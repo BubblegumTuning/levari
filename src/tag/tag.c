@@ -1,0 +1,309 @@
+#include "tag.h"
+#include "../common.h"
+#include <ctype.h>
+
+void tag_init(Tags *t) {
+    t->title[0] = t->artist[0] = t->album[0] = 0;
+    t->track = 0;
+}
+
+static void copy_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
+    size_t j = 0;
+    for (int i = 0; i < n && src[i]; i++) {
+        unsigned char c = src[i];
+        if (c < 0x20) continue;
+        if (c < 0x80) {
+            if (j + 1 >= dn) break;
+            dst[j++] = (char)c;
+            continue;
+        }
+        /* latin-1 -> utf-8 */
+        if (j + 2 >= dn) break;
+        dst[j++] = (char)(0xC0 | (c >> 6));
+        dst[j++] = (char)(0x80 | (c & 0x3F));
+    }
+    /* ID3v1 pads its fixed-width fields with spaces; drop the trailing run
+       so short tags don't turn into "Artist<24 spaces>" in the title bar */
+    while (j > 0 && dst[j - 1] == ' ') j--;
+    dst[j] = 0;
+}
+
+/* vorbis comments are utf-8 by spec: copy the bytes through as-is,
+   only dropping control chars (latin-1 -> utf-8 conversion would
+   double-encode and mangle non-ascii titles) */
+static void copy_utf8(char *dst, size_t dn, const unsigned char *src, int n) {
+    size_t j = 0;
+    for (int i = 0; i < n && src[i]; i++) {
+        unsigned char c = src[i];
+        if (c < 0x20 || c == 0x7F) continue;
+        if (j + 1 >= dn) break;
+        dst[j++] = (char)c;
+    }
+    while (j > 0 && dst[j - 1] == ' ') j--;
+    dst[j] = 0;
+}
+
+static size_t utf16_to_utf8(char *dst, size_t dn, const unsigned char *src, size_t sn) {
+    size_t o = 0;
+    for (size_t i = 0; i + 1 < sn; i += 2) {
+        unsigned cp = src[i] | (src[i + 1] << 8);
+        if (cp == 0) break;
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < sn) {
+            unsigned lo = src[i + 2] | (src[i + 3] << 8);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i += 2;
+            }
+        }
+        if (cp < 0x80) {
+            if (o + 1 >= dn) break;
+            dst[o++] = (char)cp;
+        } else if (cp < 0x800) {
+            if (o + 2 >= dn) break;
+            dst[o++] = (char)(0xC0 | (cp >> 6));
+            dst[o++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            if (o + 3 >= dn) break;
+            dst[o++] = (char)(0xE0 | (cp >> 12));
+            dst[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[o++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (o + 4 >= dn) break;
+            dst[o++] = (char)(0xF0 | (cp >> 18));
+            dst[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            dst[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[o++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    dst[o] = 0;
+    return o;
+}
+
+static void text_frame(Tags *t, const char *id, const unsigned char *p, size_t n) {
+    if (n < 1) return;
+    unsigned enc = p[0];
+    const unsigned char *v = p + 1;
+    size_t vn = n - 1;
+    char *dst = NULL;
+    if (!strcmp(id, "TIT2") || !strcmp(id, "TT2")) dst = t->title;
+    else if (!strcmp(id, "TPE1") || !strcmp(id, "TP1")) dst = t->artist;
+    else if (!strcmp(id, "TALB") || !strcmp(id, "TAL")) dst = t->album;
+    else if (!strcmp(id, "TRCK") || !strcmp(id, "TRK")) {
+        char buf[32] = {0};
+        if (enc == 1 || enc == 2) utf16_to_utf8(buf, sizeof buf, v, vn);
+        else { size_t k = vn < 31 ? vn : 31; memcpy(buf, v, k); }
+        t->track = atoi(buf);
+        return;
+    }
+    else return;
+    if (enc == 1 || enc == 2) {
+        if (enc == 1 && vn >= 2 && v[0] == 0xFF && v[1] == 0xFE) { v += 2; vn -= 2; }
+        else if (enc == 1 && vn >= 2 && v[0] == 0xFE && v[1] == 0xFF) {
+            /* big endian: swap into scratch */
+            unsigned char sw[512];
+            size_t k = vn < sizeof sw ? vn : sizeof sw;
+            for (size_t i = 0; i + 1 < k; i += 2) { sw[i] = v[i + 1]; sw[i + 1] = v[i]; }
+            utf16_to_utf8(dst, 256, sw, k);
+            return;
+        }
+        utf16_to_utf8(dst, 256, v, vn);
+    } else {
+        copy_fixed(dst, 256, v, (int)(vn < 255 ? vn : 255));
+    }
+}
+
+static void read_id3v2(FILE *f, Tags *t) {
+    unsigned char h[10];
+    if (fread(h, 1, 10, f) != 10) return;
+    int ver = h[3];
+    if (ver < 2 || ver > 4) return;
+    size_t sz = ((size_t)h[6] << 21) | ((size_t)h[7] << 14) | ((size_t)h[8] << 7) | h[9];
+    if (sz > (1u << 24)) return;
+    unsigned char *buf = malloc(sz);
+    if (!buf || fread(buf, 1, sz, f) != sz) { free(buf); return; }
+    size_t i = 0;
+    int idlen = ver == 2 ? 3 : 4;
+    while (i + (size_t)(idlen + (ver == 2 ? 3 : 6)) <= sz) {
+        char id[5] = {0};
+        memcpy(id, buf + i, idlen);
+        size_t fsz;
+        if (ver == 2) {
+            fsz = ((size_t)buf[i + 3] << 16) | ((size_t)buf[i + 4] << 8) | buf[i + 5];
+            i += 6;
+        } else {
+            if (ver == 4)
+                fsz = ((size_t)buf[i + 4] << 21) | ((size_t)buf[i + 5] << 14) |
+                      ((size_t)buf[i + 6] << 7) | buf[i + 7];
+            else
+                fsz = ((size_t)buf[i + 4] << 24) | ((size_t)buf[i + 5] << 16) |
+                      ((size_t)buf[i + 6] << 8) | buf[i + 7];
+            i += 10;
+        }
+        if (fsz == 0 || i + fsz > sz) break;
+        if (id[0] == 'T') text_frame(t, id, buf + i, fsz);
+        i += fsz;
+    }
+    free(buf);
+}
+
+static void read_id3v1(FILE *f, Tags *t) {
+    if (fseek(f, -128, SEEK_END) != 0) return;
+    unsigned char r[128];
+    if (fread(r, 1, 128, f) != 128) return;
+    if (memcmp(r, "TAG", 3) != 0) return;
+    copy_fixed(t->title, sizeof t->title, r + 3, 30);
+    copy_fixed(t->artist, sizeof t->artist, r + 33, 30);
+    copy_fixed(t->album, sizeof t->album, r + 63, 30);
+    if (r[93 + 28] == 0 && r[93 + 29] != 0) t->track = r[93 + 29];
+}
+
+static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
+    /* p points after 0x03 "vorbis" */
+    if (n < 8) return;
+    unsigned rd = p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24);
+    p += 4; n -= 4;
+    if (rd > n) return;
+    p += rd; n -= rd;
+    if (n < 4) return;
+    unsigned cnt = p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24);
+    p += 4; n -= 4;
+    for (unsigned c = 0; c < cnt && n >= 4; c++) {
+        unsigned cl = p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24);
+        p += 4; n -= 4;
+        if (cl > n) break;
+        char key[32] = {0};
+        size_t kl = cl < 31 ? cl : 31;
+        size_t eq = 0;
+        while (eq < kl && p[eq] != '=') eq++;
+        memcpy(key, p, eq);
+        for (size_t i = 0; key[i]; i++) key[i] = (char)toupper((unsigned char)key[i]);
+        const unsigned char *val = p + eq + 1;
+        size_t vl = cl - eq - 1;
+        if (!strcmp(key, "TITLE")) copy_utf8(t->title, sizeof t->title, val, (int)(vl < 255 ? vl : 255));
+        else if (!strcmp(key, "ARTIST")) copy_utf8(t->artist, sizeof t->artist, val, (int)(vl < 255 ? vl : 255));
+        else if (!strcmp(key, "ALBUM")) copy_utf8(t->album, sizeof t->album, val, (int)(vl < 255 ? vl : 255));
+        else if (!strcmp(key, "TRACKNUMBER")) {
+            char b[32] = {0};
+            size_t k = vl < 31 ? vl : 31;
+            memcpy(b, val, k);
+            t->track = atoi(b);
+        }
+        p += cl; n -= cl;
+    }
+}
+
+static void read_ogg(FILE *f, Tags *t) {
+    unsigned char buf[65536];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    size_t i = 0;
+    unsigned char pkt[65536];
+    size_t pn = 0;
+    while (i + 27 <= n) {
+        if (memcmp(buf + i, "OggS", 4) != 0) { i++; continue; }
+        unsigned char nseg = buf[i + 26];
+        if (i + 27 + nseg > n) break;
+        const unsigned char *seg = buf + i + 27;
+        size_t page_body = i + 27 + nseg;
+        size_t body = 0;
+        for (unsigned s = 0; s < nseg; s++) body += seg[s];
+        if (page_body + body > n) break;
+        /* continue current packet with this page's segments */
+        size_t bo = page_body;
+        for (unsigned s = 0; s < nseg; s++) {
+            size_t sl = seg[s];
+            if (pn + sl <= sizeof pkt) { memcpy(pkt + pn, buf + bo, sl); pn += sl; }
+            bo += sl;
+            if (sl < 255) {
+                /* packet complete */
+                if (pn > 7 && pkt[0] == 0x03 && memcmp(pkt + 1, "vorbis", 6) == 0) {
+                    vorbis_comment(t, pkt + 7, pn - 7);
+                    return;
+                }
+                pn = 0;
+            }
+        }
+        i = page_body + body;
+    }
+}
+
+static void read_riff(FILE *f, Tags *t) {
+    unsigned char h[12];
+    if (fread(h, 1, 12, f) != 12) return;
+    if (memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) return;
+    unsigned char ch[8];
+    while (fread(ch, 1, 8, f) == 8) {
+        unsigned sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | ((unsigned)ch[7] << 24);
+        long next = (sz + 1) & ~1L;
+        if (!memcmp(ch, "LIST", 4)) {
+            unsigned char lt[4];
+            if (fread(lt, 1, 4, f) != 4) return;
+            if (!memcmp(lt, "INFO", 4)) {
+                long end = (long)ftell(f) + (long)sz - 4;
+                while ((long)ftell(f) + 8 <= end) {
+                    unsigned char sh[8];
+                    if (fread(sh, 1, 8, f) != 8) return;
+                    unsigned ssz = sh[4] | (sh[5] << 8) | (sh[6] << 16) | ((unsigned)sh[7] << 24);
+                    if (ssz > 65536) return;
+                    unsigned char *sb = malloc(ssz);
+                    if (!sb) return;
+                    if (fread(sb, 1, ssz, f) != ssz) { free(sb); return; }
+                    if (!memcmp(sh, "INAM", 4)) copy_fixed(t->title, sizeof t->title, sb, (int)(ssz < 255 ? ssz : 255));
+                    else if (!memcmp(sh, "IART", 4)) copy_fixed(t->artist, sizeof t->artist, sb, (int)(ssz < 255 ? ssz : 255));
+                    else if (!memcmp(sh, "IPRD", 4)) copy_fixed(t->album, sizeof t->album, sb, (int)(ssz < 255 ? ssz : 255));
+                    else if (!memcmp(sh, "ITRK", 4)) {
+                        char b[32] = {0};
+                        size_t k = ssz < 31 ? ssz : 31;
+                        memcpy(b, sb, k);
+                        t->track = atoi(b);
+                    }
+                    free(sb);
+                    if (ssz & 1) fgetc(f);
+                }
+                return;
+            } else {
+                fseek(f, next - 4, SEEK_CUR);
+            }
+        } else {
+            fseek(f, next, SEEK_CUR);
+        }
+    }
+}
+
+static void read_module(FILE *f, Tags *t) {
+    static const char *modmag[] = { "M.K.", "M!K!", "M&K!", "N4C4", "FLT4", "FLT8",
+                                    "4CHN", "6CHN", "8CHN", "16CH", "24CH", "32CH",
+                                    "CD81", "OKTA", "FEST" };
+    unsigned char h[1084];
+    fseek(f, 0, SEEK_SET);
+    size_t n = fread(h, 1, sizeof h, f);
+    if (n < 4) return;
+    if (!memcmp(h, "IMPM", 4) && n >= 0x0C + 26)
+        copy_fixed(t->title, sizeof t->title, h + 0x0C, 26);
+    else if (n >= 17 && !memcmp(h, "Extended Module: ", 17) && n >= 0x35 + 20)
+        copy_fixed(t->title, sizeof t->title, h + 0x35, 20);
+    else if (n >= 0x2C + 4 && !memcmp(h + 0x2C, "SCRM", 4))
+        copy_fixed(t->title, sizeof t->title, h, 20);
+    else if (n >= 1084)
+        for (size_t i = 0; i < sizeof modmag / sizeof modmag[0]; i++)
+            if (!memcmp(h + 1080, modmag[i], 4)) { copy_fixed(t->title, sizeof t->title, h, 20); break; }
+}
+
+void tag_read(const char *path, Tags *t) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    unsigned char h[4] = {0};
+    size_t n = fread(h, 1, 4, f);
+    fseek(f, 0, SEEK_SET);
+    if (n >= 3 && h[0]=='I'&&h[1]=='D'&&h[2]=='3') {
+        read_id3v2(f, t);
+        read_id3v1(f, t);
+    } else if (n >= 4 && h[0]=='O'&&h[1]=='g'&&h[2]=='g'&&h[3]=='S') {
+        read_ogg(f, t);
+    } else if (n >= 4 && h[0]=='R'&&h[1]=='I'&&h[2]=='F'&&h[3]=='F') {
+        read_riff(f, t);
+    } else {
+        read_id3v1(f, t);
+        if (!t->title[0]) read_module(f, t);
+    }
+    fclose(f);
+}
