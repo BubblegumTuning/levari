@@ -1,0 +1,8 @@
+FILE "tone.wav" WAVE
+  TRACK 01 AUDIO
+    TITLE "First"
+    PERFORMER "Test"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Second"
+    INDEX 01 00:01:00

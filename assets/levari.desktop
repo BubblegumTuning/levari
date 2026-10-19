@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Levari
+GenericName=Audio Player
+Comment=Tiny Winamp-style audio player
+Exec=levari %F
+Icon=levari
+StartupWMClass=levari
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/mpeg;audio/flac;audio/x-flac;audio/ogg;audio/opus;audio/x-wav;audio/x-mpegurl;audio/x-cue;audio/x-mod;audio/x-s3m;audio/x-xm;audio/x-it;
