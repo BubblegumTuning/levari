@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.2.0 LANGUAGES C)
+project(levari VERSION 0.2.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -79,9 +79,10 @@ add_executable(levari
 )
 
 if(WIN32)
-    # link the SDL2 import lib directly: the SDL2::SDL2 target injects
-    # -mwindows (GUI subsystem), which breaks the console/CLI mode.
-    # SDL_MAIN_HANDLED keeps main() as the real entry point (no SDL2main).
+    # link the SDL2 import lib directly rather than the SDL2::SDL2 target
+    # (which injects -mwindows via CMake interface; we set it explicitly
+    # below so the intent is visible: GUI subsystem, no console window on
+    # double-click; CLI verbs re-attach to the parent console in main.c).
     target_compile_definitions(levari PRIVATE SDL_MAIN_HANDLED MODPLUG_BUILD)
     target_include_directories(levari PRIVATE src third_party ${SDL2_INCLUDE_DIRS})
     # static SDL2: single self-contained exe, no SDL2.dll needed
@@ -91,12 +92,32 @@ if(WIN32)
         dinput8 dxguid)
 else()
     target_include_directories(levari PRIVATE src third_party ${SDL2_INCLUDE_DIRS})
-    target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug dl pthread m)
+    # Homebrew's libdir is not on the default linker search path
+    target_link_directories(levari PRIVATE ${SDL2_LIBRARY_DIRS})
+    if(APPLE)
+        # no libdl on macOS (dlopen is in libSystem); ld64 has no --gc-sections/-s
+        target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug pthread m)
+    else()
+        target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug dl pthread m)
+    endif()
 endif()
 target_compile_definitions(levari PRIVATE LV_VERSION="${PROJECT_VERSION}")
+if(APPLE)
+    # proper GUI app: double-clickable, no Terminal window, not App-Napped
+    set_target_properties(levari PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/assets/Info.plist.in")
+endif()
 if(WIN32)
     target_compile_options(levari PRIVATE -Os -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
-    target_link_options(levari PRIVATE -Wl,--gc-sections -Wl,-s)
+    # -mwindows: GUI subsystem (no console on double-click). No -Wl,-s:
+    # stripped exes trip heuristic AV scans (Behavior:Win32/DefenseEvasion)
+    # and the symbol table costs little here.
+    target_link_options(levari PRIVATE -Wl,--gc-sections -mwindows)
+elseif(APPLE)
+    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
+    target_link_options(levari PRIVATE -flto -Wl,-dead_strip)
 else()
     target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
     target_link_options(levari PRIVATE -flto -Wl,--gc-sections -Wl,-s)
@@ -113,8 +134,12 @@ if(NOT WIN32)
     endif()
 endif()
 
-install(TARGETS levari RUNTIME DESTINATION bin)
-if(NOT WIN32)
+if(APPLE)
+    install(TARGETS levari BUNDLE DESTINATION .)
+else()
+    install(TARGETS levari RUNTIME DESTINATION bin)
+endif()
+if(UNIX AND NOT APPLE)
     install(FILES assets/levari.desktop DESTINATION share/applications)
     install(FILES assets/levari.svg DESTINATION share/icons/hicolor/scalable/apps)
 endif()
@@ -139,12 +164,17 @@ if(ENABLE_MCP)
     if(WIN32)
         target_compile_definitions(levari-mcp PRIVATE MODPLUG_BUILD)
         target_link_libraries(levari-mcp modplug winpthread m advapi32)
+    elseif(APPLE)
+        target_link_libraries(levari-mcp modplug pthread m)
     else()
         target_link_libraries(levari-mcp modplug dl pthread m)
     endif()
     if(WIN32)
         target_compile_options(levari-mcp PRIVATE -Os -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
-        target_link_options(levari-mcp PRIVATE -Wl,--gc-sections -Wl,-s)
+        target_link_options(levari-mcp PRIVATE -Wl,--gc-sections)
+    elseif(APPLE)
+        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
+        target_link_options(levari-mcp PRIVATE -flto -Wl,-dead_strip)
     else()
         target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
         target_link_options(levari-mcp PRIVATE -flto -Wl,--gc-sections -Wl,-s)

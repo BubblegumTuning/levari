@@ -98,8 +98,7 @@ int cfg_save(void) {
     cfg_path(path, sizeof path);
     char dir[LV_MAX_PATH];
     lv_strlcpy(dir, path, sizeof dir);
-    char *slash = strrchr(dir, '/');
-    if (slash) { *slash = 0; mkdir(dir, 0755); }
+    if (lv_dirname(dir)) mkdir(dir, 0755);
     FILE *f = fopen(path, "w");
     if (!f) return -1;
     fputs("# levari config\n", f);

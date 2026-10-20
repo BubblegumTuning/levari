@@ -15,6 +15,10 @@
 
 #define mkdir(p, m) _mkdir(p)
 
+/* ---- lstat: MinGW declares no POSIX lstat; Windows has no POSIX
+   symlinks to guard against, so plain stat is the right fallback ---- */
+#define lstat(p, b) stat((p), (b))
+
 /* ---- dlfcn shim ---- */
 #define RTLD_LAZY  0x0001
 #define RTLD_NOW   0x0002

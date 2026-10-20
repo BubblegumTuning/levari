@@ -47,7 +47,7 @@ hides that window (its state is kept).
 |---|---|
 | `SHUF` | Same shuffle toggle as the main window. |
 | `RPT` | Same repeat toggle as the main window. |
-| `ADD` | Not wired yet (decorative). |
+| `ADD` | Open the file browser (same window as the main window's folder button). |
 | `REM` | Remove the selected track from the playlist. If it was the current track, playback stops first. |
 | `CLO` | Hide the playlist window. |
 | `LIB` | Append every entry from the media library index to the playlist (the index built by the options window `SCAN` or `levari library scan`). Does not start playback. |

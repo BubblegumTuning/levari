@@ -7,6 +7,11 @@
 #include "config/config.h"
 #include "common.h"
 #include <stdio.h>
+#ifndef _WIN32
+#include <signal.h>
+#else
+#include "compat/win32.h"
+#endif
 
 static int is_cli_cmd(const char *s) {
     static const char *CMDS[] = {"play","pause","resume","toggle","stop","next","prev",
@@ -44,6 +49,19 @@ static int is_cue(const char *p) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* GUI-subsystem exe (no console window on double-click): when invoked as
+       a CLI verb, re-attach to the parent console so output is visible */
+    if (argc > 1 && (is_cli_cmd(argv[1]) || !strcmp(argv[1], "library"))) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+        }
+    }
+#else
+    /* daemon/CLI sockets: a client dying mid-response must not kill us */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     cfg_load();
     if (argc > 1 && !strcmp(argv[1], "library"))
         return lib_cmd(argc - 1, argv + 1);

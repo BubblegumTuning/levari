@@ -104,12 +104,16 @@ int cli_send_line(const char *cmd) {
 int cli_run(int argc, char **argv) {
     char line[2048] = "";
     for (int i = 1; i < argc; i++) {
-        if (strlen(line) + strlen(argv[i]) + 2 > sizeof line) {
+        size_t used = strlen(line);
+        size_t argn = strlen(argv[i]);
+        size_t sep = used ? 1 : 0;
+        /* sep + arg + the newline appended below + NUL */
+        if (used + sep + argn + 2 > sizeof line) {
             fprintf(stderr, "levari: command line truncated at %d args\n", i - 1);
             break;
         }
+        if (sep) strcat(line, " ");
         strcat(line, argv[i]);
-        strcat(line, " ");
     }
     char path[512];
     sock_path(path, sizeof path);

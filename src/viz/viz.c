@@ -61,8 +61,8 @@ void viz_spectrum(const int16_t *pcm, int n, int rate, float out[VIZ_BARS]) {
         if (k1 > N / 2) k1 = N / 2;
         double peak = 0;
         for (int k = k0; k < k1; k++) {
-            double m = sqrt((double)re[k] * re[k] + (double)im[k] * im[k]);
-            if (m > peak) peak = m;
+            double amp = sqrt((double)re[k] * re[k] + (double)im[k] * im[k]);
+            if (amp > peak) peak = amp;
         }
         double mag = peak / (N / 4.0); /* full-scale sine -> ~1.0 (0.6..1.0
                                           with bin alignment; dB scale hides

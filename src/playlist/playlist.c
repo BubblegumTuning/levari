@@ -1,4 +1,7 @@
 #include "playlist.h"
+#ifdef _WIN32
+#include "../compat/win32.h"
+#endif
 #include <unistd.h>
 #include <limits.h>
 #include <dirent.h>
@@ -50,9 +53,13 @@ static void pl_add_dir(Playlist *p, const char *dir) {
         if (de->d_name[0] == '.') continue;
         if (n == cap) {
             cap = cap ? cap * 2 : 32;
-            names = realloc(names, (size_t)cap * sizeof *names);
+            char **n2 = realloc(names, (size_t)cap * sizeof *names);
+            if (!n2) break;
+            names = n2;
         }
-        names[n++] = strdup(de->d_name);
+        char *dup = strdup(de->d_name);
+        if (!dup) break;
+        names[n++] = dup;
     }
     closedir(d);
     qsort(names, (size_t)n, sizeof *names, cmpstr);
@@ -78,7 +85,7 @@ void pl_add(Playlist *p, const char *path) {
     }
     if (ensure(p, p->count + 1) != 0) return;
     Track *t = &p->items[p->count++];
-    if (path[0] == '/') {
+    if (lv_is_abs(path)) {
         lv_strlcpy(t->path, path, sizeof t->path);
     } else {
         char cwd[PATH_MAX];
@@ -116,8 +123,7 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
     if (!f) return -1;
     char dir[LV_MAX_PATH];
     lv_strlcpy(dir, m3u, sizeof dir);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = 0; else lv_strlcpy(dir, ".", sizeof dir);
+    if (!lv_dirname(dir)) lv_strlcpy(dir, ".", sizeof dir);
 
     char line[LV_MAX_PATH + 64];
     int pending_dur = 0;
@@ -133,8 +139,8 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
         }
         if (*s == '#') continue;
         char full[LV_MAX_PATH];
-        if (s[0] == '/') lv_strlcpy(full, s, sizeof full);
-        else snprintf(full, sizeof full, "%s/%s", dir, s);
+        if (lv_is_abs(s)) lv_strlcpy(full, s, sizeof full);
+        else lv_path_join(full, sizeof full, dir, s);
         pl_add(p, full);
         if (pending_dur) p->items[p->count - 1].duration = pending_dur;
         pending_dur = 0;
@@ -164,8 +170,7 @@ int pl_load_cue(Playlist *p, const char *cue) {
     if (!f) return -1;
     char dir[LV_MAX_PATH];
     lv_strlcpy(dir, cue, sizeof dir);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = 0; else lv_strlcpy(dir, ".", sizeof dir);
+    if (!lv_dirname(dir)) lv_strlcpy(dir, ".", sizeof dir);
 
     char line[2048];
     char file[LV_MAX_PATH] = "";
@@ -181,8 +186,8 @@ int pl_load_cue(Playlist *p, const char *cue) {
             char *q2 = strchr(q1 + 1, '"');
             if (!q2) continue;
             *q2 = 0;
-            if (q1[1] == '/') lv_strlcpy(file, q1 + 1, sizeof file);
-            else snprintf(file, sizeof file, "%s/%s", dir, q1 + 1);
+            if (lv_is_abs(q1 + 1)) lv_strlcpy(file, q1 + 1, sizeof file);
+            else lv_path_join(file, sizeof file, dir, q1 + 1);
         } else if (!strncmp(s, "TRACK ", 6)) {
             idx = p->count;
             pl_add(p, file);
@@ -215,7 +220,10 @@ int pl_load_cue(Playlist *p, const char *cue) {
     fclose(f);
     for (int i = 0; i < p->count; i++) {
         Track *t = &p->items[i];
-        if (t->start_sec > 0 || t->end_sec > 0)
+        /* last track leaves end_sec == 0. Subtracting that goes negative
+           once start is past ~1.5s, and load_track only repairs a 0.
+           Leave it unknown so the player fills it from the file length. */
+        if (t->end_sec > t->start_sec)
             t->duration = (int)(t->end_sec - t->start_sec + 0.5);
     }
     return 0;

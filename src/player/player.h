@@ -33,6 +33,7 @@ typedef struct {
     int16_t viz_buf[4096];
     volatile int viz_n;
     volatile unsigned viz_seq;
+    pthread_mutex_t viz_mtx; /* viz_buf/n/seq: player writes, UI reads */
     int ao_open;
     pthread_mutex_t mtx; /* guards playlist mutations vs player thread */
     volatile int quit;

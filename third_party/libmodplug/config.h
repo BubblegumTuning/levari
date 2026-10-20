@@ -2,7 +2,11 @@
    (glibc, little-endian x86-64); replaces the autotools-generated one */
 #define HAVE_DLFCN_H 1
 #define HAVE_INTTYPES_H 1
+#ifdef __APPLE__
+/* macOS has no malloc.h; stdlib.h above provides what libmodplug needs */
+#else
 #define HAVE_MALLOC_H 1
+#endif
 #define HAVE_MEMORY_H 1
 #define HAVE_SINF 1
 #define HAVE_STDINT_H 1
