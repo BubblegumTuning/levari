@@ -2,12 +2,17 @@
 #include "../config/config.h"
 #ifdef _WIN32
 #include "../compat/win32.h"
+#else
+#include <signal.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 int main(void) {
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN); /* daemon socket may die mid-write */
+#endif
     cfg_load();
     char *line = NULL;
     size_t cap = 0;

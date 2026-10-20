@@ -71,8 +71,8 @@ static inline double run(Biquad *b, double x) {
 }
 
 void eq_process(EQ *e, int16_t *buf, int frames, int ch) {
-    if (!e->enabled) return;
     pthread_mutex_lock(&e->mtx);
+    if (!e->enabled) { pthread_mutex_unlock(&e->mtx); return; }
     double g = pow(10.0, e->preamp_db / 20.0);
     for (int f = 0; f < frames; f++) {
         for (int c = 0; c < ch; c++) {
@@ -86,6 +86,25 @@ void eq_process(EQ *e, int16_t *buf, int frames, int ch) {
         }
     }
     pthread_mutex_unlock(&e->mtx);
+}
+
+void eq_set_enabled(EQ *e, int on) {
+    pthread_mutex_lock(&e->mtx);
+    e->enabled = on ? 1 : 0;
+    pthread_mutex_unlock(&e->mtx);
+}
+
+void eq_toggle(EQ *e) {
+    pthread_mutex_lock(&e->mtx);
+    e->enabled = !e->enabled;
+    pthread_mutex_unlock(&e->mtx);
+}
+
+int eq_enabled(EQ *e) {
+    pthread_mutex_lock(&e->mtx);
+    int on = e->enabled;
+    pthread_mutex_unlock(&e->mtx);
+    return on;
 }
 
 /* ---------- WSOLA speed control ---------- */
@@ -102,7 +121,11 @@ static int ws_channel(WS *w, int c, const int16_t *in, int frames, int ch, int16
     int Ha = (int)(Hs * w->s + 0.5);
     if (Ha < 64) Ha = 64;
     if (Ha > WS_FRAME - 64) Ha = WS_FRAME - 64;
+    /* A full analysis overlap (WS_FRAME - Ha) exceeds the synthesis hop
+       below 1.0x. The blend already keeps only Hs samples, and tail[] is
+       that long — correlate and store that, never the longer overlap. */
     int ov = WS_FRAME - Ha;
+    if (ov > Hs) ov = Hs;
 
     int16_t *ib = w->in[c];
     int n = w->in_n[c];
@@ -125,7 +148,7 @@ static int ws_channel(WS *w, int c, const int16_t *in, int frames, int ch, int16
             }
         }
         const int16_t *f = base + best_d;
-        int blend = ov < Hs ? ov : Hs;
+        int blend = ov; /* already <= Hs */
         if (w->primed) {
             for (int i = 0; i < blend; i++) {
                 double a = (double)(blend - i) / blend;
@@ -139,7 +162,10 @@ static int ws_channel(WS *w, int c, const int16_t *in, int frames, int ch, int16
             for (int i = 0; i < Hs; i++) out[produced++] = f[i];
             w->primed = 1;
         }
-        for (int i = 0; i < ov; i++) w->tail[c][i] = out[produced - ov + i];
+        /* each iteration emits Hs samples and ov <= Hs, so this stays in out[] */
+        int save = ov < produced ? ov : produced;
+        for (int i = 0; i < save; i++)
+            w->tail[c][i] = out[produced - save + i];
         memmove(ib, ib + Ha, (size_t)(n - Ha) * 2);
         n -= Ha;
     }
