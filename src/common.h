@@ -10,7 +10,7 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.2.0"
+#define LV_VERSION "0.2.2"
 #endif
 
 static inline void lv_strlcpy(char *dst, const char *src, size_t n) {
@@ -51,6 +51,56 @@ static inline int lv_strncasecmp(const char *a, const char *b, size_t n) {
         if (!ca) return 0;
     }
     return 0;
+}
+
+/* last path separator. On Windows both / and \ ; elsewhere \ is a legal
+   filename character and must not split. */
+static inline char *lv_strrsep(const char *s) {
+#ifdef _WIN32
+    char *a = strrchr(s, '/'), *b = strrchr(s, '\\');
+    return (b && (!a || b > a)) ? b : a;
+#else
+    return strrchr(s, '/');
+#endif
+}
+
+/* absolute path: "/", "\foo", "C:\foo", "C:foo" (drive-relative is not
+   relative to the cue/m3u directory) */
+static inline int lv_is_abs(const char *p) {
+    if (!p || !p[0]) return 0;
+#ifdef _WIN32
+    if (p[0] == '/' || p[0] == '\\') return 1;
+    return ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':';
+#else
+    return p[0] == '/';
+#endif
+}
+
+/* cut the last component in place. "/" stays "/", "C:\file" becomes "C:\"
+   (a bare "C:" is drive-relative, not the drive root). 1 if a separator
+   was found. */
+static inline int lv_dirname(char *path) {
+    char *slash = lv_strrsep(path);
+    if (!slash) return 0;
+    if (slash == path) { path[1] = 0; return 1; }
+    *slash = 0;
+#ifdef _WIN32
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'))
+        && path[1] == ':' && path[2] == 0) {
+        path[2] = '\\';
+        path[3] = 0;
+    }
+#endif
+    return 1;
+}
+
+static inline void lv_path_join(char *out, size_t n, const char *dir, const char *rel) {
+    if (lv_is_abs(rel) || !dir || !dir[0]) { lv_strlcpy(out, rel, n); return; }
+    size_t dn = strlen(dir);
+    if (dn && (dir[dn - 1] == '/' || dir[dn - 1] == '\\'))
+        snprintf(out, n, "%s%s", dir, rel);
+    else
+        snprintf(out, n, "%s/%s", dir, rel);
 }
 
 #endif

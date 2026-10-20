@@ -27,7 +27,9 @@ The player listens on `$XDG_RUNTIME_DIR/levari-<uid>.sock`
 (fallback `/tmp/levari-<uid>.sock`). A second `levari <command>` talks to
 the running instance instead of starting a new one:
 
-    play [files...]        load and play (appends to playlist)
+    play [files...]        with files: replace the playlist and play
+                           (splits on spaces). Alone: resume, or play
+                           the current track
     pause / resume / toggle
     stop / next / prev
     seek <sec> | seek +N   absolute or relative seek
@@ -41,7 +43,7 @@ the running instance instead of starting a new one:
     eq on|off
     status                 current track, state, position
     pl                     print the playlist
-    add <file>             append to the playlist without playing
+    add <file>             append one path without playing (spaces kept)
 
 ## Config file
 
@@ -103,6 +105,6 @@ Register it in any MCP client, e.g.:
 Tools: `status`, `play`, `toggle`, `stop`, `next`, `prev`, `seek`,
 `set_volume`, `volume_up`, `volume_down`, `mute`, `set_pan`, `set_speed`, `set_shuffle`, `set_repeat`,
 `set_eq`, `playlist`, `add`, `library_scan`, `library_list`,
-`library_play`. The player must already be running. Paths passed to
-`play`/`add` must not contain spaces (the daemon protocol splits on
-whitespace).
+`library_play`. The player must already be running. `play` splits on
+whitespace, so those paths must not contain spaces. CLI `add` keeps
+spaces; the MCP `add` tool still rejects them.

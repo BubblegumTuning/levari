@@ -513,9 +513,9 @@ void search_mouse(SDL_Event *e) {
         if (!(e->motion.state & SDL_BUTTON_LMASK)) { drag = 0; return; }
         int gx, gy;
         SDL_GetGlobalMouseState(&gx, &gy);
-        int x = dwx + gx - dgx, y = dwy + gy - dgy;
-        ui_snap_next_to_main(w, &x, &y);
-        SDL_SetWindowPosition(w, x, y);
+        int wx = dwx + gx - dgx, wy = dwy + gy - dgy;
+        ui_snap_next_to_main(w, &wx, &wy);
+        SDL_SetWindowPosition(w, wx, wy);
     } else if (e->type == SDL_MOUSEWHEEL) {
         scroll -= e->wheel.y;
         if (scroll < 0) scroll = 0;

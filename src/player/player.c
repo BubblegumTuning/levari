@@ -173,24 +173,27 @@ static void *player_thread(void *arg) {
         }
 
         if (p->state == ST_PLAY && p->dec) {
-            static int16_t obuf[CHUNK * 2 + WS_FRAME * 2];
+            /* stereo at the 0.5x floor: ch * (CHUNK/0.5 + WS_FRAME) samples */
+            static int16_t obuf[2 * (CHUNK * 2 + WS_FRAME)];
             int got = dec_read(p->dec, buf, CHUNK);
             if (got > 0) {
                 eq_process(&p->eq, buf, got, p->ch);
+                pthread_mutex_lock(&p->viz_mtx);
                 for (int i = 0; i < got; i++)
                     p->viz_buf[i] = p->ch == 2
                         ? (int16_t)(((int)buf[i * 2] + (int)buf[i * 2 + 1]) / 2)
                         : buf[i];
                 p->viz_n = got;
                 p->viz_seq++;
-                const int16_t *toput = buf;
+                pthread_mutex_unlock(&p->viz_mtx);
+                int16_t *toput = buf;
                 int tout = got;
                 if (p->speed != 100) {
                     tout = ws_process(&p->ws, buf, got, p->ch, obuf);
                     toput = obuf;
                 }
-                apply_vol((int16_t *)toput, tout, p->ch, p->vol);
-                apply_pan((int16_t *)toput, tout, p->ch, p->pan);
+                apply_vol(toput, tout, p->ch, p->vol);
+                apply_pan(toput, tout, p->ch, p->pan);
                 ao_write(toput, tout);
                 p->pos_frames += got;
                 if (p->ab_b >= 0 && p->pos_frames >= p->ab_b) {
@@ -234,6 +237,7 @@ void pl_player_init(Player *p, Playlist *pl) {
     p->ab_a = p->ab_b = -1;
     p->track_start = p->track_end = 0;
     pthread_mutex_init(&p->mtx, NULL);
+    pthread_mutex_init(&p->viz_mtx, NULL);
     eq_init(&p->eq, 44100);
     srand((unsigned)time(NULL));
 }

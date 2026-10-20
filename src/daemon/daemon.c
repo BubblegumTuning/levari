@@ -110,7 +110,7 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         if (*v == '+' || *v == '-') target = cur + atof(v);
         else target = atof(v);
         if (endf > base)
-            pl_post_seek(p, (target * p->rate - base) / (double)(endf - base));
+            pl_post_seek(p, (target * p->rate) / (double)(endf - base));
         lv_strlcpy(resp, "OK", rn);
     } else if (!strcmp(cmd, "vol")) {
         int v = atoi(line + 3);
@@ -145,7 +145,9 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
     } else if (!strcmp(cmd, "eq")) {
         int on = strstr(line, "on") != NULL;
         int off = strstr(line, "off") != NULL;
-        if (on) p->eq.enabled = 1; else if (off) p->eq.enabled = 0; else p->eq.enabled = !p->eq.enabled;
+        if (on) eq_set_enabled(&p->eq, 1);
+        else if (off) eq_set_enabled(&p->eq, 0);
+        else eq_toggle(&p->eq);
         lv_strlcpy(resp, "OK", rn);
     } else if (!strcmp(cmd, "speed")) {
         double v = atof(line + 5);
@@ -165,7 +167,10 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         if (!off) lv_strlcpy(resp, "(empty)", rn);
     } else if (!strcmp(cmd, "add")) {
         char *rest = line + 3;
-        while (*rest == ' ') rest++;
+        while (*rest == ' ' || *rest == '\t') rest++;
+        char *end = rest + strlen(rest);
+        while (end > rest && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+            *--end = 0;
         if (*rest) {
             pthread_mutex_lock(&p->mtx);
             pl_add(p->pl, rest);

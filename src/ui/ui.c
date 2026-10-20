@@ -297,17 +297,22 @@ static void draw_main(void) {
         static float bars[VIZ_BARS], smooth[VIZ_BARS];
         static Uint32 viz_last;
         int16_t snap[4096];
-        int n = p->viz_n;
+        int n;
+        unsigned seq;
+        int playing = p->state == ST_PLAY;
+        pthread_mutex_lock(&p->viz_mtx);
+        n = p->viz_n;
         if (n > 4096) n = 4096;
-        Uint32 seq = p->viz_seq;
+        if (n < 0) n = 0;
+        seq = p->viz_seq;
+        if (n > 0) memcpy(snap, p->viz_buf, (size_t)n * sizeof snap[0]);
+        pthread_mutex_unlock(&p->viz_mtx);
         /* paused/stopped (or no fresh chunk): feed silence so the bars
            decay naturally instead of freezing on the last buffer */
-        if (p->state != ST_PLAY || seq == viz_last)
-            memset(snap, 0, (size_t)n * sizeof(snap[0]));
-        else {
-            memcpy(snap, p->viz_buf, (size_t)n * 2);
+        if (!playing || seq == viz_last)
+            memset(snap, 0, (size_t)n * sizeof snap[0]);
+        else
             viz_last = seq;
-        }
         viz_spectrum(snap, n, p->rate, bars);
         for (int b = 0; b < VIZ_BARS; b++) {
             smooth[b] = bars[b] > smooth[b] ? bars[b] : smooth[b] * 0.85f;
@@ -375,7 +380,7 @@ static void draw_main(void) {
         if (b->id == B_SHUF) active = p->shuffle;
         if (b->id == B_REPEAT) active = p->repeat == 1;
         if (b->id == B_RPT1) active = p->repeat == 2;
-        if (b->id == B_EQ) active = p->eq.enabled;
+        if (b->id == B_EQ) active = eq_enabled(&p->eq);
         if (b->id == B_VIS) active = ui.vis_on;
         skin_button(s, b->r, ui.pressed == b->id, active);
         Uint32 c = col(s, 220, 220, 220);
@@ -542,10 +547,11 @@ static void draw_eq(void) {
     font_puts(s, 10, 6, "EQUALIZER", col(s, 0, 224, 255));
     { Rect x = close_rect(EQ_W); draw_x(s, &x, ui.pressed == EQB_X); }
 
+    int eq_on = eq_enabled(&p->eq);
     Rect on = {10, 28, 30, 12};
-    skin_button(s, &on, ui.pressed == EQB_ON, p->eq.enabled);
-    font_puts(s, 16, 31, p->eq.enabled ? "ON" : "OFF",
-              p->eq.enabled ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
+    skin_button(s, &on, ui.pressed == EQB_ON, eq_on);
+    font_puts(s, 16, 31, eq_on ? "ON" : "OFF",
+              eq_on ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
 
     static const struct { int id; const char *l; int x, w; } PRE[] = {
         {EQB_FLAT, "FLAT", 48, 34}, {EQB_ROCK, "ROCK", 86, 34},
@@ -610,8 +616,20 @@ static void refresh_title(void) {
 
 /* ---------- built-in open file/folder browser ---------- */
 
+#ifdef _WIN32
+/* Windows paths use both separators; "C:" alone is drive-relative, not root */
+static int fs_is_root(const char *d) {
+    size_t n = strlen(d);
+    return (n == 1 && d[0] == '/') ||
+           (n == 3 && d[1] == ':' && (d[2] == '\\' || d[2] == '/')) ||
+           (n == 2 && d[1] == ':');
+}
+#else
+static int fs_is_root(const char *d) { return !strcmp(d, "/"); }
+#endif
+
 #define FILE_W 300
-#define FILE_H 240
+#define FILE_H (MAIN_H + PL_H) /* spans the main+playlist stack height, like OPT_H */
 #define FILE_LIST_RECT Rect list = {6, 24, FILE_W - 12, FILE_H - 24 - 20}
 #define FILE_ADD_RECT  Rect addb = {FILE_W - 60, FILE_H - 16, 52, 12}
 
@@ -666,7 +684,7 @@ static void file_list(void) {
     closedir(d);
     qsort(dirs, (size_t)nd, sizeof *dirs, fcmp);
     qsort(files, (size_t)nf, sizeof *files, fcmp);
-    int root = !strcmp(ui.file_dir, "/");
+    int root = fs_is_root(ui.file_dir);
     ui.file_n = nd + nf + (root ? 0 : 1);
     ui.file_names = malloc((size_t)(ui.file_n + 1) * sizeof *ui.file_names);
     if (!ui.file_names) {
@@ -685,12 +703,20 @@ static void file_list(void) {
 }
 
 static void raise_all(void) {
+#ifdef __APPLE__
+    /* Cocoa already keeps every window of the active app above other apps.
+       SDL_RaiseWindow here is makeKeyAndOrderFront + activation: calling it
+       per window on every FOCUS_GAINED re-triggers FOCUS_GAINED and floods
+       the main thread with WindowServer round-trips (focus storm, beachball). */
+    return;
+#else
     SDL_RaiseWindow(ui.wmain);
     if (ui.pl_visible && ui.wpl) SDL_RaiseWindow(ui.wpl);
     if (ui.eq_visible && ui.weq) SDL_RaiseWindow(ui.weq);
     if (ui.file_visible && ui.wfile) SDL_RaiseWindow(ui.wfile);
     if (ui.opt_visible && ui.wopt) SDL_RaiseWindow(ui.wopt);
     if (search_is_open()) SDL_RaiseWindow(search_window());
+#endif
 }
 
 /* the WM may swallow the button press that focuses a background window,
@@ -745,7 +771,7 @@ static void file_open(void) {
         if (ui.pl->cur >= 0 && ui.pl->cur < ui.pl->pl->count)
             lv_strlcpy(path, ui.pl->pl->items[ui.pl->cur].path, sizeof path);
         pthread_mutex_unlock(&ui.pl->mtx);
-        char *slash = strrchr(path, '/');
+        char *slash = lv_strrsep(path);
         if (slash) { *slash = 0; lv_strlcpy(ui.file_dir, path, sizeof ui.file_dir); }
         else if (!getcwd(ui.file_dir, sizeof ui.file_dir))
             lv_strlcpy(ui.file_dir, "/", sizeof ui.file_dir);
@@ -769,9 +795,16 @@ static void file_adddir(void) {
 
 static void file_choose(const char *name) {
     if (!strcmp(name, "..")) {
-        char *slash = strrchr(ui.file_dir, '/');
+        char *slash = lv_strrsep(ui.file_dir);
         if (slash && slash != ui.file_dir) *slash = 0;
         else if (slash) ui.file_dir[1] = 0; /* stay at "/" */
+#ifdef _WIN32
+        /* "C:" is drive-relative, not the root: pin to "C:\" */
+        if (ui.file_dir[1] == ':' && !ui.file_dir[2]) {
+            ui.file_dir[2] = '\\';
+            ui.file_dir[3] = 0;
+        }
+#endif
         file_list();
         return;
     }
@@ -1329,7 +1362,7 @@ static void action(int id) {
         lib_foreach_entry(pl_add_lib_cb, p->pl);
         pthread_mutex_unlock(&p->mtx);
         break;
-    case B_OPEN: file_open(); break;
+    case B_OPEN: case PB_ADD: file_open(); break;
     case B_SEARCH:
         if (search_is_open()) search_close();
         else search_open(ui.wmain);
@@ -1555,7 +1588,7 @@ static void handle_eq_mouse(SDL_Event *e) {
         if (ui.pressed == EQB_X && in_rect(&xc, x, y)) {
             ui.eq_visible = 0;
             SDL_HideWindow(ui.weq);
-        } else if (ui.pressed == EQB_ON) p->eq.enabled = !p->eq.enabled;
+        } else if (ui.pressed == EQB_ON) eq_toggle(&p->eq);
         else for (size_t i = 0; i < sizeof PRE / sizeof PRE[0]; i++)
             if (ui.pressed == PRE[i].id) eq_preset(p, PRE[i].id);
         ui.pressed = B_NONE;
@@ -1712,17 +1745,29 @@ int ui_run(Player *p, int show_pl) {
             /* whichever of our windows gets focus, bring the whole set forward
                so activating the playlist never leaves the main window buried */
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                Uint32 prev_focus = ui.focus_wid;
                 ui.focus_wid = e.window.windowID;
                 focus_click_drag(e.window.windowID);
                 if (search_is_open() && e.window.windowID == search_window_id()) SDL_StartTextInput();
                 else if (ui.opt_visible && ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) SDL_StartTextInput();
                 else SDL_StopTextInput();
-                if (e.window.windowID == SDL_GetWindowID(ui.wmain) ||
-                    e.window.windowID == SDL_GetWindowID(ui.wpl) ||
-                    (ui.weq && e.window.windowID == SDL_GetWindowID(ui.weq)) ||
-                    (ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) ||
-                    (ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) ||
-                    (search_is_open() && e.window.windowID == search_window_id()))
+                /* focus moving between our own windows means the set is already
+                   grouped; re-raising on every internal focus change risks a
+                   raise->focus->raise storm (proven on Cocoa, guard everywhere) */
+                int prev_ours = prev_focus && (
+                    prev_focus == SDL_GetWindowID(ui.wmain) ||
+                    (ui.wpl && prev_focus == SDL_GetWindowID(ui.wpl)) ||
+                    (ui.weq && prev_focus == SDL_GetWindowID(ui.weq)) ||
+                    (ui.wfile && prev_focus == SDL_GetWindowID(ui.wfile)) ||
+                    (ui.wopt && prev_focus == SDL_GetWindowID(ui.wopt)) ||
+                    (search_is_open() && prev_focus == search_window_id()));
+                if (!prev_ours &&
+                    (e.window.windowID == SDL_GetWindowID(ui.wmain) ||
+                     e.window.windowID == SDL_GetWindowID(ui.wpl) ||
+                     (ui.weq && e.window.windowID == SDL_GetWindowID(ui.weq)) ||
+                     (ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) ||
+                     (ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) ||
+                     (search_is_open() && e.window.windowID == search_window_id())))
                     raise_all();
             }
             break;

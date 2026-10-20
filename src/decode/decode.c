@@ -45,6 +45,14 @@ static int opus_syms(void) {
 #ifdef _WIN32
     if (!h) h = dlopen("libopus-0.dll", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("libopus.dll", RTLD_NOW | RTLD_LOCAL);
+#elif defined(__APPLE__)
+    static const char *OPUS_CANDS[] = {
+        "libopus.0.dylib", "libopus.dylib",
+        "/opt/homebrew/opt/opus/lib/libopus.0.dylib",
+        "/usr/local/opt/opus/lib/libopus.0.dylib",
+    };
+    for (size_t i = 0; i < sizeof OPUS_CANDS / sizeof OPUS_CANDS[0] && !h; i++)
+        h = dlopen(OPUS_CANDS[i], RTLD_NOW | RTLD_LOCAL);
 #else
     if (!h) h = dlopen("libopus.so.0", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("libopus.so", RTLD_NOW | RTLD_LOCAL);
@@ -178,29 +186,51 @@ static int (*p_av_read_frame)(AVFormatContext *, AVPacket *);
 static int (*p_av_find_best_stream)(AVFormatContext *, enum AVMediaType, int, int, const AVCodec **, int);
 static int (*p_av_seek_frame)(AVFormatContext *, int, int64_t, int);
 
-static void *ff_dlopen(const char *base) {
+/* tries <dir>/<base> plus versioned variants; empty dir = bare soname.
+   Linux: libfoo.so, libfoo.so.N. macOS: libfoo.dylib, libfoo.N.dylib. */
+static void *ff_try_dir(const char *dir, const char *base) {
     char nm[LV_MAX_PATH];
-    if (cfg.libav_dir[0]) { /* config-provided directory first */
-        char ld[LV_MAX_PATH];
-        lv_expand_home(cfg.libav_dir, ld, sizeof ld);
-        snprintf(nm, sizeof nm, "%s/%s.so", ld, base);
-        void *h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
-        if (h) return h;
-        for (int v = 62; v >= 54; v--) {
-            snprintf(nm, sizeof nm, "%s/%s.so.%d", ld, base, v);
-            h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
-            if (h) return h;
-        }
-    }
-    snprintf(nm, sizeof nm, "%s.so", base);
-    void *h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
+    int p = (dir && *dir) ? snprintf(nm, sizeof nm, "%s/", dir) : 0;
+    if (p < 0 || (size_t)p >= sizeof nm) return NULL;
+    void *h;
+#ifdef __APPLE__
+    snprintf(nm + p, sizeof nm - p, "%s.dylib", base);
+    h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
     if (h) return h;
     for (int v = 62; v >= 54; v--) {
-        snprintf(nm, sizeof nm, "%s.so.%d", base, v);
+        snprintf(nm + p, sizeof nm - p, "%s.%d.dylib", base, v);
         h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
         if (h) return h;
     }
+#else
+    snprintf(nm + p, sizeof nm - p, "%s.so", base);
+    h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
+    if (h) return h;
+    for (int v = 62; v >= 54; v--) {
+        snprintf(nm + p, sizeof nm - p, "%s.so.%d", base, v);
+        h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
+        if (h) return h;
+    }
+#endif
     return NULL;
+}
+
+static void *ff_dlopen(const char *base) {
+    if (cfg.libav_dir[0]) { /* config-provided directory first */
+        char ld[LV_MAX_PATH];
+        lv_expand_home(cfg.libav_dir, ld, sizeof ld);
+        void *h = ff_try_dir(ld, base);
+        if (h) return h;
+    }
+#ifdef __APPLE__
+    /* Homebrew's ffmpeg keg is not on dyld's bare-soname search path */
+    static const char *KEGS[] = { "/opt/homebrew/opt/ffmpeg/lib", "/usr/local/opt/ffmpeg/lib" };
+    for (size_t i = 0; i < sizeof KEGS / sizeof KEGS[0]; i++) {
+        void *h = ff_try_dir(KEGS[i], base);
+        if (h) return h;
+    }
+#endif
+    return ff_try_dir("", base);
 }
 
 static int ff_syms(void) {

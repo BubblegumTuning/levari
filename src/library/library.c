@@ -18,9 +18,7 @@ void lib_index_path(char *out, size_t n) {
         lv_expand_home(cfg.lib_index, out, n);
         char dir[LV_MAX_PATH];
         lv_strlcpy(dir, out, sizeof dir);
-        char *slash = strrchr(dir, '/');
-        if (!slash) slash = strrchr(dir, '\\');
-        if (slash) { *slash = 0; mkdir(dir, 0755); }
+        if (lv_dirname(dir)) mkdir(dir, 0755);
         return;
     }
     char base[LV_MAX_PATH];
