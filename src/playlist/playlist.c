@@ -71,7 +71,7 @@ static void pl_add_dir(Playlist *p, const char *dir) {
         if (lstat(full, &st) == 0 && S_ISDIR(st.st_mode))
             pl_add_dir(p, full);
         else if (audio_ext(names[i]))
-            pl_add(p, full);
+            pl_add_file(p, full);
         free(names[i]);
     }
     free(names);
@@ -83,6 +83,13 @@ void pl_add(Playlist *p, const char *path) {
         pl_add_dir(p, path);
         return;
     }
+    pl_add_file(p, path);
+}
+
+/* append without the stat-based directory probe: callers that already
+   know the path is a file (m3u lines, scanned dir entries). on network
+   shares the per-path stat was the dominant cost of loading big lists */
+void pl_add_file(Playlist *p, const char *path) {
     if (ensure(p, p->count + 1) != 0) return;
     Track *t = &p->items[p->count++];
     if (lv_is_abs(path)) {
@@ -96,6 +103,7 @@ void pl_add(Playlist *p, const char *path) {
     }
     tag_init(&t->tags);
     t->duration = 0;
+    t->notag = 0;
     t->start_sec = t->end_sec = 0;
 }
 
@@ -109,6 +117,7 @@ void pl_insert(Playlist *p, int idx, const char *path) {
     lv_strlcpy(t->path, path, sizeof t->path);
     tag_init(&t->tags);
     t->duration = 0;
+    t->notag = 0;
     t->start_sec = t->end_sec = 0;
 }
 
@@ -124,6 +133,14 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
     char dir[LV_MAX_PATH];
     lv_strlcpy(dir, m3u, sizeof dir);
     if (!lv_dirname(dir)) lv_strlcpy(dir, ".", sizeof dir);
+
+    /* pre-size from the file size (~96 bytes per entry): multi-MB
+       playlists otherwise churn realloc through every doubling */
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz > 0) ensure(p, p->count + (int)(sz / 96) + 16);
+    }
 
     char line[LV_MAX_PATH + 64];
     int pending_dur = 0;
@@ -141,7 +158,7 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
         char full[LV_MAX_PATH];
         if (lv_is_abs(s)) lv_strlcpy(full, s, sizeof full);
         else lv_path_join(full, sizeof full, dir, s);
-        pl_add(p, full);
+        pl_add_file(p, full);
         if (pending_dur) p->items[p->count - 1].duration = pending_dur;
         pending_dur = 0;
     }
@@ -231,7 +248,9 @@ int pl_load_cue(Playlist *p, const char *cue) {
 
 void pl_scan_tags(Playlist *p, pthread_mutex_t *mtx) {
     for (int i = 0; i < p->count; i++) {
-        if (p->items[i].tags.title[0]) continue;
+        /* notag: the index already probed this file and found no tags;
+           re-reading it over a network share would find nothing again */
+        if (p->items[i].tags.title[0] || p->items[i].notag) continue;
         /* per-track locking: tag_read touches tags the player thread may
            be reading in load_track; one lock for the whole playlist would
            stall track loads on big lists */

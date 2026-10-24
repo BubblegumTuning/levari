@@ -2,6 +2,7 @@
 #include "../tag/tag.h"
 #include "../decode/decode.h"
 #include "../daemon/daemon.h"
+#include "../playlist/playlist.h"
 #include "../common.h"
 #include "../config/config.h"
 #ifdef _WIN32
@@ -88,15 +89,27 @@ static void scan_dir(const char *dir, ScanCtx *c) {
             tag_init(&t);
             int dur = 0;
             if (c->tags) {
-                tag_read(full, &t);
-                Decoder *dec = dec_open(full);
-                if (dec) {
-                    long long tot = dec_total_frames(dec);
-                    if (tot > 0) dur = (int)(tot / dec_rate(dec));
-                    dec_close(dec);
+                /* one open + one head read covers tags and (for MP3) the
+                   duration via XING/VBRI or a CBR estimate; the decoder is
+                   only opened for formats that need it for length */
+                dur = tag_probe(full, st.st_size, &t);
+                if (!dur) {
+                    Decoder *dec = dec_open(full);
+                    if (dec) {
+                        long long tot = dec_total_frames(dec);
+                        if (tot > 0) dur = (int)(tot / dec_rate(dec));
+                        dec_close(dec);
+                    }
                 }
             }
-            fprintf(c->out, "%s\t%s\t%s\t%s\t%d\t%d\n", full, t.artist, t.title, t.album, dur, t.track);
+            /* only a scan that actually read tags may certify "no tags";
+               a filenames-only pass must not mark anything */
+            int notag = c->tags && !t.title[0] && !t.artist[0] && !t.album[0] && !t.track;
+            fprintf(c->out, "%s\t%s\t%s\t%s\t%d\t%d", full, t.artist, t.title, t.album, dur, t.track);
+            /* sparse 7th field: only untagged files carry the marker, so
+               tagged rows keep the original 6-field shape */
+            if (notag) fprintf(c->out, "\t1");
+            fputc('\n', c->out);
             c->added++;
         }
     }
@@ -194,19 +207,104 @@ int lib_foreach_entry(void (*fn)(const LibEntry *e, void *ud), void *ud) {
         char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
         char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
         char *p5 = strchr(p4, '\t');
-        int dur = 0, track = 0;
+        int dur = 0, track = 0, notag = 0;
         if (p5) {
             *p5++ = 0;
             char *p6 = strchr(p5, '\t');
-            if (p6) { *p6++ = 0; dur = atoi(p5); track = atoi(p6); }
-            else dur = atoi(p5);
+            if (p6) {
+                *p6++ = 0;
+                dur = atoi(p5);
+                char *p7 = strchr(p6, '\t');
+                if (p7) { *p7++ = 0; track = atoi(p6); notag = atoi(p7); }
+                else track = atoi(p6);
+            } else dur = atoi(p5);
         }
-        LibEntry e = { p1, p2, p3, p4, dur, track };
+        LibEntry e = { p1, p2, p3, p4, dur, track, notag };
         fn(&e, ud);
         n++;
     }
     fclose(f);
     return n;
+}
+
+/* one pass over the index, sorted for binary search: fills tags and
+   duration for playlist items whose title is still empty. exact path
+   match only (index paths are realpath'd at scan time); anything not
+   found falls through to the file-based pl_scan_tags. the caller must
+   hold the playlist lock. */
+typedef struct { char *path, *artist, *title, *album; int dur, track, notag; } IdxRow;
+
+static int cmprow(const void *a, const void *b) {
+    return strcmp(((const IdxRow *)a)->path, ((const IdxRow *)b)->path);
+}
+
+void lib_fill_playlist(Playlist *p) {
+    char idx[LV_MAX_PATH];
+    lib_index_path(idx, sizeof idx);
+    FILE *r = fopen(idx, "r");
+    if (!r) return;
+    IdxRow *rows = NULL;
+    int rn = 0, cap = 0;
+    char line[8192];
+    while (fgets(line, sizeof line, r)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *p1 = line;
+        char *p2 = strchr(p1, '\t'); if (!p2) continue; *p2++ = 0;
+        char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
+        char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
+        char *p5 = strchr(p4, '\t');
+        int dur = 0, track = 0, notag = 0;
+        if (p5) {
+            *p5++ = 0;
+            char *p6 = strchr(p5, '\t');
+            if (p6) {
+                *p6++ = 0;
+                dur = atoi(p5);
+                char *p7 = strchr(p6, '\t');
+                if (p7) { *p7++ = 0; track = atoi(p6); notag = atoi(p7); }
+                else track = atoi(p6);
+            } else dur = atoi(p5);
+        }
+        if (!p1[0]) continue;
+        if (rn == cap) {
+            cap = cap ? cap * 2 : 256;
+            IdxRow *x = realloc(rows, (size_t)cap * sizeof *rows);
+            if (!x) break;
+            rows = x;
+        }
+        rows[rn].path = strdup(p1);
+        rows[rn].artist = strdup(p2);
+        rows[rn].title = strdup(p3);
+        rows[rn].album = strdup(p4);
+        rows[rn].dur = dur;
+        rows[rn].track = track;
+        rows[rn].notag = notag;
+        rn++;
+    }
+    fclose(r);
+    if (!rn) { free(rows); return; }
+    qsort(rows, (size_t)rn, sizeof *rows, cmprow);
+    for (int i = 0; i < p->count; i++) {
+        Track *t = &p->items[i];
+        if (t->tags.title[0]) continue;
+        IdxRow key = { t->path, NULL, NULL, NULL, 0, 0, 0 };
+        IdxRow *hit = bsearch(&key, rows, (size_t)rn, sizeof *rows, cmprow);
+        if (!hit) continue;
+        if (hit->artist[0]) lv_strlcpy(t->tags.artist, hit->artist, sizeof t->tags.artist);
+        if (hit->title[0]) lv_strlcpy(t->tags.title, hit->title, sizeof t->tags.title);
+        if (hit->album[0]) lv_strlcpy(t->tags.album, hit->album, sizeof t->tags.album);
+        if (hit->track) t->tags.track = hit->track;
+        if (hit->dur) t->duration = hit->dur;
+        t->notag = hit->notag;
+    }
+    for (int i = 0; i < rn; i++) {
+        free(rows[i].path);
+        free(rows[i].artist);
+        free(rows[i].title);
+        free(rows[i].album);
+    }
+    free(rows);
 }
 
 static int cmd_list(const char *filter, FILE *out) {

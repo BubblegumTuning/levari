@@ -8,7 +8,7 @@ SDL2 UI with software-rendered skinning, mp3/ogg/opus/flac/wav/mod/s3m/
 xm/it decoding (plus aac/m4a/wma via optional libav* backend), CJK
 (JIS X 0208) text,
 playlist, 10-band EQ, spectrum viz, CUE sheets, daemon + CLI control,
-media library, and search.
+MPRIS, media library, and search.
 
 ## Build
 
@@ -19,7 +19,10 @@ Requires: SDL2 dev headers, a C++ compiler (for the vendored libmodplug
 module decoder). Everything else is vendored in `third_party/`.
 If `libavformat/libavcodec/libavutil` dev packages are present, CMake
 enables them automatically for aac/m4a/wma support; without them the
-player builds and runs, just without those formats.
+player builds and runs, just without those formats. On Linux, if
+`dbus-devel` (pkg-config `dbus-1`) is present, MPRIS support is built
+in (desktop media keys, player widgets, `playerctl`); without it the
+player runs the same, just off the desktop's radar.
 
 Optional: `-DENABLE_MCP=ON` also builds `levari-mcp`, a stdio MCP
 (Model Context Protocol) server for LLM control of the player
@@ -67,4 +70,4 @@ build yet).
 
 - [docs/ui.md](docs/ui.md) — windows, hotkeys, search, window snapping
 - [docs/buttons.md](docs/buttons.md) — what every button in the interface does
-- [docs/usage.md](docs/usage.md) — CLI flags, daemon commands, media library
+- [docs/usage.md](docs/usage.md) — CLI flags, daemon commands, MPRIS, media library
