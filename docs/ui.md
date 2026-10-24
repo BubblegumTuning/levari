@@ -24,10 +24,12 @@ For a per-button reference of every control in each window, see
   opens docked flush to the main window's right edge, top-aligned, as wide
   as the main+playlist stack plus a margin for the `SCAN` button.
   Edits the config file (see [usage.md](usage.md)): library scan dirs
-  `:`-separated, hover for the tooltip), library index path
+  `;`-separated, hover for the tooltip), library index path
   (default `~/.levari/index`), libav* directory, audio backend +
   device, daemon socket path, and startup window toggles
-  (playlist/EQ/VIS/search).
+  (playlist/EQ/VIS/search). Fields take an editing caret: arrows move
+  it (Home/End jump), typing inserts at it, Backspace deletes before
+  it, Delete removes at it; long text scrolls to keep the caret in view.
   `SAVE` writes `~/.config/levari/config` immediately; audio backend/device
   take effect on the next track, libav dir and socket path on restart.
   `SCAN` (beside the library dirs field) indexes those dirs in a background
@@ -80,6 +82,8 @@ there is no room on the left).
     s shuffle   r repeat   Ctrl+L rescan tags
     e equalizer   o open browser
     Left/Right seek ±5s   Up/Down volume
+    Next/Prev/Play-Stop media keys (when levari is focused; globally
+    through MPRIS on Linux, see usage.md)
     Esc quit
 
 While the search window has keyboard focus its keys go to the search box

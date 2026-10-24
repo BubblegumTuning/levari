@@ -52,6 +52,8 @@ int  font_cp_w16(unsigned cp);
 int  font_w16(const char *str);
 int  font_utf8_next(const char *s, unsigned *cp);
 int  font_fit(const char *s, int maxw);
+/* start of the trailing suffix that fits; == s when all of s fits */
+const char *font_fit_tail(const char *s, int maxw);
 /* double-size (10x14) variant for the play-time box */
 void font_puts_big(SDL_Surface *s, int x, int y, const char *str, Uint32 color);
 int  font_w_big(const char *str);

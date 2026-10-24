@@ -10,7 +10,7 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.2.2"
+#define LV_VERSION "0.2.4"
 #endif
 
 static inline void lv_strlcpy(char *dst, const char *src, size_t n) {
@@ -62,6 +62,18 @@ static inline char *lv_strrsep(const char *s) {
 #else
     return strrchr(s, '/');
 #endif
+}
+
+/* display name for an untagged file: basename with '_' rendered as a
+   space ("artist_-_song_name.mp3" -> "artist - song name.mp3").
+   real tags always win; this is only the fallback render. */
+static inline void lv_pretty_name(const char *path, char *out, size_t n) {
+    const char *base = lv_strrsep(path);
+    base = base ? base + 1 : path;
+    size_t i = 0;
+    for (; i + 1 < n && base[i]; i++)
+        out[i] = base[i] == '_' ? ' ' : base[i];
+    out[i] = 0;
 }
 
 /* absolute path: "/", "\foo", "C:\foo", "C:foo" (drive-relative is not

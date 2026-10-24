@@ -3,6 +3,7 @@
 #include "playlist/playlist.h"
 #include "decode/decode.h"
 #include "daemon/daemon.h"
+#include "mpris/mpris.h"
 #include "library/library.h"
 #include "config/config.h"
 #include "common.h"
@@ -103,9 +104,11 @@ int main(int argc, char **argv) {
 
     pl_player_start(&player);
     srv_start(&player);
+    mpris_start(&player);
     if (playlist.count > 0) pl_post(&player, CMD_PLAY, 0);
     if (selftest > 0) ui_deadline_ms = (unsigned)(selftest * 1000);
     ui_run(&player, show_pl);
+    mpris_stop();
     srv_stop();
     printf("selftest: cur=%d state=%d pos=%lld/%lld rate=%d\n",
            player.cur, player.state, player.pos_frames, player.total_frames, player.rate);

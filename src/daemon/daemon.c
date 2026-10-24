@@ -1,5 +1,6 @@
 #include "daemon.h"
 #include "../playlist/playlist.h"
+#include "../library/library.h"
 #include "../config/config.h"
 #include "../common.h"
 #ifdef _WIN32
@@ -72,15 +73,28 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         char *rest = line + 4;
         while (*rest == ' ') rest++;
         if (*rest) {
-            pthread_mutex_lock(&p->mtx);
-            pl_clear(p->pl);
+            /* build into a temp playlist WITHOUT holding p->mtx: a
+               multi-MB m3u on a network share can take a while, and the
+               UI draw loop blocks on that mutex every frame -- holding
+               it through the load makes the desktop declare the window
+               unresponsive. only the swap is locked. */
+            Playlist np;
+            pl_init(&np);
             char *tok = strtok(rest, " ");
             while (tok) {
                 const char *dot = strrchr(tok, '.');
-                if (dot && !lv_strcasecmp(dot, ".m3u")) pl_load_m3u(p->pl, tok);
-                else pl_add(p->pl, tok);
+                if (dot && !lv_strcasecmp(dot, ".m3u")) pl_load_m3u(&np, tok);
+                else pl_add(&np, tok);
                 tok = strtok(NULL, " ");
             }
+            /* index first: library queries arrive as bare paths, and the
+               index already holds tags + duration for scanned files */
+            lib_fill_playlist(&np);
+            pthread_mutex_lock(&p->mtx);
+            pl_clear(p->pl);
+            p->pl->items = np.items;
+            p->pl->count = np.count;
+            p->pl->cap = np.cap;
             pthread_mutex_unlock(&p->mtx);
             pl_post(p, CMD_PLAY, 0);
         } else {
@@ -160,7 +174,10 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         int off = 0;
         for (int i = 0; i < p->pl->count && off < (int)rn - 64; i++) {
             Track *t = &p->pl->items[i];
-            const char *name = t->tags.title[0] ? t->tags.title : t->path;
+            char pretty[LV_MAX_PATH];
+            const char *name;
+            if (t->tags.title[0]) name = t->tags.title;
+            else { lv_pretty_name(t->path, pretty, sizeof pretty); name = pretty; }
             off += snprintf(resp + off, rn - off, "%d\t%s\t%s\n", i + 1, name, t->path);
         }
         pthread_mutex_unlock(&p->mtx);
@@ -174,6 +191,7 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         if (*rest) {
             pthread_mutex_lock(&p->mtx);
             pl_add(p->pl, rest);
+            lib_fill_playlist(p->pl);
             pthread_mutex_unlock(&p->mtx);
         }
         lv_strlcpy(resp, "OK", rn);
