@@ -37,7 +37,7 @@ hides that window (its state is kept).
 
 | Slider | Action |
 |---|---|
-| `VOL` | Click or drag the knob to set volume (0–128). |
+| `VOL` | Click or drag the knob to set volume (0–128). Gain is quadratic: `(vol/128)²`, so the slider tracks perceived loudness better than linear (64 ≈ −12 dB). |
 | `BIAS` | Click or drag to set left/right balance (−32..+32). |
 | Seek bar | Click anywhere or drag the (double-width) knob to seek within the current track. For module files (mod/s3m/xm/it) seeking is approximate — it jumps to the nearest pattern order position. |
 

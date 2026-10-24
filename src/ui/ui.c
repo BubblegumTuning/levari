@@ -5,6 +5,7 @@
 #include "../viz/viz.h"
 #include "../config/config.h"
 #include "../library/library.h"
+#include "../mpris/mpris.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,7 @@ typedef struct {
     int file_n, file_scroll, file_sel, file_visible;
     /* options window */
     int opt_visible, opt_focus, opt_hover;
+    int opt_caret;               /* caret byte offset in the focused field (codepoint boundary) */
     int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch;
@@ -90,6 +92,7 @@ typedef struct {
     int drag_gx, drag_gy;   /* global mouse pos at drag start */
     int drag_wx, drag_wy;   /* window pos at drag start */
     Uint32 focus_wid;       /* window id of the focused one of ours */
+    int app_focused;        /* 1 while any of our windows holds WM focus */
     /* windows snapped beside the main one: follow it while it moves.
        slots: 0 eq, 1 file, 2 search, 3 options; w = NULL when not snapped */
     struct { SDL_Window *w; int dx, dy; } snap[4];
@@ -360,9 +363,17 @@ static void draw_main(void) {
             if (ci >= 0 && ci < p->pl->count)
                 lv_strlcpy(path, p->pl->items[ci].path, sizeof path);
             pthread_mutex_unlock(&p->mtx);
-            struct stat st;
-            if (path[0] && stat(path, &st) == 0 && st.st_size > 0)
-                kbps = (int)((double)st.st_size * 8 * p->rate /
+            /* stat once per track, not once per frame: on network
+               shares a per-frame stat is a per-frame round-trip */
+            static char sz_path[LV_MAX_PATH];
+            static long long sz_size;
+            if (path[0] && strcmp(path, sz_path) != 0) {
+                struct stat st;
+                sz_size = (stat(path, &st) == 0) ? st.st_size : 0;
+                lv_strlcpy(sz_path, path, sizeof sz_path);
+            }
+            if (sz_size > 0)
+                kbps = (int)((double)sz_size * 8 * p->rate /
                              (1000 * (double)tf) + 0.5);
         }
         if (kbps > 0)
@@ -475,7 +486,10 @@ static void draw_pl(void) {
         if (idx >= pl->count) break;
         Track *t = &pl->items[idx];
         char line[512];
-        const char *name = t->tags.title[0] ? t->tags.title : strrchr(t->path, '/') ? strrchr(t->path, '/') + 1 : t->path;
+        char pretty[LV_MAX_PATH];
+        const char *name;
+        if (t->tags.title[0]) name = t->tags.title;
+        else { lv_pretty_name(t->path, pretty, sizeof pretty); name = pretty; }
         if (t->duration) snprintf(line, sizeof line, "%02d. %s [%d:%02d]", idx + 1, name, t->duration / 60, t->duration % 60);
         else snprintf(line, sizeof line, "%02d. %s", idx + 1, name);
         /* truncate to fit, without splitting UTF-8 sequences */
@@ -603,8 +617,9 @@ static void refresh_title(void) {
                 snprintf(buf, sizeof buf, "  %s", g->title);
             }
         } else {
-            const char *base = strrchr(t->path, '/');
-            snprintf(buf, sizeof buf, "  %s", base ? base + 1 : t->path);
+            char pretty[LV_MAX_PATH];
+            lv_pretty_name(t->path, pretty, sizeof pretty);
+            snprintf(buf, sizeof buf, "  %s", pretty);
         }
     }
     pthread_mutex_unlock(&p->mtx);
@@ -787,6 +802,7 @@ static void file_adddir(void) {
     pthread_mutex_lock(&p->mtx);
     int old = p->pl->count;
     pl_add(p->pl, ui.file_dir);
+    lib_fill_playlist(p->pl);
     int added = p->pl->count - old;
     pthread_mutex_unlock(&p->mtx);
     if (added > 0) pl_post(p, CMD_PLAY, old);
@@ -820,6 +836,7 @@ static void file_choose(const char *name) {
     Player *p = ui.pl;
     pthread_mutex_lock(&p->mtx);
     pl_add(p->pl, full);
+    lib_fill_playlist(p->pl);
     int idx = p->pl->count - 1;
     pthread_mutex_unlock(&p->mtx);
     pl_post(p, CMD_PLAY, idx);
@@ -945,7 +962,7 @@ static void opt_open(void) {
     }
     ui.opt_field[OPTF_LIBDIRS][0] = 0;
     for (int i = 0; i < cfg.lib_dir_n; i++) {
-        if (i) strncat(ui.opt_field[OPTF_LIBDIRS], ":", LV_MAX_PATH - strlen(ui.opt_field[OPTF_LIBDIRS]) - 1);
+        if (i) strncat(ui.opt_field[OPTF_LIBDIRS], ";", LV_MAX_PATH - strlen(ui.opt_field[OPTF_LIBDIRS]) - 1);
         strncat(ui.opt_field[OPTF_LIBDIRS], cfg.lib_dirs[i],
                 LV_MAX_PATH - strlen(ui.opt_field[OPTF_LIBDIRS]) - 1);
     }
@@ -961,6 +978,7 @@ static void opt_open(void) {
     ui.opt_srch = cfg.ui_search > 0;
     ui.opt_hover = -1;
     ui.opt_focus = -1;
+    ui.opt_caret = 0;
     ui.opt_selall = 0;
     ui.opt_status[0] = 0;
     ui.opt_tags = 1;
@@ -972,6 +990,7 @@ static void opt_open(void) {
 static void opt_close(void) {
     ui.opt_visible = 0;
     ui.opt_focus = -1;
+    ui.opt_caret = 0;
     if (ui.wopt) SDL_HideWindow(ui.wopt);
     SDL_StopTextInput();
 }
@@ -980,12 +999,12 @@ static void opt_save(void) {
     cfg.lib_dir_n = 0;
     char copy[LV_MAX_PATH];
     lv_strlcpy(copy, ui.opt_field[OPTF_LIBDIRS], sizeof copy);
-    char *tok = strtok(copy, ":");
+    char *tok = strtok(copy, ";");
     while (tok) {
         while (*tok == ' ') tok++;
         if (*tok && cfg.lib_dir_n < CFG_MAX_LIBDIRS)
             lv_strlcpy(cfg.lib_dirs[cfg.lib_dir_n++], tok, LV_MAX_PATH);
-        tok = strtok(NULL, ":");
+        tok = strtok(NULL, ";");
     }
     lv_strlcpy(cfg.lib_index,     ui.opt_field[OPTF_LIBIDX],  sizeof cfg.lib_index);
     lv_strlcpy(cfg.libav_dir,     ui.opt_field[OPTF_LIBAV],   sizeof cfg.libav_dir);
@@ -1018,11 +1037,11 @@ static void opt_start_scan(void) {
     int n = 0;
     char copy[LV_MAX_PATH];
     lv_strlcpy(copy, ui.opt_field[OPTF_LIBDIRS], sizeof copy);
-    char *tok = strtok(copy, ":");
+    char *tok = strtok(copy, ";");
     while (tok && n < CFG_MAX_LIBDIRS) {
         while (*tok == ' ') tok++;
         if (*tok) lv_strlcpy(dirs[n++], tok, LV_MAX_PATH);
-        tok = strtok(NULL, ":");
+        tok = strtok(NULL, ";");
     }
     if (!n) { lv_strlcpy(ui.opt_status, "no library dirs set", sizeof ui.opt_status); return; }
     ScanArg *a = malloc(sizeof *a);
@@ -1079,17 +1098,38 @@ static void draw_opt(void) {
         SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
         char val[LV_MAX_PATH];
         lv_strlcpy(val, ui.opt_field[i], sizeof val);
-        int fit = font_fit(val, f.w - 8);
-        if ((int)strlen(val) > fit) val[fit] = 0;
-        if (ui.opt_focus == i && ui.opt_selall && val[0]) {
-            SDL_Rect hl = { f.x + 3, f.y + 1, (unsigned)font_w16(val), (unsigned)(f.h - 2) };
+        /* text longer than the box scrolls left. Unfocused: the trailing
+           suffix shows. Focused: the window is anchored on the caret so it
+           and its surroundings stay visible while editing mid-string. */
+        char disp[LV_MAX_PATH];
+        const char *shown;
+        int caret_w = 0;
+        if (ui.opt_focus == i) {
+            int len = (int)strlen(val);
+            if (ui.opt_caret < 0 || ui.opt_caret > len) ui.opt_caret = len;
+            char pre[LV_MAX_PATH];
+            lv_strlcpy(pre, val, (size_t)ui.opt_caret + 1);
+            const char *st = font_fit_tail(pre, f.w - 8);
+            int off = (int)(st - pre);
+            caret_w = font_w16(st);
+            int room = (f.w - 8) - caret_w;
+            int extra = room > 0 ? font_fit(val + ui.opt_caret, room) : 0;
+            int shown_len = (ui.opt_caret - off) + extra;
+            memcpy(disp, val + off, (size_t)shown_len);
+            disp[shown_len] = 0;
+            shown = disp;
+        } else {
+            shown = font_fit_tail(val, f.w - 8);
+        }
+        if (ui.opt_focus == i && ui.opt_selall && shown[0]) {
+            SDL_Rect hl = { f.x + 3, f.y + 1, (unsigned)font_w16(shown), (unsigned)(f.h - 2) };
             if (hl.x + (int)hl.w > f.x + f.w - 3)
                 hl.w = f.x + f.w - 3 - hl.x;
             if (hl.w > 0) SDL_FillRect(s, &hl, col(s, 40, 60, 120));
         }
-        font_puts16(s, f.x + 3, f.y + 1, val, col(s, 220, 220, 220));
+        font_puts16(s, f.x + 3, f.y + 1, shown, col(s, 220, 220, 220));
         if (ui.opt_focus == i) {
-            int cx = f.x + 3 + font_w16(val) + 1;
+            int cx = f.x + 3 + caret_w + 1;
             if (cx < f.x + f.w - 2) {
                 SDL_Rect c = { cx, f.y + 3, 1, f.h - 6 };
                 SDL_FillRect(s, &c, col(s, 255, 255, 255));
@@ -1162,7 +1202,7 @@ static void draw_opt(void) {
         SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
         SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
         font_puts(s, tb.x + 6, tb.y + 5, "dirs are scanned recursively", col(s, 220, 220, 220));
-        font_puts(s, tb.x + 6, tb.y + 17, "separate multiple dirs with ':'", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 17, "separate multiple dirs with ';'", col(s, 220, 220, 220));
     }
 }
 
@@ -1188,6 +1228,7 @@ static void handle_opt_mouse(SDL_Event *e) {
             Rect f = opt_field_rect(i);
             if (in_rect(&f, x, y)) {
                 ui.opt_focus = i;
+                ui.opt_caret = (int)strlen(ui.opt_field[i]);
                 ui.opt_selall = 0;
                 SDL_SetWindowInputFocus(ui.wopt);
                 SDL_StartTextInput();
@@ -1240,6 +1281,27 @@ static void opt_key(SDL_Event *e) {
     char *f = ui.opt_field[ui.opt_focus];
     int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
     switch (e->key.keysym.sym) {
+    case SDLK_LEFT:
+        if (ui.opt_selall) { ui.opt_caret = 0; ui.opt_selall = 0; break; }
+        if (ui.opt_caret > 0) {
+            int q = ui.opt_caret - 1;
+            while (q > 0 && ((unsigned char)f[q] & 0xC0) == 0x80) q--;
+            ui.opt_caret = q;
+        }
+        break;
+    case SDLK_RIGHT:
+        if (ui.opt_selall) { ui.opt_caret = (int)strlen(f); ui.opt_selall = 0; break; }
+        if (ui.opt_caret < (int)strlen(f)) {
+            unsigned cp;
+            ui.opt_caret += font_utf8_next(f + ui.opt_caret, &cp);
+        }
+        break;
+    case SDLK_HOME:
+        ui.opt_caret = 0; ui.opt_selall = 0;
+        break;
+    case SDLK_END:
+        ui.opt_caret = (int)strlen(f); ui.opt_selall = 0;
+        break;
     case SDLK_a:
         if (ctrl) ui.opt_selall = f[0] ? 1 : 0;
         break;
@@ -1248,27 +1310,43 @@ static void opt_key(SDL_Event *e) {
         break;
     case SDLK_x:
         if (ctrl) {
-            if (ui.opt_selall && f[0]) { ui_clip_copy(f); f[0] = 0; ui.opt_selall = 0; }
+            if (ui.opt_selall && f[0]) { ui_clip_copy(f); f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; }
         }
         break;
     case SDLK_v:
         if (ctrl) {
-            if (ui.opt_selall) { f[0] = 0; ui.opt_selall = 0; }
-            ui_clip_paste(f, sizeof ui.opt_field[0]);
+            if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; }
+            char tmp[LV_MAX_PATH];
+            tmp[0] = 0;
+            if (ui_clip_paste(tmp, sizeof tmp)) {
+                size_t tl = strlen(tmp), len = strlen(f);
+                if (len + tl < LV_MAX_PATH - 1) {
+                    memmove(f + ui.opt_caret + tl, f + ui.opt_caret, len - (size_t)ui.opt_caret + 1);
+                    memcpy(f + ui.opt_caret, tmp, tl);
+                    ui.opt_caret += (int)tl;
+                }
+            }
         }
         break;
     case SDLK_BACKSPACE: {
-        if (ui.opt_selall) { f[0] = 0; ui.opt_selall = 0; return; }
-        size_t n = strlen(f);
-        if (!n) return;
-        /* delete the last whole utf8 codepoint */
-        size_t i = n - 1;
-        while (i > 0 && ((unsigned char)f[i] & 0xC0) == 0x80) i--;
-        f[i] = 0;
+        if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; return; }
+        int c = ui.opt_caret;
+        if (c <= 0) return;
+        int q = c - 1;
+        while (q > 0 && ((unsigned char)f[q] & 0xC0) == 0x80) q--;
+        size_t len = strlen(f);
+        memmove(f + q, f + c, len - (size_t)c + 1);
+        ui.opt_caret = q;
         break;
     }
     case SDLK_DELETE:
-        if (ui.opt_selall) { f[0] = 0; ui.opt_selall = 0; }
+        if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; break; }
+        if (ui.opt_caret < (int)strlen(f)) {
+            unsigned cp;
+            int n = font_utf8_next(f + ui.opt_caret, &cp);
+            size_t len = strlen(f);
+            memmove(f + ui.opt_caret, f + ui.opt_caret + n, len - (size_t)ui.opt_caret - (size_t)n + 1);
+        }
         break;
     }
 }
@@ -1276,14 +1354,18 @@ static void opt_key(SDL_Event *e) {
 static void opt_text(const char *text) {
     if (ui.opt_focus < 0) return;
     char *f = ui.opt_field[ui.opt_focus];
-    if (ui.opt_selall) { f[0] = 0; ui.opt_selall = 0; }
-    size_t n = strlen(f);
-    if (n + strlen(text) < LV_MAX_PATH - 1) strcat(f, text);
+    if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; }
+    size_t tl = strlen(text), len = strlen(f);
+    if (len + tl >= LV_MAX_PATH - 1) return;
+    if (ui.opt_caret < 0 || ui.opt_caret > (int)len) ui.opt_caret = (int)len;
+    memmove(f + ui.opt_caret + tl, f + ui.opt_caret, len - (size_t)ui.opt_caret + 1);
+    memcpy(f + ui.opt_caret, text, tl);
+    ui.opt_caret += (int)tl;
 }
 
 static void pl_add_lib_cb(const LibEntry *e, void *ud) {
     Playlist *pl = ud;
-    pl_add(pl, e->path);
+    pl_add_file(pl, e->path); /* index rows are always files: no stat needed */
     if (!pl->count) return;
     Track *t = &pl->items[pl->count - 1];
     lv_strlcpy(t->tags.artist, e->artist, sizeof t->tags.artist);
@@ -1291,6 +1373,7 @@ static void pl_add_lib_cb(const LibEntry *e, void *ud) {
     lv_strlcpy(t->tags.album, e->album, sizeof t->tags.album);
     t->duration = e->duration;
     t->tags.track = e->track;
+    t->notag = e->notag;
 }
 
 static void action(int id) {
@@ -1730,6 +1813,7 @@ int ui_run(Player *p, int show_pl) {
     int running = 1;
     while (running) {
         if (ui_deadline_ms && SDL_GetTicks() >= ui_deadline_ms) break;
+        if (mpris_take_raise()) raise_all(); /* MPRIS Raise request */
         SDL_Event e;
         int wait = (int)(next > SDL_GetTicks() ? next - SDL_GetTicks() : 0);
         if (SDL_WaitEventTimeout(&e, wait)) switch (e.type) {
@@ -1744,39 +1828,43 @@ int ui_run(Player *p, int show_pl) {
                 search_surface_refresh();
             /* whichever of our windows gets focus, bring the whole set forward
                so activating the playlist never leaves the main window buried */
+            if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                /* focus left us for another app (or a window of ours closed):
+                   the next FOCUS_GAINED must re-raise the whole set */
+                ui.app_focused = 0;
+            }
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
-                Uint32 prev_focus = ui.focus_wid;
+                int was_focused = ui.app_focused;
+                ui.app_focused = 1;
                 ui.focus_wid = e.window.windowID;
                 focus_click_drag(e.window.windowID);
                 if (search_is_open() && e.window.windowID == search_window_id()) SDL_StartTextInput();
                 else if (ui.opt_visible && ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) SDL_StartTextInput();
                 else SDL_StopTextInput();
-                /* focus moving between our own windows means the set is already
-                   grouped; re-raising on every internal focus change risks a
-                   raise->focus->raise storm (proven on Cocoa, guard everywhere) */
-                int prev_ours = prev_focus && (
-                    prev_focus == SDL_GetWindowID(ui.wmain) ||
-                    (ui.wpl && prev_focus == SDL_GetWindowID(ui.wpl)) ||
-                    (ui.weq && prev_focus == SDL_GetWindowID(ui.weq)) ||
-                    (ui.wfile && prev_focus == SDL_GetWindowID(ui.wfile)) ||
-                    (ui.wopt && prev_focus == SDL_GetWindowID(ui.wopt)) ||
-                    (search_is_open() && prev_focus == search_window_id()));
-                if (!prev_ours &&
-                    (e.window.windowID == SDL_GetWindowID(ui.wmain) ||
-                     e.window.windowID == SDL_GetWindowID(ui.wpl) ||
-                     (ui.weq && e.window.windowID == SDL_GetWindowID(ui.weq)) ||
-                     (ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) ||
-                     (ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) ||
-                     (search_is_open() && e.window.windowID == search_window_id())))
-                    raise_all();
+                /* the set surfaces as a unit: when focus arrives from another
+                   app, raise every visible window, not just the one the WM
+                   clicked. The raise->focus->raise storm is Cocoa-only
+                   (SDL_RaiseWindow = makeKeyAndOrderFront); on X11/Windows
+                   XRaiseWindow/SetWindowPos never move focus, and raise_all()
+                   is a no-op on Cocoa anyway */
+                if (!was_focused) raise_all();
             }
             break;
         case SDL_KEYDOWN:
-            if (search_is_open() && ui.focus_wid == search_window_id()) search_key(&e);
-            else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_key(&e);
-            else if (ui.pl_visible && ui.wpl && ui.focus_wid == SDL_GetWindowID(ui.wpl)) {
-                if (!pl_key(&e)) handle_key(&e);
-            } else handle_key(&e);
+            /* media keys bypass the focus routing: they belong to the
+               player, not to whichever window has the caret */
+            switch (e.key.keysym.sym) {
+            case SDLK_AUDIONEXT: pl_post(p, CMD_NEXT, 0); break;
+            case SDLK_AUDIOPREV: pl_post(p, CMD_PREV, 0); break;
+            case SDLK_AUDIOPLAY: pl_post(p, CMD_TOGGLE_PAUSE, 0); break;
+            case SDLK_AUDIOSTOP: pl_post(p, CMD_STOP, 0); break;
+            default:
+                if (search_is_open() && ui.focus_wid == search_window_id()) search_key(&e);
+                else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_key(&e);
+                else if (ui.pl_visible && ui.wpl && ui.focus_wid == SDL_GetWindowID(ui.wpl)) {
+                    if (!pl_key(&e)) handle_key(&e);
+                } else handle_key(&e);
+            }
             break;
         case SDL_TEXTINPUT:
             if (search_is_open() && ui.focus_wid == search_window_id()) search_text(e.text.text);

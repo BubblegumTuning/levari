@@ -357,6 +357,26 @@ int font_fit(const char *s, int maxw) {
     return bytes;
 }
 
+/* start of the longest trailing suffix of s that fits in maxw pixels on the
+   16px grid; == s when all of s fits. UTF-8 safe: walks back over
+   continuation bytes so a codepoint is never split mid-glyph. */
+const char *font_fit_tail(const char *s, int maxw) {
+    const char *p = s + strlen(s);
+    int used = 0;
+    while (p > s) {
+        const char *q = p - 1;
+        while (q > s && ((unsigned char)*q & 0xC0) == 0x80) q--;
+        unsigned cp;
+        int n = font_utf8_next(q, &cp);
+        if (q + n != p) { p = q; continue; } /* malformed: drop it, keep the rest */
+        int w = font_cp_w16(cp);
+        if (used + w > maxw + 1) break;
+        used += w;
+        p = q;
+    }
+    return p;
+}
+
 int font_w(const char *str) {
     int n = 0;
     while (*str) {

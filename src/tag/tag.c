@@ -2,6 +2,12 @@
 #include "../common.h"
 #include <ctype.h>
 
+/* One head read per file: on network / spinning-disk storage every open and
+   every seek to a new region costs a round-trip, so tag_probe pulls this
+   much up front and parses everything it can from memory. The tail is
+   visited only when an ID3v1 record can still add something. */
+#define TAG_HEAD (128 * 1024)
+
 void tag_init(Tags *t) {
     t->title[0] = t->artist[0] = t->album[0] = 0;
     t->track = 0;
@@ -112,15 +118,13 @@ static void text_frame(Tags *t, const char *id, const unsigned char *p, size_t n
     }
 }
 
-static void read_id3v2(FILE *f, Tags *t) {
-    unsigned char h[10];
-    if (fread(h, 1, 10, f) != 10) return;
-    int ver = h[3];
-    if (ver < 2 || ver > 4) return;
-    size_t sz = ((size_t)h[6] << 21) | ((size_t)h[7] << 14) | ((size_t)h[8] << 7) | h[9];
-    if (sz > (1u << 24)) return;
-    unsigned char *buf = malloc(sz);
-    if (!buf || fread(buf, 1, sz, f) != sz) { free(buf); return; }
+static unsigned be32(const unsigned char *p) {
+    return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) |
+           ((unsigned)p[2] << 8) | p[3];
+}
+
+/* walk ID3v2 frames (ver 2/3/4) from a memory buffer */
+static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, Tags *t) {
     size_t i = 0;
     int idlen = ver == 2 ? 3 : 4;
     while (i + (size_t)(idlen + (ver == 2 ? 3 : 6)) <= sz) {
@@ -143,7 +147,13 @@ static void read_id3v2(FILE *f, Tags *t) {
         if (id[0] == 'T') text_frame(t, id, buf + i, fsz);
         i += fsz;
     }
-    free(buf);
+}
+
+/* ID3v1 fills only what the head parse left empty: ID3v2 wins when both
+   exist (the old code let the v1 tail overwrite the v2 values) */
+static void fill_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
+    if (dst[0]) return;
+    copy_fixed(dst, dn, src, n);
 }
 
 static void read_id3v1(FILE *f, Tags *t) {
@@ -151,10 +161,17 @@ static void read_id3v1(FILE *f, Tags *t) {
     unsigned char r[128];
     if (fread(r, 1, 128, f) != 128) return;
     if (memcmp(r, "TAG", 3) != 0) return;
-    copy_fixed(t->title, sizeof t->title, r + 3, 30);
-    copy_fixed(t->artist, sizeof t->artist, r + 33, 30);
-    copy_fixed(t->album, sizeof t->album, r + 63, 30);
-    if (r[93 + 28] == 0 && r[93 + 29] != 0) t->track = r[93 + 29];
+    fill_fixed(t->title, sizeof t->title, r + 3, 30);
+    fill_fixed(t->artist, sizeof t->artist, r + 33, 30);
+    fill_fixed(t->album, sizeof t->album, r + 63, 30);
+    if (!t->track && r[93 + 28] == 0 && r[93 + 29] != 0) t->track = r[93 + 29];
+}
+
+/* skip the tail seek entirely once the display fields are present: an
+   album/track carried only by ID3v1 is rare, and on spinning rust the
+   extra seek costs more than the field is worth */
+static int tags_complete(const Tags *t) {
+    return t->title[0] && t->artist[0];
 }
 
 static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
@@ -192,12 +209,53 @@ static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
     }
 }
 
-static void read_ogg(FILE *f, Tags *t) {
-    unsigned char buf[65536];
-    size_t n = fread(buf, 1, sizeof buf, f);
+/* STREAMINFO body: min/max blocksize (2B each), min/max framesize (3B each),
+   then sample rate 20b | channels-1 3b | bitsample-1 5b | total samples 36b
+   (fields byte-aligned as libFLAC/ffmpeg write them: sr spans p[10..12]
+   upper nibble, total samples spans p[13] lower nibble through p[17]).
+   Returns seconds, 0 = unusable. */
+static int flac_streaminfo_dur(const unsigned char *p, size_t n) {
+    if (n < 18) return 0;
+    unsigned sr = ((unsigned)p[10] << 12) | ((unsigned)p[11] << 4) | (p[12] >> 4);
+    unsigned long long ns = ((unsigned long long)(p[13] & 0x0F) << 32) |
+                            ((unsigned)p[14] << 24) | ((unsigned)p[15] << 16) |
+                            ((unsigned)p[16] << 8) | p[17];
+    if (!sr || !ns || ns / sr > 86400ULL) return 0;
+    return (int)(ns / sr);
+}
+
+/* walk a FLAC metadata block chain (b points after the "fLaC" magic):
+   4B header = last|type, 24-bit BE length. Fills tags from the VORBIS_COMMENT
+   block (type 4), returns duration from STREAMINFO (type 0), 0 = unknown. */
+static int flac_blocks(const unsigned char *b, size_t n, Tags *t) {
+    size_t i = 0;
+    int dur = 0;
+    for (;;) {
+        if (i + 4 > n) break;
+        int last = b[i] & 0x80;
+        unsigned type = b[i] & 0x7F;
+        size_t blen = ((size_t)b[i + 1] << 16) | ((size_t)b[i + 2] << 8) | b[i + 3];
+        i += 4;
+        if (blen > n - i) break;
+        if (type == 0) dur = flac_streaminfo_dur(b + i, blen);
+        else if (type == 4) vorbis_comment(t, b + i, blen);
+        i += blen;
+        if (last || (dur && tags_complete(t))) break;
+    }
+    return dur;
+}
+
+/* parse Ogg comments from the head buffer. Vorbis carries the comment in a
+   0x03 "vorbis" packet, Opus in "OpusTags" (identical framing after the
+   magic); Ogg FLAC opens with 0x7F "FLAC" and then one metadata block per
+   packet, same block types as native FLAC (ffmpeg additionally embeds the
+   fLaC magic + first blocks inside the marker packet). Returns duration
+   seconds (only FLAC can provide it here), 0 = unknown. */
+static int read_ogg(const unsigned char *buf, size_t n, Tags *t) {
     size_t i = 0;
     unsigned char pkt[65536];
     size_t pn = 0;
+    int flac = 0, dur = 0;
     while (i + 27 <= n) {
         if (memcmp(buf + i, "OggS", 4) != 0) { i++; continue; }
         unsigned char nseg = buf[i + 26];
@@ -217,15 +275,34 @@ static void read_ogg(FILE *f, Tags *t) {
                 /* packet complete */
                 if (pn > 7 && pkt[0] == 0x03 && memcmp(pkt + 1, "vorbis", 6) == 0) {
                     vorbis_comment(t, pkt + 7, pn - 7);
-                    return;
+                    return dur;
+                } else if (pn >= 8 && memcmp(pkt, "OpusTags", 8) == 0) {
+                    vorbis_comment(t, pkt + 8, pn - 8);
+                    return dur;
+                } else if (pn >= 5 && pkt[0] == 0x7F && memcmp(pkt + 1, "FLAC", 4) == 0) {
+                    flac = 1;
+                    /* marker = 0x7F "FLAC" + major + minor + 2B header-packet
+                       count; ffmpeg embeds the fLaC magic + first blocks here */
+                    if (pn >= 13 && memcmp(pkt + 9, "fLaC", 4) == 0)
+                        dur = flac_blocks(pkt + 13, pn - 13, t);
+                } else if (flac && pn >= 4) {
+                    unsigned type = pkt[0] & 0x7F;
+                    if (type == 0) dur = flac_streaminfo_dur(pkt + 4, pn - 4);
+                    else if (type == 4) {
+                        vorbis_comment(t, pkt + 4, pn - 4);
+                        return dur;
+                    }
                 }
                 pn = 0;
             }
         }
         i = page_body + body;
     }
+    return dur;
 }
 
+/* RIFF stays FILE-based: LIST INFO usually sits after the data chunk, so
+   the walk must be able to seek past audio the head buffer cannot hold */
 static void read_riff(FILE *f, Tags *t) {
     unsigned char h[12];
     if (fread(h, 1, 12, f) != 12) return;
@@ -269,13 +346,10 @@ static void read_riff(FILE *f, Tags *t) {
     }
 }
 
-static void read_module(FILE *f, Tags *t) {
+static void read_module(const unsigned char *h, size_t n, Tags *t) {
     static const char *modmag[] = { "M.K.", "M!K!", "M&K!", "N4C4", "FLT4", "FLT8",
                                     "4CHN", "6CHN", "8CHN", "16CH", "24CH", "32CH",
                                     "CD81", "OKTA", "FEST" };
-    unsigned char h[1084];
-    fseek(f, 0, SEEK_SET);
-    size_t n = fread(h, 1, sizeof h, f);
     if (n < 4) return;
     if (!memcmp(h, "IMPM", 4) && n >= 0x0C + 26)
         copy_fixed(t->title, sizeof t->title, h + 0x0C, 26);
@@ -288,22 +362,97 @@ static void read_module(FILE *f, Tags *t) {
             if (!memcmp(h + 1080, modmag[i], 4)) { copy_fixed(t->title, sizeof t->title, h, 20); break; }
 }
 
-void tag_read(const char *path, Tags *t) {
+/* Duration from the first MPEG frame header inside the head buffer:
+   XING/Info frame count (exact for VBR), else VBRI, else a CBR estimate
+   from the file size. Never reads the whole file. Returns seconds,
+   0 = unknown. off = first byte after ID3v2 (0 if none); fsize = size
+   hint from the caller's stat (0 = stat via f when absent). */
+static int mp3_head_duration(const unsigned char *b, size_t n, size_t off,
+                             long long fsize, FILE *f) {
+    static const int br_v1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
+    static const int br_v2[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0};
+    static const int sr_base[3] = {44100, 48000, 32000};
+    size_t i = off;
+    for (; i + 4 <= n; i++) {
+        if (b[i] != 0xFF || (b[i + 1] & 0xE0) != 0xE0) continue;
+        int ver = (b[i + 1] >> 3) & 3;    /* 3=MPEG1 2=MPEG2 0=MPEG2.5, 1=invalid */
+        int layer = (b[i + 1] >> 1) & 3;  /* 1=Layer III */
+        int bri = (b[i + 2] >> 4) & 0xF;
+        int sri = (b[i + 2] >> 2) & 3;
+        if (ver == 1 || layer != 1 || sri == 3 || bri == 0 || bri == 15) continue;
+        int bitrate = (ver == 3 ? br_v1 : br_v2)[bri] * 1000;
+        int rate = sr_base[sri] / (ver == 3 ? 1 : ver == 2 ? 2 : 4);
+        int spf = ver == 3 ? 1152 : 576;
+        size_t body = i + 4;
+        /* XING/Info follows the frame header and side info; scan a small
+           window instead of computing the exact side-info length */
+        for (size_t k = body; k + 12 <= n && k < body + 96; k++) {
+            if (memcmp(b + k, "XING", 4) && memcmp(b + k, "INFO", 4)) continue;
+            if (be32(b + k + 4) & 1) {
+                unsigned frames = be32(b + k + 8);
+                if (frames && (long long)frames * spf < (long long)rate * 86400)
+                    return (int)((long long)frames * spf / rate);
+            }
+            break;
+        }
+        /* VBRI sits at a fixed offset: frame body + 32; frames at +12 */
+        if (body + 48 <= n && !memcmp(b + body + 32, "VBRI", 4)) {
+            unsigned frames = be32(b + body + 44);
+            if (frames && (long long)frames * spf < (long long)rate * 86400)
+                return (int)((long long)frames * spf / rate);
+        }
+        if (fsize <= 0 && fseeko(f, 0, SEEK_END) == 0) fsize = ftello(f);
+        if (fsize > (long long)i) return (int)((fsize - (long long)i) * 8 / bitrate);
+        return 0;
+    }
+    return 0;
+}
+
+int tag_probe(const char *path, long long size_hint, Tags *t) {
     FILE *f = fopen(path, "rb");
-    if (!f) return;
-    unsigned char h[4] = {0};
-    size_t n = fread(h, 1, 4, f);
-    fseek(f, 0, SEEK_SET);
-    if (n >= 3 && h[0]=='I'&&h[1]=='D'&&h[2]=='3') {
-        read_id3v2(f, t);
-        read_id3v1(f, t);
-    } else if (n >= 4 && h[0]=='O'&&h[1]=='g'&&h[2]=='g'&&h[3]=='S') {
-        read_ogg(f, t);
-    } else if (n >= 4 && h[0]=='R'&&h[1]=='I'&&h[2]=='F'&&h[3]=='F') {
+    if (!f) return 0;
+    unsigned char *b = malloc(TAG_HEAD);
+    if (!b) { fclose(f); return 0; }
+    size_t n = fread(b, 1, TAG_HEAD, f);
+    int dur = 0;
+    if (n >= 3 && b[0]=='I' && b[1]=='D' && b[2]=='3') {
+        size_t tagend = 0;
+        if (n >= 10 && b[3] >= 2 && b[3] <= 4) {
+            size_t sz = ((size_t)b[6] << 21) | ((size_t)b[7] << 14) |
+                        ((size_t)b[8] << 7) | b[9];
+            if (sz <= (1u << 24)) {
+                if (10 + sz <= n) {
+                    id3v2_frames(b + 10, sz, b[3], t);
+                } else {
+                    /* tag larger than the head buffer: one follow-up read */
+                    unsigned char *tb = malloc(sz);
+                    if (tb && fseek(f, 10, SEEK_SET) == 0 &&
+                        fread(tb, 1, sz, f) == sz)
+                        id3v2_frames(tb, sz, b[3], t);
+                    free(tb);
+                }
+                tagend = 10 + sz;
+            }
+        }
+        dur = mp3_head_duration(b, n, tagend, size_hint, f);
+        if (!tags_complete(t)) read_id3v1(f, t);
+    } else if (n >= 4 && b[0]=='O' && b[1]=='g' && b[2]=='g' && b[3]=='S') {
+        dur = read_ogg(b, n, t);
+    } else if (n >= 4 && b[0]=='f' && b[1]=='L' && b[2]=='a' && b[3]=='C') {
+        dur = flac_blocks(b + 4, n - 4, t);
+    } else if (n >= 4 && b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F') {
+        fseek(f, 0, SEEK_SET);
         read_riff(f, t);
     } else {
-        read_id3v1(f, t);
-        if (!t->title[0]) read_module(f, t);
+        dur = mp3_head_duration(b, n, 0, size_hint, f);
+        if (!tags_complete(t)) read_id3v1(f, t);
+        if (!t->title[0]) read_module(b, n, t);
     }
+    free(b);
     fclose(f);
+    return dur;
+}
+
+void tag_read(const char *path, Tags *t) {
+    tag_probe(path, 0, t);
 }

@@ -31,7 +31,7 @@
 #include <libavcodec/avcodec.h>
 #endif
 
-enum { F_UNKNOWN, F_MP3, F_OGG, F_OPUS, F_FLAC, F_WAV, F_FFMPEG, F_MOD };
+enum { F_UNKNOWN, F_MP3, F_OGG, F_OPUS, F_FLAC, F_OGGFLAC, F_WAV, F_FFMPEG, F_MOD };
 
 /* ---- opus via dlopen'd libopus (no dev headers needed) ---- */
 static void *(*opus_create)(int Fs, int ch, int *err);
@@ -151,6 +151,93 @@ static long long ogg_last_granule(Opus *o) {
     }
     free(b);
     return gran;
+}
+
+/* offset of the last metadata block header in the chain b[begin..end) */
+static size_t flac_last_blk(const unsigned char *b, size_t begin, size_t end) {
+    size_t i = begin, last = begin;
+    while (i + 4 <= end) {
+        last = i;
+        if (b[i] & 0x80) break;
+        size_t blen = ((size_t)b[i + 1] << 16) | ((size_t)b[i + 2] << 8) | b[i + 3];
+        i += 4 + blen;
+    }
+    return last;
+}
+
+/* rebuild a native FLAC byte stream from an Ogg FLAC file (raw, in hand):
+   fLaC magic + metadata blocks + raw frames, packets reassembled from the
+   segment tables. The stream marker packet (0x7F "FLAC" + 4B version/count)
+   is dropped; ffmpeg embeds the fLaC magic + first blocks inside it and
+   those are kept. The last metadata block gets its last-block flag set
+   before the first audio frame (0xFF sync). ffmpeg zeroes STREAMINFO's
+   total samples in Ogg (the count lives in the end-of-stream granule
+   position), so patch it from the last granule: drflac then has an exact
+   length and can build its seek table. Returns a malloc'd stream the
+   caller frees, NULL on malformed input. */
+static unsigned char *oggflac_demux(const unsigned char *raw, size_t n,
+                                    size_t *olen, long long *total_out) {
+    unsigned char *out = malloc(n + 4);
+    if (!out) return NULL;
+    size_t o = 0, pstart = 4;
+    memcpy(out + o, "fLaC", 4); o += 4;
+    long long serial = -1, gran = -1;
+    int in_audio = 0;
+    size_t i = 0;
+    while (i + 27 <= n) {
+        if (memcmp(raw + i, "OggS", 4)) break;
+        int nseg = raw[i + 26];
+        if (i + 27 + (size_t)nseg > n) break;
+        const unsigned char *seg = raw + i + 27;
+        size_t body = i + 27 + (size_t)nseg, blen = 0;
+        for (int s = 0; s < nseg; s++) blen += seg[s];
+        if (body + blen > n) break;
+        long long ser = (long long)rd32(raw + i + 14);
+        if (serial < 0) serial = ser;
+        long long pg = rd64(raw + i + 6);
+        if (ser == serial && pg >= 0) gran = pg;
+        size_t bo = body;
+        for (int s = 0; s < nseg; s++) {
+            size_t sl = seg[s];
+            memcpy(out + o, raw + bo, sl);
+            o += sl; bo += sl;
+            if (sl < 255) { /* packet complete */
+                size_t plen = o - pstart;
+                if (!in_audio && plen >= 5 && out[pstart] == 0x7F &&
+                    !memcmp(out + pstart + 1, "FLAC", 4)) {
+                    size_t skip = plen >= 13 && !memcmp(out + pstart + 9, "fLaC", 4)
+                                  ? 13 : plen;
+                    if (skip < plen) memmove(out + pstart, out + pstart + skip, plen - skip);
+                    o -= skip;
+                } else if (!in_audio && plen >= 1 && out[pstart] == 0xFF) {
+                    in_audio = 1;
+                    out[flac_last_blk(out, 4, pstart)] |= 0x80;
+                }
+                pstart = o;
+            }
+        }
+        i = body + blen;
+    }
+    if (!in_audio || o <= 4) { free(out); return NULL; }
+    long long total = gran > 0 ? gran : 0;
+    if (o >= 4 + 4 + 34 && (out[4] & 0x7F) == 0) {
+        unsigned char *si = out + 8; /* STREAMINFO body */
+        long long ns = ((long long)(si[13] & 0x0F) << 32) |
+                       ((unsigned)si[14] << 24) | ((unsigned)si[15] << 16) |
+                       ((unsigned)si[16] << 8) | si[17];
+        if (!ns && gran > 0) {
+            si[13] = (unsigned char)((si[13] & 0xF0) | ((gran >> 32) & 0x0F));
+            si[14] = (unsigned char)(gran >> 24);
+            si[15] = (unsigned char)(gran >> 16);
+            si[16] = (unsigned char)(gran >> 8);
+            si[17] = (unsigned char)gran;
+            ns = gran;
+        }
+        if (ns > 0) total = ns;
+    }
+    *olen = o;
+    *total_out = total;
+    return out;
 }
 
 /* ---- aac / wma / anything else via libav* (optional, HAVE_FFMPEG) ----
@@ -328,6 +415,7 @@ struct Decoder {
         mp3dec_ex_t mp3;
         stb_vorbis *ov;
         drflac *flac;
+        struct { drflac *fl; unsigned char *buf; } oflac; /* ogg flac: demuxed stream must outlive the decoder */
         drwav *wav;
         Opus *op;
         ModPlugFile *mp;
@@ -337,10 +425,30 @@ struct Decoder {
     } u;
 };
 
+/* validate an mpeg audio frame header as a layer-iii frame and return its
+   size in bytes, 0 otherwise. layer bits 00 (adts/aac) and layers i/ii are
+   excluded: minimp3 decodes layer iii only, those stay with libav. */
+static int mpeg_l3_size(const unsigned char *p) {
+    if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return 0;
+    int ver = (p[1] >> 3) & 3, lay = (p[1] >> 1) & 3;
+    int bri = (p[2] >> 4) & 0xF, sri = (p[2] >> 2) & 3, pad = (p[2] >> 1) & 1;
+    static const int BR[][14] = {
+        {  8, 16, 24, 32, 40, 48, 56, 64, 80, 96,112,128,144,160}, /* mpeg2/2.5 l3 */
+        {  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0},
+        {  8, 16, 24, 32, 40, 48, 56, 64, 80, 96,112,128,144,160},
+        { 32, 40, 48, 56, 64, 80, 96,112,128,160,192,224,256,320}, /* mpeg1 l3 */
+    };
+    static const int SR[][3] = {
+        {11025,12000, 8000}, {0,0,0}, {22050,24000,16000}, {44100,48000,32000},
+    };
+    if (ver == 1 || lay != 1 || bri == 0 || bri == 15 || sri == 3) return 0;
+    return (ver == 3 ? 144 : 72) * BR[ver][bri - 1] * 1000 / SR[ver][sri] + pad;
+}
+
 static int sniff(const char *path, int *fmt) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
-    unsigned char h[1084] = {0};
+    unsigned char h[65536] = {0};
     size_t n = fread(h, 1, sizeof h, f);
     fclose(f);
     if (n < 3) return -1;
@@ -355,7 +463,15 @@ static int sniff(const char *path, int *fmt) {
         if (g) {
             size_t m = fread(b, 1, sizeof b, g);
             fclose(g);
-            for (size_t i = 0; i + 8 <= m; i++)
+            /* Ogg FLAC: the 0x7F "FLAC" stream marker sits at the start of
+               the first packet (checked there, not scanned: 0x7F + "FLAC"
+               can occur inside vorbis codebook bytes) */
+            if (m >= 28) {
+                size_t bs = 27 + (size_t)b[26];
+                if (bs + 5 <= m && b[bs] == 0x7F && !memcmp(b + bs + 1, "FLAC", 4))
+                    *fmt = F_OGGFLAC;
+            }
+            for (size_t i = 0; *fmt == F_OGG && i + 8 <= m; i++)
                 if (!memcmp(b + i, "OpusHead", 8)) { *fmt = F_OPUS; break; }
         }
         return 0;
@@ -378,6 +494,19 @@ static int sniff(const char *path, int *fmt) {
         if ((h[1]&0x06)==0x00) { *fmt = F_FFMPEG; return 0; } /* ADTS aac: layer bits are 0 */
 #endif
         *fmt = F_MP3; return 0;
+    }
+    /* mpeg frames can hide behind junk (a zeroed id3v2 region, encoder
+       pad): accept a layer-iii header whose computed frame size lands on
+       the next frame sync, the same shape as ffmpeg's probe. minimp3's
+       frame walker skips the junk itself once we route the file here. */
+    for (size_t i = 0; i + 4 <= n; i++) {
+        int fs = mpeg_l3_size(h + i);
+        if (!fs) continue;
+        if (i + (size_t)fs + 2 <= n) {
+            if (h[i + fs] == 0xFF && (h[i + fs + 1] & 0xE0) == 0xE0) { *fmt = F_MP3; return 0; }
+        } else if (n < sizeof h) { /* the frame runs to eof: whole file is in hand */
+            *fmt = F_MP3; return 0;
+        }
     }
 #ifdef HAVE_FFMPEG
     *fmt = F_FFMPEG; return 0; /* let libav probe it */
@@ -423,6 +552,45 @@ Decoder *dec_open(const char *path) {
         d->ch = (int)d->u.flac->channels;
         d->rate = (int)d->u.flac->sampleRate;
         d->total = (long long)d->u.flac->totalPCMFrameCount;
+        break;
+    }
+    case F_OGGFLAC: {
+        /* demux to a native stream in memory (same slurp policy as the
+           modplug path; 64MB cap) and hand it to drflac */
+        FILE *f = fopen(path, "rb");
+        if (!f) goto fail;
+        fseeko(f, 0, SEEK_END);
+        long long fs = ftello(f);
+        unsigned char *raw = NULL, *stream = NULL;
+        size_t olen = 0;
+        long long total = 0;
+        if (fs > 0 && fs <= (64LL << 20)) {
+            raw = malloc((size_t)fs);
+            if (raw && fseeko(f, 0, SEEK_SET) == 0 &&
+                fread(raw, 1, (size_t)fs, f) == (size_t)fs)
+                stream = oggflac_demux(raw, (size_t)fs, &olen, &total);
+            free(raw);
+        }
+        fclose(f);
+        if (stream) {
+            drflac *dc = drflac_open_memory(stream, olen, NULL);
+            if (dc) {
+                d->u.oflac.fl = dc;
+                d->u.oflac.buf = stream;
+                d->ch = (int)dc->channels;
+                d->rate = (int)dc->sampleRate;
+                d->total = (long long)dc->totalPCMFrameCount
+                           ? (long long)dc->totalPCMFrameCount : total;
+                break;
+            }
+            free(stream);
+        }
+#ifdef HAVE_FFMPEG
+        d->fmt = F_FFMPEG; /* exotic variant or over the cap: let libav try */
+        goto ffmpeg;
+#else
+        goto fail;
+#endif
         break;
     }
     case F_OPUS: {
@@ -577,6 +745,8 @@ int dec_read(Decoder *d, int16_t *out, int frames) {
         return stb_vorbis_get_samples_short_interleaved(d->u.ov, d->ch, (short*)out, frames * d->ch);
     case F_FLAC:
         return (int)drflac_read_pcm_frames_s16(d->u.flac, (drflac_uint64)frames, out);
+    case F_OGGFLAC:
+        return (int)drflac_read_pcm_frames_s16(d->u.oflac.fl, (drflac_uint64)frames, out);
     case F_WAV:
         return (int)drwav_read_pcm_frames_s16(d->u.wav, (drwav_uint64)frames, out);
     case F_MOD: {
@@ -686,6 +856,8 @@ int dec_seek(Decoder *d, long long frame) {
         return stb_vorbis_seek(d->u.ov, (unsigned int)frame) ? 0 : -1;
     case F_FLAC:
         return drflac_seek_to_pcm_frame(d->u.flac, (drflac_uint64)frame) ? 0 : -1;
+    case F_OGGFLAC:
+        return drflac_seek_to_pcm_frame(d->u.oflac.fl, (drflac_uint64)frame) ? 0 : -1;
     case F_WAV:
         return drwav_seek_to_pcm_frame(d->u.wav, (drwav_uint64)frame) ? 0 : -1;
     case F_MOD:
@@ -736,6 +908,7 @@ void dec_close(Decoder *d) {
     case F_MP3: mp3dec_ex_close(&d->u.mp3); break;
     case F_OGG: stb_vorbis_close(d->u.ov); break;
     case F_FLAC: drflac_close(d->u.flac); break;
+    case F_OGGFLAC: drflac_close(d->u.oflac.fl); free(d->u.oflac.buf); break;
     case F_WAV: drwav_uninit(d->u.wav); free(d->u.wav); break;
     case F_MOD: ModPlug_Unload(d->u.mp); break;
     case F_OPUS: {

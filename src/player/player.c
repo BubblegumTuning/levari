@@ -85,7 +85,7 @@ static void load_track_locked(Player *p, int idx) {
     }
     if (t->end_sec > 0 && p->total_frames > 0)
         p->track_end = (long long)(t->end_sec * p->rate);
-    if (!t->tags.title[0]) tag_read(t->path, &t->tags);
+    if (!t->tags.title[0] && !t->notag) tag_read(t->path, &t->tags);
     if (!t->duration) {
         long long len = (p->track_end ? p->track_end : p->total_frames) - p->track_start;
         if (len > 0 && p->rate > 0) t->duration = (int)(len / p->rate);
@@ -101,7 +101,10 @@ static void load_track(Player *p, int idx) {
 static void apply_vol(int16_t *buf, int frames, int ch, int vol) {
     if (vol >= 128) return;
     size_t n = (size_t)frames * ch;
-    for (size_t i = 0; i < n; i++) buf[i] = (int16_t)((int32_t)buf[i] * vol / 128);
+    /* quadratic taper: gain = (vol/128)^2, closer to perceived loudness
+       than linear amplitude. Max intermediate 32767*128*128 fits int32. */
+    for (size_t i = 0; i < n; i++)
+        buf[i] = (int16_t)((int32_t)buf[i] * vol * vol / 16384);
 }
 
 static void apply_pan(int16_t *buf, int frames, int ch, int pan) {
@@ -278,8 +281,7 @@ const char *pl_current_title(Player *p, char *buf, size_t n) {
         if (t->tags.artist[0]) snprintf(buf, n, "%s - %s", t->tags.artist, t->tags.title);
         else lv_strlcpy(buf, t->tags.title, n);
     } else {
-        const char *base = strrchr(t->path, '/');
-        lv_strlcpy(buf, base ? base + 1 : t->path, n);
+        lv_pretty_name(t->path, buf, n);
     }
     return buf;
 }

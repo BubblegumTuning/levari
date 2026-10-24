@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.2.2 LANGUAGES C)
+project(levari VERSION 0.2.4 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -131,6 +131,19 @@ if(NOT WIN32)
     if(AV_FOUND)
         target_compile_definitions(levari PRIVATE HAVE_FFMPEG)
         target_include_directories(levari PRIVATE ${AV_INCLUDE_DIRS})
+    endif()
+endif()
+
+# optional MPRIS (D-Bus) media-player integration, Linux only:
+# without dbus-devel the player builds and runs, just without MPRIS
+if(UNIX AND NOT APPLE)
+    pkg_check_modules(DBUS dbus-1)
+    if(DBUS_FOUND)
+        target_sources(levari PRIVATE src/mpris/mpris.c)
+        target_compile_definitions(levari PRIVATE HAVE_MPRIS)
+        target_include_directories(levari PRIVATE ${DBUS_INCLUDE_DIRS})
+        target_link_directories(levari PRIVATE ${DBUS_LIBRARY_DIRS})
+        target_link_libraries(levari ${DBUS_LIBRARIES})
     endif()
 endif()
 
