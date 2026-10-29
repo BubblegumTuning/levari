@@ -18,8 +18,9 @@ enum {
     B_SHUF, B_REPEAT, B_EQ, B_VIS, B_LIST, B_ABA, B_ABB, B_XMAIN, B_SEARCH, B_RPT1,
     PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_X, FB_ADDDIR, FB_X,
     EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X,
-    OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH,
-    OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X,
+    OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
+    OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS,
+    OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA,
     B_NONE
 };
 
@@ -70,7 +71,8 @@ typedef struct {
     int opt_caret;               /* caret byte offset in the focused field (codepoint boundary) */
     int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
     char opt_field[OPTF_N][LV_MAX_PATH];
-    int opt_pl, opt_eq, opt_vis, opt_srch;
+    int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
+    int opt_adv;                 /* options window on the ADVANCED tab */
     int opt_scanning;            /* a library scan thread is running */
     int opt_tags;                /* scan reads tags+duration, not just names */
     SDL_atomic_t opt_scan_done;  /* set by the scan thread when finished */
@@ -89,6 +91,7 @@ typedef struct {
     int eq_on, vis_on, mini;
     char title[512];
     int scroll_off;
+    int marquee;            /* 1 when draw_main took the scrolling-title path */
     int drag_gx, drag_gy;   /* global mouse pos at drag start */
     int drag_wx, drag_wy;   /* window pos at drag start */
     Uint32 focus_wid;       /* window id of the focused one of ours */
@@ -296,6 +299,7 @@ static void draw_main(void) {
     font_puts_big(s, R_TIME.x + 6, R_TIME.y + 2, tb, col(s, 0, 255, 0));
 
     int tx = R_TSCROLL.x + 2, tw = R_TSCROLL.w - 4;
+    ui.marquee = 0;
     if (ui.vis_on) {
         static float bars[VIZ_BARS], smooth[VIZ_BARS];
         static Uint32 viz_last;
@@ -329,10 +333,13 @@ static void draw_main(void) {
     } else if (font_w16(ui.title) <= tw) {
         font_puts16(s, tx, R_TSCROLL.y + 1, ui.title, col(s, 0, 224, 255));
     } else {
+        ui.marquee = 1;
         char padded[600];
         snprintf(padded, sizeof padded, "%s   ", ui.title);
         int len = font_w16(padded);
-        int off = ui.scroll_off % (len + tw);
+        /* pause between cycles is a fixed 20 px (10 frames = 1 s at 2 px
+           per 10 Hz tick); a tw-sized pause left the strip blank ~9 s */
+        int off = ui.scroll_off % (len + 20);
         /* draw codepoint by codepoint, hard-clipped to the title strip so
            glyphs can never bleed into the time box */
         int x = tx - off;
@@ -346,7 +353,11 @@ static void draw_main(void) {
             x += font_cp_w16(cp);
             q += n;
         }
-        ui.scroll_off += 2;
+        /* advance only while the marquee is live (playing, or the 10FPS
+           override): paused/stopped repaints (hover, dirty flags) must not
+           creep the title along a few px per mouse movement */
+        if (p->state == ST_PLAY || cfg.ui_always10 > 0)
+            ui.scroll_off += 2;
     }
 
     /* row 2: khz / kbps readout; bitrate estimated from file size over the
@@ -725,6 +736,16 @@ static void raise_all(void) {
        the main thread with WindowServer round-trips (focus storm, beachball). */
     return;
 #else
+    /* Xfwm (and some other X11 WMs) restack AND refocus on XRaiseWindow:
+       the raise fires FOCUS_LOST/FOCUS_GAINED, which calls raise_all again
+       (app_focused was cleared by the FOCUS_LOST in between) — a self
+       feeding focus storm that slams _NET_ACTIVE_WINDOW between our own
+       windows many times a second. A short cooldown breaks the loop while
+       keeping click-to-front for real activations from other apps. */
+    static Uint32 last_raise_ms;
+    Uint32 now = SDL_GetTicks();
+    if (last_raise_ms && !SDL_TICKS_PASSED(now, last_raise_ms + 500)) return;
+    last_raise_ms = now;
     SDL_RaiseWindow(ui.wmain);
     if (ui.pl_visible && ui.wpl) SDL_RaiseWindow(ui.wpl);
     if (ui.eq_visible && ui.weq) SDL_RaiseWindow(ui.weq);
@@ -939,6 +960,16 @@ static Rect opt_save_rect(void)  { Rect r = { OPT_W - 142, 224, 60, 14 }; return
 static Rect opt_close_rect(void) { Rect r = { OPT_W - 72,  224, 60, 14 }; return r; }
 static Rect opt_clear_rect(void) { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBIDX].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_tog_rect(int i)  { Rect r = { OPT_FLD_X + i * 52, 190, 48, 14 }; return r; }
+/* BASIC/ADVANCED tab buttons: small tabs in the title bar, right of the
+   "OPTIONS" label (ends at x=52); visible on both tabs */
+static Rect opt_tab_basic_rect(void) { Rect r = { 60, 4, 38, 14 }; return r; }
+static Rect opt_tab_adv_rect(void)   { Rect r = { 102, 4, 26, 14 }; return r; }
+/* LARGE toggle (ADV page): beside its description text — the lines at
+   y=52/66 end at x=178, so the button sits right of them, vertically
+   centered on the two-line block */
+static Rect opt_large_rect(void)     { Rect r = { 186, 56, 48, 14 }; return r; }
+/* 10FPS toggle (ADV page): same column, below the LARGE block */
+static Rect opt_fps_rect(void)       { Rect r = { 186, 114, 48, 14 }; return r; }
 static Rect opt_scan_rect(void)  { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBDIRS].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_chk_rect(void)   { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP + OPT_SCAN_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBDIRS].y, OPT_CHK_W, OPT_FLD_H }; return r; }
 
@@ -976,6 +1007,11 @@ static void opt_open(void) {
     ui.opt_eq  = cfg.ui_eq  > 0;
     ui.opt_vis = cfg.ui_vis > 0;
     ui.opt_srch = cfg.ui_search > 0;
+    ui.opt_shuf = cfg.shuffle_remember > 0;
+    ui.opt_fade = cfg.fade_stop > 0;
+    ui.opt_large = cfg.allow_large > 0;
+    ui.opt_f10 = cfg.ui_always10 > 0;
+    ui.opt_adv = 0;
     ui.opt_hover = -1;
     ui.opt_focus = -1;
     ui.opt_caret = 0;
@@ -1015,6 +1051,12 @@ static void opt_save(void) {
     cfg.ui_eq = ui.opt_eq;
     cfg.ui_vis = ui.opt_vis;
     cfg.ui_search = ui.opt_srch;
+    cfg.shuffle_remember = ui.opt_shuf;
+    if (ui.opt_shuf) cfg.shuffle = ui.pl->shuffle; /* capture the live state now */
+    cfg.fade_stop = ui.opt_fade;
+    ui.pl->fade_stop = ui.opt_fade; /* apply without waiting for a restart */
+    cfg.allow_large = ui.opt_large; /* decode.c reads cfg live: no restart */
+    cfg.ui_always10 = ui.opt_f10;   /* scheduler reads cfg live: no restart */
     cfg_save();
 }
 
@@ -1083,9 +1125,21 @@ static void draw_opt(void) {
     skin_window_bg(s, OPT_W, OPT_H);
     font_puts(s, 10, 6, "OPTIONS", col(s, 0, 224, 255));
     { Rect x = close_rect(OPT_W);
-      font_puts(s, x.x - 6 - font_w("v" LV_VERSION), 6, "v" LV_VERSION, col(s, 150, 150, 150));
+      font_puts(s, x.x - 6 - font_w(LV_ARCH " v" LV_VERSION), 6,
+                LV_ARCH " v" LV_VERSION, col(s, 150, 150, 150));
       draw_x(s, &x, ui.pressed == OPTB_X); }
 
+    /* BASIC / ADVANCED tabs: small buttons in the title bar, visible on
+       both pages; the active tab is lit green */
+    { Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect();
+      skin_button(s, &tb, ui.pressed == OPTB_TABB, !ui.opt_adv);
+      font_puts(s, tb.x + (tb.w - font_w("BASIC")) / 2, tb.y + 3, "BASIC",
+                ui.opt_adv ? col(s, 220, 220, 220) : col(s, 0, 255, 0));
+      skin_button(s, &ta, ui.pressed == OPTB_TABA, ui.opt_adv);
+      font_puts(s, ta.x + (ta.w - font_w("ADV")) / 2, ta.y + 3, "ADV",
+                ui.opt_adv ? col(s, 0, 255, 0) : col(s, 220, 220, 220)); }
+
+    if (!ui.opt_adv)
     for (int i = 0; i < OPTF_N; i++) {
         font_puts(s, 10, OPT_ROWS[i].y + 5, OPT_ROWS[i].lbl, col(s, 150, 150, 150));
         Rect f = opt_field_rect(i);
@@ -1137,6 +1191,7 @@ static void draw_opt(void) {
         }
     }
 
+    if (!ui.opt_adv) {
     Rect sc = opt_scan_rect();
     skin_button(s, &sc, ui.pressed == OPTB_SCAN && !ui.opt_scanning, 0);
     const char *sl = ui.opt_scanning ? "BUSY" : "SCAN";
@@ -1162,18 +1217,41 @@ static void draw_opt(void) {
     }
     font_puts(s, box.x + 16, ck.y + 5, "TAGS",
               ui.opt_tags ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
+    }
 
-    static const struct { int id; const char *l; } TOG[4] = {
+    if (!ui.opt_adv) {
+    static const struct { int id; const char *l; } TOG[6] = {
         { OPTB_TPL, "UI PL" }, { OPTB_TEQ, "UI EQ" },
         { OPTB_TVIS, "UI VIS" }, { OPTB_TSRCH, "UI SRCH" },
+        { OPTB_TSHUF, "SHUF" }, { OPTB_TFADE, "FADE" },
     };
     font_puts(s, 10, 193, "STARTUP", col(s, 150, 150, 150));
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         Rect r = opt_tog_rect(i);
-        int on = i == 0 ? ui.opt_pl : i == 1 ? ui.opt_eq : i == 2 ? ui.opt_vis : ui.opt_srch;
+        int on = i == 0 ? ui.opt_pl : i == 1 ? ui.opt_eq :
+                 i == 2 ? ui.opt_vis : i == 3 ? ui.opt_srch :
+                 i == 4 ? ui.opt_shuf : ui.opt_fade;
         skin_button(s, &r, ui.pressed == TOG[i].id, on);
         font_puts(s, r.x + (r.w - font_w(TOG[i].l)) / 2, r.y + 3, TOG[i].l,
                   on ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
+    }
+    } else {
+        /* ADVANCED page: LARGE = allow ingest of files over the 256 MB
+           decode cap (OOM guard for the slurp-based decoders) */
+        font_puts(s, 10, 30, "ADVANCED", col(s, 150, 150, 150));
+        font_puts(s, 10, 52, "LARGE: allow ingest of files", col(s, 220, 220, 220));
+        font_puts(s, 10, 66, "over 256 MB (memory risk)", col(s, 220, 220, 220));
+        font_puts(s, 10, 88, "applies immediately, no restart", col(s, 120, 120, 120));
+        Rect r = opt_large_rect();
+        skin_button(s, &r, ui.pressed == OPTB_TLARGE, ui.opt_large);
+        font_puts(s, r.x + (r.w - font_w("LARGE")) / 2, r.y + 3, "LARGE",
+                  ui.opt_large ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
+        font_puts(s, 10, 110, "10FPS: keep repainting the", col(s, 220, 220, 220));
+        font_puts(s, 10, 124, "main window at 10 fps", col(s, 220, 220, 220));
+        Rect r2 = opt_fps_rect();
+        skin_button(s, &r2, ui.pressed == OPTB_TFPS, ui.opt_f10);
+        font_puts(s, r2.x + (r2.w - font_w("10FPS")) / 2, r2.y + 3, "10FPS",
+                  ui.opt_f10 ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
     }
 
     Rect sv = opt_save_rect(), cl = opt_close_rect();
@@ -1182,9 +1260,11 @@ static void draw_opt(void) {
     skin_button(s, &cl, ui.pressed == OPTB_CLOSE, 0);
     font_puts(s, cl.x + (cl.w - font_w("CLOSE")) / 2, cl.y + 3, "CLOSE", col(s, 220, 220, 220));
 
+    if (!ui.opt_adv) {
     Rect cr = opt_clear_rect();
     skin_button(s, &cr, ui.pressed == OPTB_CLEAR && !ui.opt_scanning, 0);
     font_puts(s, cr.x + (cr.w - font_w("CLEAR")) / 2, cr.y + 3, "CLEAR", col(s, 220, 220, 220));
+    }
 
     if (ui.opt_status[0])
         font_puts(s, 10, 240, ui.opt_status, col(s, 0, 224, 255));
@@ -1214,13 +1294,24 @@ static void handle_opt_mouse(SDL_Event *e) {
         Rect sv = opt_save_rect(), cl = opt_close_rect();
         if (in_rect(&sv, x, y)) { ui.pressed = OPTB_SAVE; return; }
         if (in_rect(&cl, x, y)) { ui.pressed = OPTB_CLOSE; return; }
+        Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect();
+        if (in_rect(&tb, x, y)) { ui.pressed = OPTB_TABB; return; }
+        if (in_rect(&ta, x, y)) { ui.pressed = OPTB_TABA; return; }
+        if (ui.opt_adv) {
+            Rect tg = opt_large_rect();
+            if (in_rect(&tg, x, y)) { ui.pressed = OPTB_TLARGE; return; }
+            Rect tf = opt_fps_rect();
+            if (in_rect(&tf, x, y)) { ui.pressed = OPTB_TFPS; return; }
+            if (y < 22) { ui.drag = 11; drag_begin(ui.wopt); ui.opt_focus = -1; }
+            return;
+        }
         Rect sc = opt_scan_rect();
         if (in_rect(&sc, x, y)) { if (!ui.opt_scanning) ui.pressed = OPTB_SCAN; return; }
         Rect cr = opt_clear_rect();
         if (in_rect(&cr, x, y)) { if (!ui.opt_scanning) ui.pressed = OPTB_CLEAR; return; }
         Rect ck = opt_chk_rect();
         if (in_rect(&ck, x, y)) { ui.pressed = OPTB_CHK; return; }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             Rect tg = opt_tog_rect(i);
             if (in_rect(&tg, x, y)) { ui.pressed = OPTB_TPL + i; return; }
         }
@@ -1240,17 +1331,25 @@ static void handle_opt_mouse(SDL_Event *e) {
         if (ui.pressed != B_NONE) {
             Rect xc = close_rect(OPT_W);
             Rect sv = opt_save_rect(), cl = opt_close_rect();
+            Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect(), tg0 = opt_large_rect();
+            Rect tf0 = opt_fps_rect();
             if (ui.pressed == OPTB_X && in_rect(&xc, x, y)) opt_close();
+            else if (ui.pressed == OPTB_TABB && in_rect(&tb, x, y)) { ui.opt_adv = 0; ui.opt_focus = -1; }
+            else if (ui.pressed == OPTB_TABA && in_rect(&ta, x, y)) { ui.opt_adv = 1; ui.opt_focus = -1; }
+            else if (ui.pressed == OPTB_TLARGE && in_rect(&tg0, x, y)) ui.opt_large = !ui.opt_large;
+            else if (ui.pressed == OPTB_TFPS && in_rect(&tf0, x, y)) ui.opt_f10 = !ui.opt_f10;
             else if (ui.pressed == OPTB_SAVE && in_rect(&sv, x, y)) opt_save();
             else if (ui.pressed == OPTB_CLOSE && in_rect(&cl, x, y)) opt_close();
-            else if (ui.pressed >= OPTB_TPL && ui.pressed <= OPTB_TSRCH) {
+            else if (ui.pressed >= OPTB_TPL && ui.pressed <= OPTB_TFADE) {
                 int i = ui.pressed - OPTB_TPL;
                 Rect tg = opt_tog_rect(i);
                 if (in_rect(&tg, x, y)) {
                     if (i == 0) ui.opt_pl = !ui.opt_pl;
                     else if (i == 1) ui.opt_eq = !ui.opt_eq;
                     else if (i == 2) ui.opt_vis = !ui.opt_vis;
-                    else ui.opt_srch = !ui.opt_srch;
+                    else if (i == 3) ui.opt_srch = !ui.opt_srch;
+                    else if (i == 4) ui.opt_shuf = !ui.opt_shuf;
+                    else ui.opt_fade = !ui.opt_fade;
                 }
             }
             else if (ui.pressed == OPTB_SCAN) {
@@ -1270,7 +1369,7 @@ static void handle_opt_mouse(SDL_Event *e) {
         drag_move_snap(ui.wopt);
     } else if (e->type == SDL_MOUSEMOTION) {
         Rect f = opt_field_rect(OPTF_LIBDIRS);
-        ui.opt_hover = (x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
+        ui.opt_hover = (!ui.opt_adv && x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
                        ? OPTF_LIBDIRS : -1;
     }
 }
@@ -1376,6 +1475,15 @@ static void pl_add_lib_cb(const LibEntry *e, void *ud) {
     t->notag = e->notag;
 }
 
+/* when the options window's SHUF startup toggle is on, keep the shuffle
+   state in the config file so it survives sessions */
+static void shuffle_persist(void) {
+    if (cfg.shuffle_remember > 0) {
+        cfg.shuffle = ui.pl->shuffle;
+        cfg_save();
+    }
+}
+
 static void action(int id) {
     Player *p = ui.pl;
     switch (id) {
@@ -1387,7 +1495,7 @@ static void action(int id) {
     case B_STOP: pl_post(p, CMD_STOP, 0); break;
     case B_PREV: pl_post(p, CMD_PREV, 0); break;
     case B_NEXT: pl_post(p, CMD_NEXT, 0); break;
-    case B_SHUF: p->shuffle = !p->shuffle; break;
+    case B_SHUF: p->shuffle = !p->shuffle; shuffle_persist(); break;
     case B_REPEAT: p->repeat = p->repeat == 1 ? 0 : 1; break;
     case B_RPT1: p->repeat = p->repeat == 2 ? 0 : 2; break;
     case B_ABA:
@@ -1415,7 +1523,7 @@ static void action(int id) {
             SDL_ShowWindow(ui.wpl);
         } else SDL_HideWindow(ui.wpl);
         break;
-    case PB_SHUF: p->shuffle = !p->shuffle; break;
+    case PB_SHUF: p->shuffle = !p->shuffle; shuffle_persist(); break;
     case PB_REPEAT: p->repeat = p->repeat == 1 ? 0 : 1; break;
     case PB_REM:
         if (ui.pl_selall) {
@@ -1691,7 +1799,7 @@ static void handle_key(SDL_Event *e) {
     case SDLK_v: pl_post(p, CMD_STOP, 0); break;
     case SDLK_b: pl_post(p, CMD_PREV, 0); break;
     case SDLK_n: pl_post(p, CMD_NEXT, 0); break;
-    case SDLK_s: p->shuffle = !p->shuffle; break;
+    case SDLK_s: p->shuffle = !p->shuffle; shuffle_persist(); break;
     case SDLK_r: p->repeat = !p->repeat; break;
     case SDLK_RIGHT: pl_post_seek(p, (double)(p->pos_frames - p->track_start + p->rate * 5) /
                                       (double)((p->track_end > 0 ? p->track_end : p->total_frames) - p->track_start)); break;
@@ -1700,6 +1808,13 @@ static void handle_key(SDL_Event *e) {
     case SDLK_UP: p->vol += 8; if (p->vol > 128) p->vol = 128; break;
     case SDLK_DOWN: p->vol -= 8; if (p->vol < 0) p->vol = 0; break;
     case SDLK_l: if (ctrl) { pl_scan_tags(p->pl, &p->mtx); } break;
+    case SDLK_f:
+#ifdef __APPLE__
+        if (ctrl || (e->key.keysym.mod & KMOD_GUI)) search_open(ui.wmain);
+#else
+        if (ctrl) search_open(ui.wmain);
+#endif
+        break;
     case SDLK_e:
         ui.eq_visible = !ui.eq_visible;
         if (ui.eq_visible) SDL_ShowWindow(ui.weq);
@@ -1719,6 +1834,36 @@ static Uint32 ev_win(const SDL_Event *e) {
     case SDL_MOUSEWHEEL: return e->wheel.windowID;
     }
     return 0;
+}
+
+/* ---- idle redraw scheduler -------------------------------------------------
+   The old loop repainted every visible window at a fixed 10 fps no matter
+   what: paused, unfocused, nothing changed. That steady 10 Hz wake-up is the
+   entire steady-state CPU cost and keeps the CPU out of deep sleep states on
+   laptops. Now events mark their window dirty, a poll tick (1 s, or 10 Hz
+   only while an animation is live) catches player-thread changes, and only
+   dirty windows are repainted. Unfocused windows are not repainted at all
+    (FOCUS_GAINED marks the whole set dirty again), with four exceptions: the
+    main window while the visualizer is on and playing (the vis band lives in
+    the main window and a user watching it wants it live), the main window
+    while ui.always_10fps is on and a title is long enough to marquee (the
+    options > advanced 10FPS toggle keeps it scrolling even paused and
+    unfocused), the main window at 1 Hz while playing (the time readout and
+    position slider keep pace instead of jumping on refocus), and a one-shot
+    repaint after EXPOSED/SHOWN, because on an uncomposited X11 desktop the
+    WM hands us a garbage window when someone uncovers it. */
+#define D_MAIN 1u
+#define D_PL   2u
+#define D_EQ   4u
+#define D_FILE 8u
+#define D_OPT  16u
+#define D_SRCH 32u
+#define D_ALL  (D_MAIN | D_PL | D_EQ | D_FILE | D_OPT | D_SRCH)
+static unsigned ui_dirty;
+
+static void win_present(SDL_Window *w) {
+    if (w && !(SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED))
+        SDL_UpdateWindowSurface(w);
 }
 
 int ui_run(Player *p, int show_pl) {
@@ -1810,12 +1955,20 @@ int ui_run(Player *p, int show_pl) {
     if (ui_show_search) search_open(ui.wmain);
 
     Uint32 next = SDL_GetTicks();
+    ui_dirty = D_ALL;
+    int wake = 1;   /* one-shot unfocused repaint after EXPOSED/SHOWN; 1 = paint once at startup */
+    struct pollsnap { int state, cur, count; long long pos_s;
+                      int pl_vis, eq_vis, file_vis, opt_vis, search_open; };
+    struct pollsnap snap_prev =
+        { -99, -99, -99, -9999, -1, -1, -1, -1, -1 };
     int running = 1;
     while (running) {
         if (ui_deadline_ms && SDL_GetTicks() >= ui_deadline_ms) break;
         if (mpris_take_raise()) raise_all(); /* MPRIS Raise request */
         SDL_Event e;
-        int wait = (int)(next > SDL_GetTicks() ? next - SDL_GetTicks() : 0);
+        int wait = next ? (int)(next > SDL_GetTicks() ? next - SDL_GetTicks() : 0)
+                        : -1;   /* no tick scheduled: sleep until an event */
+        if (ui_deadline_ms && wait > 1000) wait = 1000;
         if (SDL_WaitEventTimeout(&e, wait)) switch (e.type) {
         case SDL_QUIT: running = 0; break;
         case SDL_WINDOWEVENT:
@@ -1832,6 +1985,10 @@ int ui_run(Player *p, int show_pl) {
                 /* focus left us for another app (or a window of ours closed):
                    the next FOCUS_GAINED must re-raise the whole set */
                 ui.app_focused = 0;
+                /* one-shot repaint so the search caret disappears even when
+                   the whole app loses focus (unfocused windows otherwise
+                   aren't repainted and would keep the last blink frame) */
+                wake = 1;
             }
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
                 int was_focused = ui.app_focused;
@@ -1843,12 +2000,14 @@ int ui_run(Player *p, int show_pl) {
                 else SDL_StopTextInput();
                 /* the set surfaces as a unit: when focus arrives from another
                    app, raise every visible window, not just the one the WM
-                   clicked. The raise->focus->raise storm is Cocoa-only
-                   (SDL_RaiseWindow = makeKeyAndOrderFront); on X11/Windows
-                   XRaiseWindow/SetWindowPos never move focus, and raise_all()
-                   is a no-op on Cocoa anyway */
+                   clicked. On Cocoa raise_all() is a no-op; on X11 raising
+                   can itself refocus (Xfwm), so raise_all() rate-limits
+                   itself to keep that from becoming a storm */
                 if (!was_focused) raise_all();
             }
+            ui_dirty |= D_ALL;
+            if (e.window.event == SDL_WINDOWEVENT_EXPOSED ||
+                e.window.event == SDL_WINDOWEVENT_SHOWN) wake = 1;
             break;
         case SDL_KEYDOWN:
             /* media keys bypass the focus routing: they belong to the
@@ -1865,10 +2024,12 @@ int ui_run(Player *p, int show_pl) {
                     if (!pl_key(&e)) handle_key(&e);
                 } else handle_key(&e);
             }
+            ui_dirty |= D_MAIN | D_PL | D_SRCH | D_OPT;
             break;
         case SDL_TEXTINPUT:
             if (search_is_open() && ui.focus_wid == search_window_id()) search_text(e.text.text);
             else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_text(e.text.text);
+            ui_dirty |= D_SRCH | D_OPT;
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
@@ -1878,12 +2039,12 @@ int ui_run(Player *p, int show_pl) {
             /* a swallowed button-release must not leave a drag latched on */
             if (e.type == SDL_MOUSEMOTION && ui.drag &&
                 !(e.motion.state & SDL_BUTTON_LMASK)) ui.drag = 0;
-            if (wid == SDL_GetWindowID(ui.wmain)) handle_main_mouse(&e);
-            else if (wid == SDL_GetWindowID(ui.wpl)) handle_pl_mouse(&e);
-            else if (ui.weq && wid == SDL_GetWindowID(ui.weq)) handle_eq_mouse(&e);
-            else if (ui.wfile && wid == SDL_GetWindowID(ui.wfile)) handle_file_mouse(&e);
-            else if (ui.wopt && wid == SDL_GetWindowID(ui.wopt)) handle_opt_mouse(&e);
-            else if (search_is_open() && wid == search_window_id()) search_mouse(&e);
+            if (wid == SDL_GetWindowID(ui.wmain)) { handle_main_mouse(&e); ui_dirty |= D_MAIN; }
+            else if (wid == SDL_GetWindowID(ui.wpl)) { handle_pl_mouse(&e); ui_dirty |= D_PL; }
+            else if (ui.weq && wid == SDL_GetWindowID(ui.weq)) { handle_eq_mouse(&e); ui_dirty |= D_EQ; }
+            else if (ui.wfile && wid == SDL_GetWindowID(ui.wfile)) { handle_file_mouse(&e); ui_dirty |= D_FILE; }
+            else if (ui.wopt && wid == SDL_GetWindowID(ui.wopt)) { handle_opt_mouse(&e); ui_dirty |= D_OPT; }
+            else if (search_is_open() && wid == search_window_id()) { search_mouse(&e); ui_dirty |= D_SRCH; }
             break;
         }
         }
@@ -1893,35 +2054,92 @@ int ui_run(Player *p, int show_pl) {
             snprintf(ui.opt_status, sizeof ui.opt_status,
                      "added %d (%d seen)", ui.opt_scan_added, ui.opt_scan_seen);
             search_lib_invalidate();
+            ui_dirty |= D_OPT;
         }
-        /* redraw only on the fixed 10 fps tick, not per event: otherwise a
-           flood of mouse-motion events makes the title scroller race */
+        /* idle redraw scheduler: repaint only dirty windows, and only on the
+           poll tick. 10 Hz while an animation is live (scrolling title,
+           visualizer, drag, scan), else 1 Hz for the position text. An
+           unfocused app sleeps on events, except a live visualizer (the vis
+           band lives in the main window and a watcher wants it moving), a
+           1 Hz main-window repaint while playing (no time/position jump on
+           refocus), or a one-shot repaint after the WM exposes/shows a
+           window. Visibility transitions mark the window dirty so a freshly
+           shown window paints once without touching every toggle site. */
         Uint32 now = SDL_GetTicks();
-        if (now >= next) {
-            refresh_title();
-            draw_main();
-            SDL_UpdateWindowSurface(ui.wmain);
-            if (ui.pl_visible) {
-                draw_pl();
-                SDL_UpdateWindowSurface(ui.wpl);
-            }
-            if (ui.eq_visible && ui.weq) {
-                draw_eq();
-                SDL_UpdateWindowSurface(ui.weq);
-            }
-            if (ui.file_visible && ui.sfile) {
-                draw_file();
-                SDL_UpdateWindowSurface(ui.wfile);
-            }
-            if (ui.opt_visible && ui.sopt) {
-                draw_opt();
-                SDL_UpdateWindowSurface(ui.wopt);
-            }
-            if (search_is_open() && search_window()) {
-                search_draw();
-                SDL_UpdateWindowSurface(search_window());
-            }
+        /* interaction pending while focused: guarantee a prompt (<=100 ms)
+           repaint so hover/seek feedback stays responsive even when no
+           animation is live; rapid events coalesce into the same tick. */
+        if (ui.app_focused && ui_dirty && next && next > now + 100)
             next = now + 100;
+        if (now >= next) {
+            int playing = p->state == ST_PLAY;
+            int so = search_is_open();
+            struct pollsnap sn = {
+                p->state, p->cur, p->pl->count,
+                p->rate ? p->pos_frames / p->rate : 0,
+                ui.pl_visible, ui.eq_visible, ui.file_visible,
+                ui.opt_visible, so };
+            if (sn.state != snap_prev.state || sn.cur != snap_prev.cur ||
+                sn.count != snap_prev.count)
+                ui_dirty |= D_MAIN | D_PL;
+            if (sn.pos_s != snap_prev.pos_s) ui_dirty |= D_MAIN;
+            if (sn.pl_vis != snap_prev.pl_vis) ui_dirty |= D_PL;
+            if (sn.eq_vis != snap_prev.eq_vis) ui_dirty |= D_EQ;
+            if (sn.file_vis != snap_prev.file_vis) ui_dirty |= D_FILE;
+            if (sn.opt_vis != snap_prev.opt_vis) ui_dirty |= D_OPT;
+            if (sn.search_open != snap_prev.search_open) ui_dirty |= D_SRCH;
+            snap_prev = sn;
+            if (ui.opt_scanning) ui_dirty |= D_OPT;
+
+            /* the search caret blinks only while the search window has focus */
+            int srch_focused = so && ui.app_focused &&
+                               ui.focus_wid == search_window_id();
+            search_set_focus(srch_focused);
+
+            int vis_live = ui.vis_on && playing;
+            int f10_live = cfg.ui_always10 > 0 && ui.marquee;
+            int anim = (ui.marquee && (playing || f10_live)) || vis_live ||
+                       ui.drag || ui.opt_scanning;
+
+            if (ui.app_focused) {
+                if ((ui_dirty & D_MAIN) || anim) {
+                    refresh_title();
+                    draw_main();
+                    win_present(ui.wmain);
+                }
+                if ((ui_dirty & D_PL) && ui.pl_visible) { draw_pl(); win_present(ui.wpl); }
+                if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
+                if ((ui_dirty & D_FILE) && ui.file_visible && ui.sfile) { draw_file(); win_present(ui.wfile); }
+                if ((ui_dirty & D_OPT) && ui.opt_visible && ui.sopt) { draw_opt(); win_present(ui.wopt); }
+                if (((ui_dirty & D_SRCH) || srch_focused) && so && search_window()) { search_draw(); win_present(search_window()); }
+                ui_dirty = 0;
+            } else if (vis_live || f10_live || playing || (wake && ui_dirty)) {
+                if ((ui_dirty & D_MAIN) || vis_live || f10_live) {
+                    refresh_title();
+                    draw_main();
+                    win_present(ui.wmain);
+                }
+                if ((ui_dirty & D_PL) && ui.pl_visible) { draw_pl(); win_present(ui.wpl); }
+                if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
+                if ((ui_dirty & D_FILE) && ui.file_visible && ui.sfile) { draw_file(); win_present(ui.wfile); }
+                if ((ui_dirty & D_OPT) && ui.opt_visible && ui.sopt) { draw_opt(); win_present(ui.wopt); }
+                if ((ui_dirty & D_SRCH) && so && search_window()) { search_draw(); win_present(search_window()); }
+                ui_dirty = 0;
+                wake = 0;
+            }
+
+            /* vis_live is part of anim, so a live visualizer always ticks at
+               10 Hz whether focused or not. A focused search field redraws on
+               each 500 ms caret boundary (2 Hz, just enough to toggle it).
+               Focused idle polls at 1 Hz for player-thread state changes;
+               unfocused but playing polls at 1 Hz so the time readout and
+               position slider keep pace instead of jumping on refocus;
+               unfocused idle sleeps on events. */
+            if (anim) next = now + 100;
+            else if (srch_focused) next = now + (unsigned)(500 - (int)(now % 500));
+            else if (ui.app_focused) next = now + 1000;
+            else if (playing) next = now + 1000;
+            else next = 0;   /* unfocused, nothing playing: sleep on events */
         }
     }
     /* save window dumps at exit so they reflect the final state */

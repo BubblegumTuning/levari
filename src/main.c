@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && is_cli_cmd(argv[1]))
         return cli_run(argc, argv);
 
-    if (dec_ffmpeg_status() == 2)
+    if (dec_ffmpeg_probe() == 2)
         fprintf(stderr, "levari: libav* shared libraries not found; aac/m4a/wma disabled\n");
 
     int show_pl = 1;
@@ -81,6 +81,8 @@ int main(int argc, char **argv) {
     int selftest = 0;
     pl_init(&playlist);
     pl_player_init(&player, &playlist);
+    if (cfg.shuffle_remember > 0 && cfg.shuffle > 0) player.shuffle = 1;
+    player.fade_stop = cfg.fade_stop > 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--nopl")) show_pl = 0;

@@ -10,7 +10,21 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.2.4"
+#define LV_VERSION "0.2.7"
+#endif
+
+/* build architecture, shown in the options title bar before the version
+   so a release binary can be identified at a glance (x86-64 vs arm32...) */
+#if defined(__aarch64__)
+#define LV_ARCH "arm64"
+#elif defined(__arm__)
+#define LV_ARCH "arm32"
+#elif defined(__x86_64__) || defined(_M_X64)
+#define LV_ARCH "x86-64"
+#elif defined(__i386__) || defined(_M_IX86)
+#define LV_ARCH "x86"
+#else
+#define LV_ARCH "?"
 #endif
 
 static inline void lv_strlcpy(char *dst, const char *src, size_t n) {

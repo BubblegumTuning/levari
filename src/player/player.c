@@ -98,6 +98,14 @@ static void load_track(Player *p, int idx) {
     pthread_mutex_unlock(&p->mtx);
 }
 
+static void hard_stop(Player *p) {
+    p->fading = 0;
+    p->state = ST_STOP;
+    close_dec(p);
+    ao_close();
+    p->ao_open = 0;
+}
+
 static void apply_vol(int16_t *buf, int frames, int ch, int vol) {
     if (vol >= 128) return;
     size_t n = (size_t)frames * ch;
@@ -105,6 +113,15 @@ static void apply_vol(int16_t *buf, int frames, int ch, int vol) {
        than linear amplitude. Max intermediate 32767*128*128 fits int32. */
     for (size_t i = 0; i < n; i++)
         buf[i] = (int16_t)((int32_t)buf[i] * vol * vol / 16384);
+}
+
+/* stop fade: linear ramp of the slider value toward silence. apply_vol's
+   quadratic taper turns the linear slider ramp into a smooth perceived fade. */
+static int fade_vol(int vol, long long left, long long total) {
+    if (total <= 0) return 0;
+    if (left >= total) return vol;
+    if (left <= 0) return 0;
+    return (int)((long long)vol * left / total);
 }
 
 static void apply_pan(int16_t *buf, int frames, int ch, int pan) {
@@ -133,6 +150,8 @@ static void *player_thread(void *arg) {
         if (cmd != CMD_NONE) p->cmd = CMD_NONE;
         pthread_mutex_unlock(&p->mtx);
         if (cmd != CMD_NONE) {
+            /* any command but stop interrupts a running stop fade */
+            if (cmd != CMD_STOP) p->fading = 0;
             switch (cmd) {
             case CMD_PLAY:
                 load_track(p, cmd_arg);
@@ -143,10 +162,14 @@ static void *player_thread(void *arg) {
                 else if (p->pl->count) load_track(p, p->cur >= 0 ? p->cur : 0);
                 break;
             case CMD_STOP:
-                p->state = ST_STOP;
-                close_dec(p);
-                ao_close();
-                p->ao_open = 0;
+                /* second stop while fading, or fade off/paused: stop at once */
+                if (p->fade_stop && p->dec && p->state == ST_PLAY && !p->fading) {
+                    p->fading = 1;
+                    p->fade_total = p->rate / 2; /* 0.5 s */
+                    p->fade_left = p->fade_total;
+                } else {
+                    hard_stop(p);
+                }
                 break;
             case CMD_SEEK:
                 if (p->dec) {
@@ -195,7 +218,8 @@ static void *player_thread(void *arg) {
                     tout = ws_process(&p->ws, buf, got, p->ch, obuf);
                     toput = obuf;
                 }
-                apply_vol(toput, tout, p->ch, p->vol);
+                apply_vol(toput, tout, p->ch,
+                          p->fading ? fade_vol(p->vol, p->fade_left, p->fade_total) : p->vol);
                 apply_pan(toput, tout, p->ch, p->pan);
                 ao_write(toput, tout);
                 p->pos_frames += got;
@@ -204,9 +228,14 @@ static void *player_thread(void *arg) {
                     dec_seek(p->dec, a);
                     p->pos_frames = a;
                 }
+                if (p->fading) {
+                    p->fade_left -= got;
+                    if (p->fade_left <= 0) { hard_stop(p); continue; }
+                }
             }
             int ended = got <= 0 || (p->track_end > 0 && p->pos_frames >= p->track_end);
             if (ended) {
+                if (p->fading) { hard_stop(p); continue; } /* stop wins over next track */
                 if (p->repeat == 2) {
                     dec_seek(p->dec, p->track_start);
                     p->pos_frames = p->track_start;
@@ -214,10 +243,7 @@ static void *player_thread(void *arg) {
                 }
                 int n = pick_next(p, p->cur);
                 if (n >= 0) { load_track(p, n); continue; }
-                p->state = ST_STOP;
-                close_dec(p);
-                ao_close();
-                p->ao_open = 0;
+                hard_stop(p);
                 continue;
             }
         } else {

@@ -1,4 +1,4 @@
-libmodplug 0.8.9.1+ (Konstanty/libmodplug master, 2024-06)
+libmodplug 0.8.9.1+ (Konstanty/libmodplug master, 2026-10)
 
 Public domain (see COPYING). Renders mod/s3m/xm/it and other module
 formats to 44.1 kHz PCM; used by src/decode/decode.c.

@@ -42,14 +42,26 @@ static void fft(float *re, float *im) {
     }
 }
 
+static const float *hann(void) {
+    static float w[N];
+    static int init = 0;
+    if (!init) {
+        for (int i = 0; i < N; i++)
+            w[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)(N - 1));
+        init = 1;
+    }
+    return w;
+}
+
 void viz_spectrum(const int16_t *pcm, int n, int rate, float out[VIZ_BARS]) {
     float re[N], im[N];
     if (rate <= 0) rate = 44100; /* stopped/no track: harmless default */
     memset(im, 0, sizeof im);
     int m = n < N ? n : N;
+    const float *win = hann();
     for (int i = 0; i < N; i++) {
         float v = i < m ? (float)pcm[i] / 32768.0f : 0.0f;
-        re[i] = v * (0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)(N - 1)));
+        re[i] = v * win[i];
     }
     fft(re, im);
     /* log-spaced edges, but guarantee >=1 bin per bar at the low end */
