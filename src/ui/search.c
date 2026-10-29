@@ -30,8 +30,10 @@ static SDL_Window *w;
 static SDL_Surface *sf;
 static int visible, pressed, drag, scroll, sel, nres;
 static int scope; /* 0 = playlist, 1 = library */
+static int focused; /* 1 while the search window holds WM focus: gates the caret */
 static int selall; /* ctrl-a: whole query selected, next edit replaces it */
 static char query[512];
+static int caret; /* byte offset in query (codepoint boundary): edit position */
 static Result *res;
 static int res_cap;
 static LibEnt *libs;
@@ -138,6 +140,19 @@ static void lib_free(void) {
 
 static char *dupn(const char *s) { return strdup(s ? s : ""); }
 
+/* normalized copy for matching; falls back to a raw copy if the
+ * scratch alloc fails rather than writing through a null tmp */
+static char *norm_dup(const char *s) {
+    if (!s) return dupn(s);
+    size_t nn = strlen(s) * 3 + 1;
+    char *tmp = malloc(nn);
+    if (!tmp) return dupn(s);
+    norm(s, tmp, nn);
+    char *r = dupn(tmp);
+    free(tmp);
+    return r;
+}
+
 static void lib_load(void) {
     lib_free();
     lib_loaded = 1;
@@ -168,14 +183,10 @@ static void lib_load(void) {
         lv_strlcpy(fb, b, sizeof fb);
         char *dot = strrchr(fb, '.');
         if (dot && dot > fb) *dot = 0;
-        size_t nn = strlen(fb) * 3 + 1;
-        char *tmp = malloc(nn);
-        norm(fb, tmp, nn);
-        e->nfile = dupn(tmp);
-        free(tmp);
-        nn = strlen(e->title) * 3 + 1; tmp = malloc(nn); norm(e->title, tmp, nn); e->ntitle = dupn(tmp); free(tmp);
-        nn = strlen(e->artist) * 3 + 1; tmp = malloc(nn); norm(e->artist, tmp, nn); e->nartist = dupn(tmp); free(tmp);
-        nn = strlen(e->album) * 3 + 1; tmp = malloc(nn); norm(e->album, tmp, nn); e->nalbum = dupn(tmp); free(tmp);
+        e->nfile = norm_dup(fb);
+        e->ntitle = norm_dup(e->title);
+        e->nartist = norm_dup(e->artist);
+        e->nalbum = norm_dup(e->album);
     }
     fclose(f);
 }
@@ -303,6 +314,7 @@ void search_init(Player *p) {
     visible = pressed = drag = scroll = sel = nres = 0;
     scope = 0; selall = 0;
     query[0] = 0;
+    caret = 0;
 }
 
 int search_is_open(void) { return visible; }
@@ -310,6 +322,8 @@ int search_is_open(void) { return visible; }
 SDL_Window *search_window(void) { return w; }
 
 Uint32 search_window_id(void) { return w ? SDL_GetWindowID(w) : 0; }
+
+void search_set_focus(int f) { focused = f; }
 
 void search_open(SDL_Window *anchor) {
     if (!w) {
@@ -344,6 +358,7 @@ void search_open(SDL_Window *anchor) {
     }
     lib_loaded = 0; /* re-read the index on every open */
     selall = 0;
+    if (caret < 0 || caret > (int)strlen(query)) caret = (int)strlen(query);
     visible = 1;
     SDL_ShowWindow(w);
     SDL_RaiseWindow(w);
@@ -354,6 +369,7 @@ void search_open(SDL_Window *anchor) {
 
 void search_close(void) {
     visible = 0;
+    focused = 0;
     if (w) SDL_HideWindow(w);
     SDL_StopTextInput();
 }
@@ -394,29 +410,44 @@ static void draw_edit(void) {
     SDL_FillRect(sf, &t1, edge); SDL_FillRect(sf, &t2, edge);
     SDL_FillRect(sf, &t3, edge); SDL_FillRect(sf, &t4, edge);
 
-    int pad = 3, tw = font_w16(query);
-    int off = tw > edit.w - 2 * pad - 6 ? tw - (edit.w - 2 * pad - 6) : 0;
-    int x = edit.x + pad - off;
+    int pad = 3, avail = edit.w - 2 * pad - 6;
+    int len = (int)strlen(query);
+    if (caret < 0 || caret > len) caret = len;
+    /* focused: the visible slice is anchored on the caret (like the options
+       fields) so mid-string edits stay on screen; unfocused: the tail shows */
+    char disp[512];
+    const char *shown;
+    int caret_x = -1;
+    if (focused) {
+        char pre[512];
+        memcpy(pre, query, (size_t)caret);
+        pre[caret] = 0;
+        const char *st = font_fit_tail(pre, avail);
+        int off = (int)(st - pre);
+        int caret_w = font_w16(st);
+        int room = avail - caret_w;
+        int extra = room > 0 ? font_fit(query + caret, room) : 0;
+        int shown_len = (caret - off) + extra;
+        memcpy(disp, query + off, (size_t)shown_len);
+        disp[shown_len] = 0;
+        shown = disp;
+        caret_x = edit.x + pad + caret_w;
+    } else {
+        shown = font_fit_tail(query, avail);
+    }
     if (selall && query[0]) {
-        SDL_Rect hl = { x < edit.x + pad ? edit.x + pad : x, edit.y + 1,
-                        (unsigned)tw, (unsigned)(edit.h - 2) };
+        SDL_Rect hl = { edit.x + pad, edit.y + 1,
+                        (unsigned)font_w16(shown), (unsigned)(edit.h - 2) };
         if (hl.x + (int)hl.w > edit.x + edit.w - pad)
             hl.w = edit.x + edit.w - pad - hl.x;
         if (hl.w > 0) SDL_FillRect(sf, &hl, col(40, 60, 120));
     }
-    const char *q = query;
-    while (*q) {
-        if (x >= edit.x + edit.w - pad) break;
-        unsigned cp;
-        int n = font_utf8_next(q, &cp);
-        if (x + font_cp_w16(cp) > edit.x + pad)
-            font_putcp16_clip(sf, x, edit.y + 1, cp, col(255, 255, 255), edit.x + pad, edit.x + edit.w - pad);
-        x += font_cp_w16(cp);
-        q += n;
-    }
-    if ((SDL_GetTicks() / 500) % 2 == 0) {
-        SDL_Rect c = { x < edit.x + edit.w - pad - 1 ? x : edit.x + edit.w - pad - 1,
-                       edit.y + 2, 1, 14 };
+    font_puts16(sf, edit.x + pad, edit.y + 1, shown, col(255, 255, 255));
+    /* caret only while the search field has focus; unfocused it is not drawn
+       at all (a one-shot repaint on FOCUS_LOST clears the last blink frame) */
+    if (focused && (SDL_GetTicks() / 500) % 2 == 0) {
+        int cx = caret_x < edit.x + edit.w - pad - 1 ? caret_x : edit.x + edit.w - pad - 1;
+        SDL_Rect c = { cx, edit.y + 2, 1, 14 };
         SDL_FillRect(sf, &c, col(0, 255, 0));
     }
     skin_button(sf, &scopeb, pressed == SB_SCOPE, 0);
@@ -486,6 +517,29 @@ void search_mouse(SDL_Event *e) {
         if (in_rect(&scopeb, x, y)) { pressed = SB_SCOPE; return; }
         if (in_rect(&edit, x, y)) {
             selall = 0;
+            /* place the caret at the codepoint boundary nearest the click,
+               hit-testing the currently visible caret-anchored slice */
+            int av = edit.w - 12;
+            int qlen = (int)strlen(query);
+            if (caret < 0 || caret > qlen) caret = qlen;
+            char pre[512];
+            memcpy(pre, query, (size_t)caret);
+            pre[caret] = 0;
+            const char *st = font_fit_tail(pre, av);
+            int off = (int)(st - pre);
+            int room = av - font_w16(st);
+            int extra = room > 0 ? font_fit(query + caret, room) : 0;
+            const char *end = query + off + (caret - off) + extra;
+            const char *p = query + off;
+            int px = edit.x + 3;
+            while (p < end) {
+                unsigned cp;
+                int n = font_utf8_next(p, &cp);
+                if (x < px + font_cp_w16(cp) / 2) break;
+                px += font_cp_w16(cp);
+                p += n;
+            }
+            caret = (int)(p - query);
             SDL_SetWindowInputFocus(w);
             SDL_StartTextInput();
             return;
@@ -523,12 +577,11 @@ void search_mouse(SDL_Event *e) {
     }
 }
 
-static void del_last_cp(void) {
-    size_t n = strlen(query);
-    if (!n) return;
-    size_t i = n - 1;
-    while (i > 0 && ((unsigned char)query[i] & 0xC0) == 0x80) i--;
-    query[i] = 0;
+/* byte length of the codepoint before offset i (i > 0) */
+static int cp_before_len(int i) {
+    int q = i - 1;
+    while (q > 0 && ((unsigned char)query[q] & 0xC0) == 0x80) q--;
+    return i - q;
 }
 
 void search_key(SDL_Event *e) {
@@ -543,13 +596,14 @@ void search_key(SDL_Event *e) {
     case SDLK_x:
         if (ctrl && selall && query[0]) {
             ui_clip_copy(query);
-            query[0] = 0; selall = 0; nres = 0; sel = scroll = 0;
+            query[0] = 0; caret = 0; selall = 0; nres = 0; sel = scroll = 0;
         }
         break;
     case SDLK_v:
         if (ctrl) {
-            if (selall) { query[0] = 0; selall = 0; }
+            if (selall) { query[0] = 0; caret = 0; selall = 0; }
             if (ui_clip_paste(query, sizeof query)) {
+                caret = (int)strlen(query);
                 if (query[0]) run_search();
                 else { nres = 0; sel = scroll = 0; }
             }
@@ -565,12 +619,40 @@ void search_key(SDL_Event *e) {
     case SDLK_DOWN:
         if (sel < nres - 1) { sel++; keep_scroll(); }
         break;
+    case SDLK_LEFT:
+        if (selall) { caret = 0; selall = 0; break; }
+        if (caret > 0) caret -= cp_before_len(caret);
+        break;
+    case SDLK_RIGHT:
+        if (selall) { caret = (int)strlen(query); selall = 0; break; }
+        if (query[caret]) {
+            unsigned cp;
+            caret += font_utf8_next(query + caret, &cp);
+        }
+        break;
+    case SDLK_HOME:
+        caret = 0; selall = 0;
+        break;
+    case SDLK_END:
+        caret = (int)strlen(query); selall = 0;
+        break;
     case SDLK_BACKSPACE:
-        if (selall) { query[0] = 0; selall = 0; nres = 0; sel = scroll = 0; }
-        else if (query[0]) { del_last_cp(); run_search(); }
+        if (selall) { query[0] = 0; caret = 0; selall = 0; nres = 0; sel = scroll = 0; }
+        else if (caret > 0) {
+            int q = caret - cp_before_len(caret);
+            memmove(query + q, query + caret, strlen(query + caret) + 1);
+            caret = q;
+            run_search();
+        }
         break;
     case SDLK_DELETE:
-        if (selall) { query[0] = 0; selall = 0; nres = 0; sel = scroll = 0; }
+        if (selall) { query[0] = 0; caret = 0; selall = 0; nres = 0; sel = scroll = 0; }
+        else if (query[caret]) {
+            unsigned cp;
+            int n = font_utf8_next(query + caret, &cp);
+            memmove(query + caret, query + caret + n, strlen(query + caret + n) + 1);
+            run_search();
+        }
         break;
     case SDLK_ESCAPE:
         search_close();
@@ -579,15 +661,21 @@ void search_key(SDL_Event *e) {
 }
 
 void search_text(const char *text) {
-    if (selall) { query[0] = 0; selall = 0; }
+    if (selall) { query[0] = 0; caret = 0; selall = 0; }
     size_t len = strlen(query);
+    if (caret < 0 || caret > (int)len) caret = (int)len;
     const char *q = text;
     int changed = 0;
     while (*q && len + 4 < sizeof query) {
         unsigned cp;
         int n = font_utf8_next(q, &cp);
         if (cp >= 0x20 || cp == 0x09) {
-            len += (size_t)utf8_enc(cp, query + len);
+            char enc[4];
+            int m = utf8_enc(cp, enc);
+            memmove(query + caret + m, query + caret, len - (size_t)caret + 1);
+            memcpy(query + caret, enc, (size_t)m);
+            caret += m;
+            len += (size_t)m;
             query[len] = 0;
             changed = 1;
         }
