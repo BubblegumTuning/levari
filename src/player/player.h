@@ -17,6 +17,9 @@ typedef struct {
     volatile int repeat;   /* 0 none, 1 all, 2 one */
     volatile int vol;      /* 0..128 */
     int vol_prev;          /* volume restored by unmute */
+    volatile int fade_stop;/* 1: CMD_STOP fades out over 0.5s before stopping */
+    int fading;            /* player-thread only: a stop fade is in progress */
+    long long fade_total, fade_left; /* frames of the running fade */
     volatile int pan;      /* -32..32 left..right balance */
     volatile int cmd;
     volatile int cmd_arg;

@@ -17,6 +17,6 @@ void     dec_close(Decoder *d);
 
 /* ffmpeg backend availability: 0 = not built, 1 = available,
    2 = built but libav* shared libraries missing at runtime */
-int      dec_ffmpeg_status(void);
+int      dec_ffmpeg_probe(void); /* 1 = libav* loadable, 2 = missing; no lasting dlopen */
 
 #endif

@@ -65,12 +65,24 @@ static void set_key(const char *k, char *v) {
         int o = onoff(v); if (o >= 0) cfg.ui_vis = o;
     } else if (!strcmp(k, "ui.search")) {
         int o = onoff(v); if (o >= 0) cfg.ui_search = o;
+    } else if (!strcmp(k, "player.shuffle_remember")) {
+        int o = onoff(v); if (o >= 0) cfg.shuffle_remember = o;
+    } else if (!strcmp(k, "player.shuffle")) {
+        int o = onoff(v); if (o >= 0) cfg.shuffle = o;
+    } else if (!strcmp(k, "player.fade_stop")) {
+        int o = onoff(v); if (o >= 0) cfg.fade_stop = o;
+    } else if (!strcmp(k, "decode.allow_large")) {
+        int o = onoff(v); if (o >= 0) cfg.allow_large = o;
+    } else if (!strcmp(k, "ui.always_10fps")) {
+        int o = onoff(v); if (o >= 0) cfg.ui_always10 = o;
     }
 }
 
 void cfg_load(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.ui_pl = cfg.ui_eq = cfg.ui_vis = cfg.ui_search = -1;
+    cfg.shuffle_remember = cfg.shuffle = -1;
+    cfg.fade_stop = 1; /* fade-out on stop is on unless configured off */
     char path[LV_MAX_PATH];
     cfg_path(path, sizeof path);
     FILE *f = fopen(path, "r");
@@ -113,6 +125,11 @@ int cfg_save(void) {
     if (cfg.ui_eq >= 0) fprintf(f, "ui.eq = %s\n", onoff_s(cfg.ui_eq));
     if (cfg.ui_vis >= 0) fprintf(f, "ui.vis = %s\n", onoff_s(cfg.ui_vis));
     if (cfg.ui_search >= 0) fprintf(f, "ui.search = %s\n", onoff_s(cfg.ui_search));
+    if (cfg.shuffle_remember >= 0) fprintf(f, "player.shuffle_remember = %s\n", onoff_s(cfg.shuffle_remember));
+    if (cfg.shuffle >= 0) fprintf(f, "player.shuffle = %s\n", onoff_s(cfg.shuffle));
+    fprintf(f, "player.fade_stop = %s\n", onoff_s(cfg.fade_stop));
+    fprintf(f, "decode.allow_large = %s\n", onoff_s(cfg.allow_large));
+    fprintf(f, "ui.always_10fps = %s\n", onoff_s(cfg.ui_always10));
     fclose(f);
     return 0;
 }

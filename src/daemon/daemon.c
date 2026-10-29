@@ -5,6 +5,7 @@
 #include "../common.h"
 #ifdef _WIN32
 #include "../compat/win32.h"
+#include <sddl.h>
 #else
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -155,6 +156,10 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         volatile int *flag = !strcmp(cmd, "shuffle") ? &p->shuffle : &p->repeat;
         if (one) *flag = 2;
         else if (on) *flag = 1; else if (off) *flag = 0; else *flag = !*flag;
+        if (flag == &p->shuffle && cfg.shuffle_remember > 0) {
+            cfg.shuffle = *flag;
+            cfg_save();
+        }
         lv_strlcpy(resp, "OK", rn);
     } else if (!strcmp(cmd, "eq")) {
         int on = strstr(line, "on") != NULL;
@@ -206,11 +211,25 @@ static void *srv_thread(void *arg) {
     (void)arg;
     char path[512];
     sock_path(path, sizeof path);
+    /* owner-only pipe: with a NULL security descriptor the pipe inherits the
+       token's default DACL, which lets other local users open the single
+       instance (read-only, but enough to lock the real CLI/MCP out). The
+       owner-SID ACE blocks them at open while the same user's CLI/MCP keep
+       access even from another logon session. */
+    PSECURITY_DESCRIPTOR psd = NULL;
+    SECURITY_ATTRIBUTES sa, *sap = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:(A;;GA;;;OW)", SDDL_REVISION_1, &psd, NULL)) {
+        sa.nLength = sizeof sa;
+        sa.lpSecurityDescriptor = psd;
+        sa.bInheritHandle = FALSE;
+        sap = &sa;
+    }
     while (!srv_quit) {
         HANDLE h = CreateNamedPipeA(path, PIPE_ACCESS_DUPLEX,
                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                    1, 0, 4096, 1000, NULL);
-        if (h == INVALID_HANDLE_VALUE) return NULL;
+                                    1, 0, 4096, 1000, sap);
+        if (h == INVALID_HANDLE_VALUE) { if (psd) LocalFree(psd); return NULL; }
         cur_pipe = h;
         if (!ConnectNamedPipe(h, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
             CloseHandle(h); cur_pipe = INVALID_HANDLE_VALUE;
@@ -236,6 +255,7 @@ static void *srv_thread(void *arg) {
         CloseHandle(h);
         cur_pipe = INVALID_HANDLE_VALUE;
     }
+    if (psd) LocalFree(psd);
     return NULL;
 }
 

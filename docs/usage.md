@@ -79,6 +79,18 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
     ui.eq = off
     ui.vis = off
     ui.search = off
+    player.shuffle_remember = on  keep the shuffle toggle across sessions
+    player.shuffle = on           remembered state (kept updated while
+                                  shuffle_remember is on)
+    player.fade_stop = on         0.5 s volume fade-out when stop is pressed
+                                  (options window `FADE` toggle; on by default)
+    decode.allow_large = off      accept files over 256 MB; off = the decoder
+                                  refuses them (options window ADV page,
+                                  `LARGE` toggle)
+    ui.always_10fps = off         keep repainting the main window at 10 fps
+                                  whenever a title is long enough to marquee,
+                                  so it scrolls while paused/stopped/unfocused
+                                  (options window ADV page, `10FPS` toggle)
 
 A leading `~` in any path value expands to the home directory. In the
 options window the library dirs field takes several directories as one

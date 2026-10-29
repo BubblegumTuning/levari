@@ -11,6 +11,7 @@ void search_shutdown(void);
 int search_is_open(void);
 SDL_Window *search_window(void);
 Uint32 search_window_id(void);
+void search_set_focus(int f); /* 1 while the search window holds WM focus */
 void search_draw(void);
 void search_surface_refresh(void);
 void search_mouse(SDL_Event *e);

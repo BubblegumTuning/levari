@@ -21,6 +21,7 @@
 #include "../compat/win32.h"
 #else
 #include <dlfcn.h>
+#include <sys/stat.h>
 #endif
 #include <string.h>
 #include <stdio.h>
@@ -357,8 +358,19 @@ static int ff_syms(void) {
     return 0;
 }
 
-int dec_ffmpeg_status(void) {
-    return ff_syms() == 0 ? 1 : 2;
+/* startup availability check that does not keep libav* mapped: dlopen
+   the three, then dlclose them right away (their whole dep chain gets
+   unmapped again); the first real ffmpeg-format open does the full
+   symbol-resolving ff_syms() load. ff_state is left untouched. */
+int dec_ffmpeg_probe(void) {
+    void *hu = ff_dlopen("libavutil");
+    void *hc = ff_dlopen("libavcodec");
+    void *hf = ff_dlopen("libavformat");
+    int ok = hu && hc && hf;
+    if (hu) dlclose(hu);
+    if (hc) dlclose(hc);
+    if (hf) dlclose(hf);
+    return ok ? 1 : 2;
 }
 
 typedef struct {
@@ -404,7 +416,7 @@ static void ff_copy(AVFrame *fr, int from, int n, int ch, int16_t *out) {
         }
 }
 #else
-int dec_ffmpeg_status(void) { return 0; }
+int dec_ffmpeg_probe(void) { return 0; }
 #endif
 
 struct Decoder {
@@ -517,6 +529,20 @@ static int sniff(const char *path, int *fmt) {
 Decoder *dec_open(const char *path) {
     int fmt = F_UNKNOWN;
     if (sniff(path, &fmt) != 0) return NULL;
+    /* large-file ingest policy (options window ADVANCED tab, LARGE toggle):
+       the slurp-based decoders (minimp3 builds a whole-file seek table,
+       modplug/ogg-flac buffer the stream) would happily OOM on a
+       multi-gigabyte file. Over LV_LARGE_FILE the open is refused unless
+       the user opted in; tag_probe is unaffected (fixed 128KB head). */
+    if (!cfg.allow_large) {
+        struct stat st;
+        if (stat(path, &st) == 0 && (long long)st.st_size > (256LL << 20)) {
+            fprintf(stderr, "levari: %s is %lld MB, over the 256 MB ingest "
+                            "cap (enable LARGE in options > advanced)\n",
+                    path, (long long)st.st_size >> 20);
+            return NULL;
+        }
+    }
     Decoder *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->fmt = fmt;
@@ -724,7 +750,7 @@ Decoder *dec_open(const char *path) {
     /* the whole pipeline (player buffers, pan, viz, WSOLA, ALSA) assumes
        at most stereo; vorbis allows 255 channels, flac 32, wav 65535, so
        a multichannel file here would overflow the fixed sample buffers */
-    if (d->ch <= 0 || d->ch > 2 || d->rate <= 0) goto fail;
+    if (d->ch <= 0 || d->ch > 2 || d->rate <= 0) { dec_close(d); return NULL; }
     return d;
 fail:
     free(d);

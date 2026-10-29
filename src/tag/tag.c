@@ -105,8 +105,12 @@ static void text_frame(Tags *t, const char *id, const unsigned char *p, size_t n
     if (enc == 1 || enc == 2) {
         if (enc == 1 && vn >= 2 && v[0] == 0xFF && v[1] == 0xFE) { v += 2; vn -= 2; }
         else if (enc == 1 && vn >= 2 && v[0] == 0xFE && v[1] == 0xFF) {
-            /* big endian: swap into scratch */
-            unsigned char sw[512];
+            /* big endian: skip the BOM (the LE branch above does too —
+             * without this the swapped FE FF becomes U+FEFF in the text),
+             * swap into scratch; zero-init so a truncated odd-length
+             * field has no uninitialized tail byte */
+            v += 2; vn -= 2;
+            unsigned char sw[512] = {0};
             size_t k = vn < sizeof sw ? vn : sizeof sw;
             for (size_t i = 0; i + 1 < k; i += 2) { sw[i] = v[i + 1]; sw[i + 1] = v[i]; }
             utf16_to_utf8(dst, 256, sw, k);
@@ -192,6 +196,7 @@ static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
         size_t kl = cl < 31 ? cl : 31;
         size_t eq = 0;
         while (eq < kl && p[eq] != '=') eq++;
+        if (eq >= kl) { p += cl; n -= cl; continue; } /* no '=': not a KEY=VALUE entry */
         memcpy(key, p, eq);
         for (size_t i = 0; key[i]; i++) key[i] = (char)toupper((unsigned char)key[i]);
         const unsigned char *val = p + eq + 1;

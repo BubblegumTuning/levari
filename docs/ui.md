@@ -27,8 +27,11 @@ For a per-button reference of every control in each window, see
   `;`-separated, hover for the tooltip), library index path
   (default `~/.levari/index`), libav* directory, audio backend +
   device, daemon socket path, and startup window toggles
-  (playlist/EQ/VIS/search). Fields take an editing caret: arrows move
-  it (Home/End jump), typing inserts at it, Backspace deletes before
+  (playlist/EQ/VIS/search) plus the `SHUF` toggle: when on, the shuffle
+  state is saved to the config and restored at startup, and the `FADE`
+  toggle: when on (the default), stop fades out over 0.5 s. Fields take an
+  editing caret: arrows move it (Home/End jump), typing inserts at it,
+  Backspace deletes before
   it, Delete removes at it; long text scrolls to keep the caret in view.
   `SAVE` writes `~/.config/levari/config` immediately; audio backend/device
   take effect on the next track, libav dir and socket path on restart.
@@ -55,7 +58,10 @@ and word-start matches score higher.
 - Click a result, or press `Enter` to jump to the top (or arrow-selected)
   result: it becomes the current track; if playback is active it starts
   playing immediately.
-- Edit box: full UTF-8/IME input; `Ctrl+A` selects all, then `Backspace`
+- Edit box: full UTF-8/IME input with an editing caret: arrows move it
+  (Home/End jump), typing inserts at it, Backspace deletes before it,
+  Delete removes at it; clicking places it; long text scrolls to keep
+  the caret in view. `Ctrl+A` selects all, then `Backspace`
   or typing replaces it. `Esc` closes the window.
 
 ## Window snapping
@@ -80,6 +86,7 @@ there is no room on the left).
 
     x play   c pause   Space play/pause   v stop   b prev   n next
     s shuffle   r repeat   Ctrl+L rescan tags
+    Ctrl+F (Cmd+F on Mac) open + focus the search window
     e equalizer   o open browser
     Left/Right seek ±5s   Up/Down volume
     Next/Prev/Play-Stop media keys (when levari is focused; globally

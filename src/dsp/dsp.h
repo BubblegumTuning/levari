@@ -6,7 +6,7 @@
 
 #define EQ_BANDS 10
 
-typedef struct { double b0, b1, b2, a1, a2; double x1, x2, y1, y2; } Biquad;
+typedef struct { float b0, b1, b2, a1, a2; float x1, x2, y1, y2; } Biquad;
 
 typedef struct {
     int enabled;

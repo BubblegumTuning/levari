@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.2.4 LANGUAGES C)
+project(levari VERSION 0.2.7 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -54,8 +54,11 @@ if(WIN32)
     # no -flto on MinGW: LTO IR hides main() from archive member selection,
     # so mingw's crtexewin.o (main -> WinMain shim) wins and the link fails
     target_compile_options(modplug PRIVATE -Os -w)
-else()
+elseif(APPLE)
     target_compile_options(modplug PRIVATE -Os -flto -w)
+else()
+    # -fPIE required so the static archive can join a PIE link
+    target_compile_options(modplug PRIVATE -Os -flto -fPIE -w)
 endif()
 
 add_executable(levari
@@ -110,18 +113,42 @@ if(APPLE)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/assets/Info.plist.in")
 endif()
 if(WIN32)
-    target_compile_options(levari PRIVATE -Os -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(levari PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
     # -mwindows: GUI subsystem (no console on double-click). No -Wl,-s:
     # stripped exes trip heuristic AV scans (Behavior:Win32/DefenseEvasion)
     # and the symbol table costs little here.
+    # MinGW-w64 links PE executables DYNAMICBASE (ASLR) by default.
     target_link_options(levari PRIVATE -Wl,--gc-sections -mwindows)
 elseif(APPLE)
-    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
     target_link_options(levari PRIVATE -flto -Wl,-dead_strip)
 else()
-    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
-    target_link_options(levari PRIVATE -flto -Wl,--gc-sections -Wl,-s)
+    # hardening: PIE (ASLR for the image), stack canaries, full RELRO
+    # (-z now makes the GOT read-only), FORTIFY source-level buffer checks
+    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter)
+    target_link_options(levari PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
 endif()
+
+# CPU tuning for ARM boards: -DLV_TUNE=arm1176jzf-s (Pi Zero 1 / Pi 1),
+# cortex-a7 (Pi 2) or cortex-a72 (Pi 4). On 32-bit armv7 the NEON flags
+# also switch minimp3 to its SIMD mp3 decoder; the armv6 boards (Pi Zero 1,
+# Pi 1: ARM1176, VFPv2, no NEON) get plain VFP instead, so minimp3 keeps
+# its scalar path and the binary runs on them (NEON flags would SIGILL).
+set(LV_TUNE "" CACHE STRING "-mcpu target, e.g. arm1176jzf-s (Pi Zero) / cortex-a7 (Pi 2) / cortex-a72 (Pi 4)")
+if(LV_TUNE AND NOT WIN32)
+    target_compile_options(levari PRIVATE -mcpu=${LV_TUNE})
+    target_compile_options(modplug PRIVATE -mcpu=${LV_TUNE})
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv7")
+        target_compile_options(levari PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=hard)
+        target_compile_options(modplug PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=hard)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv6")
+        target_compile_options(levari PRIVATE -mfpu=vfp -mfloat-abi=hard)
+        target_compile_options(modplug PRIVATE -mfpu=vfp -mfloat-abi=hard)
+    endif()
+endif()
+
+# decoders dominate CPU: let this TU optimize for speed, not size
+set_source_files_properties(src/decode/decode.c PROPERTIES COMPILE_OPTIONS "-O3")
 
 # optional libav* backend for aac/wma and other exotic formats:
 # dev headers only at build time; the libraries are dlopen'd at runtime,
@@ -183,14 +210,14 @@ if(ENABLE_MCP)
         target_link_libraries(levari-mcp modplug dl pthread m)
     endif()
     if(WIN32)
-        target_compile_options(levari-mcp PRIVATE -Os -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
+        target_compile_options(levari-mcp PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
         target_link_options(levari-mcp PRIVATE -Wl,--gc-sections)
     elseif(APPLE)
-        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
+        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
         target_link_options(levari-mcp PRIVATE -flto -Wl,-dead_strip)
     else()
-        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter)
-        target_link_options(levari-mcp PRIVATE -flto -Wl,--gc-sections -Wl,-s)
+        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter)
+        target_link_options(levari-mcp PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
     endif()
     set_source_files_properties(third_party/cJSON.c PROPERTIES COMPILE_OPTIONS "-w")
     if(AV_FOUND)

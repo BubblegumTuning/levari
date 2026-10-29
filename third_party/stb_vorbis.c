@@ -3761,8 +3761,12 @@ static int start_decoder(vorb *f)
             if (present) {
                lengths[j] = get_bits(f, 5) + 1;
                ++total;
-               if (lengths[j] == 32)
-                  return error(f, VORBIS_invalid_setup);
+               // LEVARI PATCH: upstream stb_vorbis (master 003501f, unfixed as of
+               // 2026-10-28) leaks the sparse 'lengths' temp here; it is a local
+               // var never seen by vorbis_deinit. Guarded by c->sparse because in
+               // the non-sparse case lengths == c->codeword_lengths (setup_malloc,
+               // freed by deinit). Remove marker if upstream ever fixes this.
+               if (lengths[j] == 32) { if (c->sparse) setup_temp_free(f, lengths, c->entries); return error(f, VORBIS_invalid_setup); }
             } else {
                lengths[j] = NO_CODE;
             }
@@ -3817,7 +3821,10 @@ static int start_decoder(vorb *f)
       }
 
       if (!compute_codewords(c, lengths, c->entries, values)) {
-         if (c->sparse) setup_temp_free(f, values, 0);
+         // LEVARI PATCH: also free 'lengths' (upstream leaks it here). Do NOT
+         // temp-free c->codewords: vorbis_deinit already setup_free()s that
+         // struct field (double-free in malloc-fallback mode).
+         if (c->sparse) { setup_temp_free(f, values, 0); setup_temp_free(f, lengths, c->entries); }
          return error(f, VORBIS_invalid_setup);
       }
 

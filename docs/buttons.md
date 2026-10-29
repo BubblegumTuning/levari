@@ -14,7 +14,7 @@ hides that window (its state is kept).
 |---|---|
 | `▶` Play | Stopped: start playback at the current track (first track if none is current). Paused: resume. |
 | `❚❚` Pause | Toggle pause/play. |
-| `■` Stop | Stop playback. |
+| `■` Stop | Stop playback. With the options window's `FADE` toggle on (the default), a stop while playing first fades the volume to silence over 0.5 s; pressing stop again stops at once. Stopping while paused stops at once. |
 | `\|◀` Prev | Jump to the previous track. |
 | `▶\|` Next | Jump to the next track. |
 | folder icon | Open the file browser window (same as the `o` hotkey or `O`). |
@@ -23,7 +23,7 @@ hides that window (its state is kept).
 
 | Button | Action |
 |---|---|
-| `SHUFFLE` | Toggle shuffle mode (green = on). Next/prev navigation then follows the shuffled order. |
+| `SHUFFLE` | Toggle shuffle mode (green = on). Next/prev navigation then follows the shuffled order. With the options window's `SHUF` startup toggle on, the state is saved to the config and restored at startup. |
 | `REPEAT` | Toggle playlist repeat (green = on); the last track wraps back to the first. |
 | `EQ` | Show/hide the equalizer window. The label is green while EQ processing is enabled, regardless of window visibility. |
 | `VIS` | Toggle the spectrum analyzer drawn over the scrolling title strip (green = on). |
@@ -82,6 +82,31 @@ window's width within 12 px.
 The current directory is shown along the bottom; a scrollbar appears on
 the right when the list overflows. The browser opens in the folder of
 the current track (or the working directory if nothing is loaded).
+
+## Options window
+
+Opened from the main window title-bar right-click (`OPTIONS...`). The
+`BASIC` / `ADV` tab buttons (small tabs in the title bar, right of the
+`OPTIONS` label) switch the page; `SAVE` writes
+all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
+
+### BASIC page
+
+| Control | Action |
+|---|---|
+| `LIBRARY DIRS` | `;`-separated list of scanned directories (hover for the tooltip). |
+| `SCAN` | Scan the library dirs into the index (uses the `TAGS` checkbox). |
+| `TAGS` | When on (green), SCAN reads tags+duration; off = filenames only. |
+| `LIB INDEX` / `LIBAV DIR` / `AUDIO BACKEND` / `AUDIO DEVICE` / `DAEMON SOCKET` | Config text fields; `libav.dir` and the socket path apply on restart. |
+| `CLEAR` | Delete the library index. |
+| `STARTUP` toggles `UI PL` `UI EQ` `UI VIS` `UI SRCH` `SHUF` `FADE` | Startup window visibility; `SHUF` keeps the shuffle state across sessions; `FADE` fades volume out on stop (on by default). |
+
+### ADV page
+
+| Control | Action |
+|---|---|
+| `LARGE` | Allow ingest of files over 256 MB (green = on). Off by default: files over the cap are refused by the decoder with a message, protecting against OOM from the whole-file slurp decoders (MP3 seek table, module/Ogg-FLAC buffers). Toggling applies immediately (still press `SAVE` to persist); tag scanning is never capped. |
+| `10FPS` | Keep repainting the main window at 10 fps whenever the title is long enough to marquee (green = on). Off by default: the marquee only scrolls while playing. On, it also scrolls while paused, stopped, or unfocused — at the cost of a steady 10 fps repaint. Toggling applies immediately (still press `SAVE` to persist). |
 
 ## Search window
 

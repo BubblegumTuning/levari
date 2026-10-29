@@ -63,8 +63,8 @@ void eq_design_locked(EQ *e) {
         }
 }
 
-static inline double run(Biquad *b, double x) {
-    double y = b->b0 * x + b->b1 * b->x1 + b->b2 * b->x2 - b->a1 * b->y1 - b->a2 * b->y2;
+static inline float run(Biquad *b, float x) {
+    float y = b->b0 * x + b->b1 * b->x1 + b->b2 * b->x2 - b->a1 * b->y1 - b->a2 * b->y2;
     b->x2 = b->x1; b->x1 = x;
     b->y2 = b->y1; b->y1 = y;
     return y;
@@ -73,12 +73,12 @@ static inline double run(Biquad *b, double x) {
 void eq_process(EQ *e, int16_t *buf, int frames, int ch) {
     pthread_mutex_lock(&e->mtx);
     if (!e->enabled) { pthread_mutex_unlock(&e->mtx); return; }
-    double g = pow(10.0, e->preamp_db / 20.0);
+    float g = (float)pow(10.0, e->preamp_db / 20.0);
     for (int f = 0; f < frames; f++) {
         for (int c = 0; c < ch; c++) {
             int idx = f * ch + c;
             int bc = c < 2 ? c : 0;
-            double v = (double)buf[idx] * g;
+            float v = (float)buf[idx] * g;
             for (int b = 0; b < EQ_BANDS; b++) v = run(&e->bq[b][bc], v);
             if (v > 32767) v = 32767;
             if (v < -32768) v = -32768;

@@ -1,5 +1,6 @@
 /* minimal hand-written config.h for levari's vendored libmodplug
-   (glibc, little-endian x86-64); replaces the autotools-generated one */
+   (glibc, little-endian: x86-64/aarch64/armv7); replaces the
+   autotools-generated one */
 #define HAVE_DLFCN_H 1
 #define HAVE_INTTYPES_H 1
 #ifdef __APPLE__

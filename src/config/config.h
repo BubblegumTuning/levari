@@ -15,6 +15,15 @@ typedef struct {
     char audio_device[128];        /* audio.device; "" = default */
     char socket_path[LV_MAX_PATH]; /* daemon.socket; "" = XDG default */
     int  ui_pl, ui_eq, ui_vis, ui_search; /* ui.playlist/eq/vis/search: -1 unset, 0 off, 1 on */
+    int  shuffle_remember; /* player.shuffle_remember: -1 unset, 0 off, 1 on */
+    int  shuffle;          /* player.shuffle: remembered state, -1 unset */
+    int  fade_stop;        /* player.fade_stop: 0 off, 1 on; default on */
+    int  allow_large;      /* decode.allow_large: 0 off (default), 1 on =
+                              accept files over the 256 MB ingest cap */
+    int  ui_always10;      /* ui.always_10fps: 0 off (default), 1 on = keep
+                              repainting the main window at 10 fps whenever
+                              a title is long enough to marquee, so it keeps
+                              scrolling while paused/stopped/unfocused */
 } Config;
 
 extern Config cfg;
