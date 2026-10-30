@@ -49,7 +49,9 @@ used automatically with or without `LV_TUNE`.
     tools/release.sh
 
 Builds the release targets (native linux, MinGW win; `SDL2_DIR` points
-at the SDL2-mingw cmake dir) and writes `dist/release/levari-<target>.<version>.zip`
+at the SDL2-mingw cmake dir) and writes `dist/release/levari-<target>.<arch>.<version>.zip`
+(arch tokens match the in-app `LV_ARCH` display: `x86-64`, `arm32`,
+`arm64`, `x86`)
 (version read from CMakeLists.txt) — one folder with every artifact,
 ready to drag into a GitHub release upload. Pi zips join the set once
 their cross toolchains are set up (see the pi block in the script).

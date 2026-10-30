@@ -16,5 +16,8 @@ void tag_read(const char *path, Tags *t);
    caller's stat, 0 = stat internally). Returns duration in seconds,
    0 = unknown (other formats need the decoder for that). */
 int tag_probe(const char *path, long long size_hint, Tags *t);
+/* SPC/ID666 length field from a >=0x100-byte header buffer; seconds,
+   0 = unknown. decode.c reuses it on its slurped copy. */
+int spc_tag_duration(const unsigned char *head, long n);
 
 #endif
