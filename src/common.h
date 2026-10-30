@@ -10,7 +10,7 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.2.7"
+#define LV_VERSION "0.2.9"
 #endif
 
 /* build architecture, shown in the options title bar before the version
@@ -65,6 +65,15 @@ static inline int lv_strncasecmp(const char *a, const char *b, size_t n) {
         if (!ca) return 0;
     }
     return 0;
+}
+
+/* case-insensitive substring search (no strcasestr portability gamble) */
+static inline const char *lv_stristr(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return hay;
+    for (const char *p = hay; *p; p++)
+        if (!lv_strncasecmp(p, needle, nl)) return p;
+    return NULL;
 }
 
 /* last path separator. On Windows both / and \ ; elsewhere \ is a legal
@@ -127,6 +136,35 @@ static inline void lv_path_join(char *out, size_t n, const char *dir, const char
         snprintf(out, n, "%s%s", dir, rel);
     else
         snprintf(out, n, "%s/%s", dir, rel);
+}
+
+/* logical drive roots from a GetLogicalDrives-style bitmask (bit 0 = "A:").
+   PURE: no Win32 calls, unit-testable on any OS. *out is a malloc'd array
+   of "X:\" strings in ascending order; the caller frees each entry. */
+static inline int drives_from_mask(unsigned mask, char ***out) {
+    int n = 0;
+    for (int i = 0; i < 26; i++) if (mask & (1u << i)) n++;
+    if (!n) { *out = NULL; return 0; }
+    char **v = malloc((size_t)n * sizeof *v);
+    if (!v) { *out = NULL; return 0; }
+    int k = 0;
+    for (int i = 0; i < 26; i++) {
+        if (!(mask & (1u << i))) continue;
+        v[k] = malloc(4);
+        if (!v[k]) {
+            for (int j = 0; j < k; j++) free(v[j]);
+            free(v);
+            *out = NULL;
+            return 0;
+        }
+        v[k][0] = (char)('A' + i);
+        v[k][1] = ':';
+        v[k][2] = '\\';
+        v[k][3] = 0;
+        k++;
+    }
+    *out = v;
+    return k;
 }
 
 #endif

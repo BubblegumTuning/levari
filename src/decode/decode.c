@@ -13,10 +13,12 @@
 #include "../../third_party/stb_vorbis.c"
 
 #include "../../third_party/libmodplug/modplug.h"
+#include "../../third_party/snes_spc/spc.h"
 
 #include "decode.h"
 #include "../common.h"
 #include "../config/config.h"
+#include "../tag/tag.h"
 #ifdef _WIN32
 #include "../compat/win32.h"
 #else
@@ -32,7 +34,7 @@
 #include <libavcodec/avcodec.h>
 #endif
 
-enum { F_UNKNOWN, F_MP3, F_OGG, F_OPUS, F_FLAC, F_OGGFLAC, F_WAV, F_FFMPEG, F_MOD };
+enum { F_UNKNOWN, F_MP3, F_OGG, F_OPUS, F_FLAC, F_OGGFLAC, F_WAV, F_FFMPEG, F_MOD, F_SPC };
 
 /* ---- opus via dlopen'd libopus (no dev headers needed) ---- */
 static void *(*opus_create)(int Fs, int ch, int *err);
@@ -89,9 +91,12 @@ typedef struct {
 } Opus;
 
 static long long rd64(const unsigned char *p) {
-    long long v = 0;
+    /* unsigned accumulator: signed left-shift overflow was UB (UBSan,
+       night 2026-10-29); two's-complement conversion on return is the
+       intended value for Ogg granule positions. */
+    unsigned long long v = 0;
     for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
+    return (long long)v;
 }
 static unsigned rd32(const unsigned char *p) {
     return (unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24;
@@ -250,7 +255,10 @@ static unsigned char *oggflac_demux(const unsigned char *raw, size_t n,
 static int ff_state; /* 0 = not tried, 1 = ok, -1 = unavailable */
 
 static void (*p_av_log_set_level)(int);
-static int (*p_av_rescale_q)(int64_t, AVRational, AVRational);
+/* av_rescale_q returns int64_t: an int prototype truncates the value at
+   2^31 — at fine stream time bases (mp3 uses 1/14112000) that is under
+   half an hour of audio, corrupting duration and seek targets */
+static int64_t (*p_av_rescale_q)(int64_t, AVRational, AVRational);
 static int (*p_av_sample_fmt_is_planar)(enum AVSampleFormat);
 static int (*p_av_get_bytes_per_sample)(enum AVSampleFormat);
 static const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID);
@@ -419,6 +427,29 @@ static void ff_copy(AVFrame *fr, int from, int n, int ch, int16_t *out) {
 int dec_ffmpeg_probe(void) { return 0; }
 #endif
 
+/* SPC playback policy. The ID666 length tag is authoritative when present
+   (the ripper timed the song): play that many seconds, then fade out over
+   SPC_FADE and end. Untagged files are trimmed by silence: once audio has
+   been heard, SPC_SILENCE frames of continuous near-silence with no DSP
+   key-on events end the song (same fade); SPC_MAX caps runaway playback of
+   files that never go quiet. Seek = reload + spc_skip: fast-forward from
+   the start (skip decodes without filtering, several times faster). */
+#define SPC_RATE 32000
+#define SPC_FADE (2 * SPC_RATE)
+#define SPC_SILENCE (3 * SPC_RATE)
+#define SPC_MAX (600 * SPC_RATE)
+typedef struct {
+    SNES_SPC *spc;
+    SPC_Filter *filter;
+    unsigned char *data; /* kept: seek reloads the emulator from it */
+    long size;
+    long long played;  /* frames emitted since (re)load */
+    long long end_at;  /* absolute frame where output stops; 0 = trim mode */
+    long long fade_at; /* absolute frame where the fade-out starts; <0 none */
+    long long silent;  /* consecutive silent frames (trim mode) */
+    int heard;         /* non-silent output seen (arms the trim) */
+} Spc;
+
 struct Decoder {
     int fmt;
     int rate, ch;
@@ -431,6 +462,7 @@ struct Decoder {
         drwav *wav;
         Opus *op;
         ModPlugFile *mp;
+        Spc *sp;
 #ifdef HAVE_FFMPEG
         FF *ff;
 #endif
@@ -494,6 +526,7 @@ static int sniff(const char *path, int *fmt) {
     if ((h[0]=='I'&&h[1]=='M'&&h[2]=='P'&&h[3]=='M') ||               /* it */
         (n >= 17 && !memcmp(h, "Extended Module: ", 17))) { *fmt = F_MOD; return 0; } /* xm */
     if (n >= 0x2C + 4 && h[0x2C]=='S'&&h[0x2D]=='C'&&h[0x2E]=='R'&&h[0x2F]=='M') { *fmt = F_MOD; return 0; } /* s3m */
+    if (n >= 27 && !memcmp(h, "SNES-SPC700 Sound File Data", 27)) { *fmt = F_SPC; return 0; }
     if (n >= 1084) {                                                 /* mod: channel magic */
         static const char *modmag[] = { "M.K.", "M!K!", "M&K!", "N4C4", "FLT4", "FLT8",
                                         "4CHN", "6CHN", "8CHN", "16CH", "24CH", "32CH",
@@ -701,6 +734,52 @@ Decoder *dec_open(const char *path) {
         d->total = ms > 0 ? (long long)ms * 441 / 10 : 0;
         break;
     }
+    case F_SPC: {
+        long long fs = 0;
+        FILE *f = fopen(path, "rb");
+        if (!f) goto fail;
+        fseek(f, 0, SEEK_END);
+        fs = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        unsigned char *buf = NULL;
+        /* spc_min_file_size: the fixed layout (header + 64K RAM + DSP
+           regs) must be fully present; trailer data is optional */
+        if (fs >= 0x10180 && fs <= (64LL << 20)) buf = malloc((size_t)fs);
+        if (!buf || fread(buf, 1, (size_t)fs, f) != (size_t)fs) {
+            free(buf);
+            fclose(f);
+            goto fail;
+        }
+        fclose(f);
+        SNES_SPC *spc = spc_new();
+        SPC_Filter *flt = spc_filter_new();
+        if (!spc || !flt || spc_load_spc(spc, buf, (long)fs) != NULL) {
+            if (spc) spc_delete(spc);
+            if (flt) spc_filter_delete(flt);
+            free(buf);
+            goto fail;
+        }
+        spc_clear_echo(spc); /* many rips carry garbage in the echo region */
+        Spc *s = calloc(1, sizeof *s);
+        if (!s) {
+            spc_delete(spc);
+            spc_filter_delete(flt);
+            free(buf);
+            goto fail;
+        }
+        s->spc = spc; s->filter = flt; s->data = buf; s->size = (long)fs;
+        s->fade_at = -1;
+        int secs = spc_tag_duration(buf, (long)fs);
+        if (secs) {
+            s->end_at = (long long)secs * SPC_RATE + SPC_FADE;
+            s->fade_at = (long long)secs * SPC_RATE;
+        }
+        d->u.sp = s;
+        d->ch = 2;
+        d->rate = SPC_RATE;
+        d->total = s->end_at;
+        break;
+    }
 #ifdef HAVE_FFMPEG
     case F_FFMPEG: {
     ffmpeg:
@@ -778,6 +857,48 @@ int dec_read(Decoder *d, int16_t *out, int frames) {
     case F_MOD: {
         int got = ModPlug_Read(d->u.mp, out, frames * 4); /* s16 stereo -> 4 bytes/frame */
         return got > 0 ? got / 4 : 0;
+    }
+    case F_SPC: {
+        Spc *s = d->u.sp;
+        if (s->end_at && s->played >= s->end_at) return 0;
+        int n = frames;
+        if (s->end_at && s->played + n > s->end_at)
+            n = (int)(s->end_at - s->played);
+        if (spc_play(s->spc, n * 2, (short *)out) != NULL) return 0;
+        spc_filter_run(s->filter, (short *)out, n * 2);
+        long long from = s->played;
+        s->played += n;
+        if (!s->end_at) {
+            /* silence trim: the emulated DSP reports whether any voice
+               keyed on since the last check; quiet + no key-ons for
+               SPC_SILENCE frames means the song has ended */
+            int loud = 0;
+            for (int i = 0; i < n * 2; i++)
+                if (out[i] < -32 || out[i] > 32) { loud = 1; break; }
+            if (loud) { s->silent = 0; s->heard = 1; }
+            else if (spc_check_kon(s->spc)) s->silent = 0;
+            else if (s->heard && (s->silent += n) >= SPC_SILENCE) {
+                s->end_at = s->played + SPC_FADE;
+                s->fade_at = s->played;
+            }
+            if (!s->end_at && s->played >= SPC_MAX) {
+                s->end_at = s->played + SPC_FADE;
+                s->fade_at = s->played;
+            }
+        }
+        if (s->fade_at >= 0 && s->played > s->fade_at) {
+            /* linear ramp to silence across the fade window; frames
+               before fade_at keep unity gain via the span clamp */
+            long long span = s->end_at - s->fade_at;
+            for (int i = 0; i < n; i++) {
+                long long g = s->end_at - (from + i);
+                if (g > span) g = span;
+                if (g < 0) g = 0;
+                out[i * 2]     = (int16_t)((long long)out[i * 2]     * g / span);
+                out[i * 2 + 1] = (int16_t)((long long)out[i * 2 + 1] * g / span);
+            }
+        }
+        return n;
     }
     case F_OPUS: {
         Opus *o = d->u.op;
@@ -889,6 +1010,22 @@ int dec_seek(Decoder *d, long long frame) {
     case F_MOD:
         ModPlug_Seek(d->u.mp, (int)(frame * 1000 / d->rate)); /* order-approximate */
         return 0;
+    case F_SPC: {
+        Spc *s = d->u.sp;
+        if (frame < 0) frame = 0;
+        if (frame > (1LL << 30)) return -1; /* spc_skip takes an int count */
+        if (spc_load_spc(s->spc, s->data, s->size) != NULL) return -1;
+        spc_clear_echo(s->spc);
+        spc_filter_clear(s->filter);
+        s->played = 0;
+        s->silent = 0;
+        s->heard = 0;
+        /* end_at/fade_at are absolute stream positions: they stay valid
+           across a seek, no recompute needed */
+        if (frame > 0 && spc_skip(s->spc, (int)(frame * 2)) != NULL) return -1;
+        s->played = frame;
+        return 0;
+    }
     case F_OPUS: {
         Opus *o = d->u.op;
         long long target = frame + o->pre_skip;
@@ -898,11 +1035,18 @@ int dec_seek(Decoder *d, long long frame) {
         o->seg_i = 0;
         o->buf_n = o->buf_i = 0;
         o->pkt_len = 0;
+        long long prev = 0; /* first audio page emits from sample 0 */
         for (;;) {
             if (ogg_load_page(o) != 0) return -1;
             if (o->page_granule >= 0 && o->page_granule >= target) break;
+            if (o->page_granule > prev) prev = o->page_granule;
         }
-        o->discard = o->page_granule - target;
+        /* decoding restarts at the found page's first packet, so that page
+           emits samples [prev, page_granule): discard what precedes the
+           target. (The old page_granule - target landed at
+           prev + page_granule - 2*target: exact only at page center, up
+           to a full page off at the edges.) */
+        o->discard = target - prev;
         opus_ctl(o->dec, 4007 /* OPUS_RESET_STATE */);
         return 0;
     }
@@ -937,6 +1081,14 @@ void dec_close(Decoder *d) {
     case F_OGGFLAC: drflac_close(d->u.oflac.fl); free(d->u.oflac.buf); break;
     case F_WAV: drwav_uninit(d->u.wav); free(d->u.wav); break;
     case F_MOD: ModPlug_Unload(d->u.mp); break;
+    case F_SPC: {
+        Spc *s = d->u.sp;
+        if (s->spc) spc_delete(s->spc);
+        if (s->filter) spc_filter_delete(s->filter);
+        free(s->data);
+        free(s);
+        break;
+    }
     case F_OPUS: {
         Opus *o = d->u.op;
         if (o->dec) opus_destroy(o->dec);

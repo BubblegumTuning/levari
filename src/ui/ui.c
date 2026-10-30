@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "search.h"
+#include "textedit.h"
 #include "../skin/skin.h"
 #include "../skin/cjk_font.h"
 #include "../viz/viz.h"
@@ -12,6 +13,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>   /* GetLogicalDrives for the COMPUTER pseudo-root */
+#endif
 
 enum {
     B_PLAY, B_PAUSE, B_STOP, B_PREV, B_NEXT, B_OPEN,
@@ -66,6 +70,17 @@ typedef struct {
     char file_dir[LV_MAX_PATH];
     char **file_names;   /* entries of file_dir, dirs first, then ".." at 0 */
     int file_n, file_scroll, file_sel, file_visible;
+    int *file_view;      /* indices into file_names while the field filters;
+                            file_sel/file_scroll index THIS, not file_names */
+    int file_view_n;
+    char file_field[LV_MAX_PATH]; /* editable twin of file_dir: path entry
+                                     + live filter source (text after the
+                                     last separator) */
+    TField file_tf;      /* edit state; buf points at file_field */
+    int file_focus;      /* 1 = the path field has the caret */
+    int file_err;        /* "path not valid" showing over the field */
+    Uint32 file_err_at;  /* SDL_GetTicks when the error started */
+    int file_pseudo;     /* Windows pseudo-root: logical drives, no parent */
     /* options window */
     int opt_visible, opt_focus, opt_hover;
     int opt_caret;               /* caret byte offset in the focused field (codepoint boundary) */
@@ -656,7 +671,8 @@ static int fs_is_root(const char *d) { return !strcmp(d, "/"); }
 
 #define FILE_W 300
 #define FILE_H (MAIN_H + PL_H) /* spans the main+playlist stack height, like OPT_H */
-#define FILE_LIST_RECT Rect list = {6, 24, FILE_W - 12, FILE_H - 24 - 20}
+#define FILE_LIST_RECT Rect list = {6, 42, FILE_W - 12, FILE_H - 42 - 20}
+#define FILE_FLD_RECT  Rect fld = {6, 24, FILE_W - 12, 16}
 #define FILE_ADD_RECT  Rect addb = {FILE_W - 60, FILE_H - 16, 52, 12}
 
 static int audio_name(const char *name) {
@@ -673,12 +689,78 @@ static int fcmp(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+/* the field mirrors the current folder whenever it has no caret (or the
+   pseudo-root is showing, where no path applies) */
+static void file_sync_field(void) {
+#ifdef _WIN32
+    if (ui.file_pseudo) {
+        lv_strlcpy(ui.file_field, "COMPUTER", sizeof ui.file_field);
+        ui.file_tf.caret = (int)strlen(ui.file_field);
+        ui.file_tf.selall = 0;
+        return;
+    }
+#endif
+    lv_strlcpy(ui.file_field, ui.file_dir, sizeof ui.file_field);
+    ui.file_tf.caret = (int)strlen(ui.file_field);
+    ui.file_tf.selall = 0;
+}
+
+/* Rebuild the list view over file_names: while the path field has the
+   caret and differs from the current dir, the text after the last
+   separator filters entry names as a case-insensitive substring (the
+   song-search feel). ".." is always kept, at view index 0. Pure string
+   pass over the cached names — no stat. file_sel/file_scroll index the
+   VIEW, so both reset here. */
+static void file_build_view(void) {
+    int n = ui.file_n;
+    int *v = n > 0 ? malloc((size_t)n * sizeof *v) : NULL;
+    if (n > 0 && !v) {
+        free(ui.file_view);
+        ui.file_view = NULL;
+        ui.file_view_n = 0;
+        return;
+    }
+    free(ui.file_view);
+    ui.file_view = v;
+    ui.file_view_n = 0;
+    if (!n) return;
+    const char *term = NULL;
+    if (ui.file_focus && !ui.file_pseudo &&
+        strcmp(ui.file_field, ui.file_dir) != 0) {
+        const char *sep = lv_strrsep(ui.file_field);
+        term = sep ? sep + 1 : ui.file_field;
+        if (!*term) term = NULL;
+    }
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        const char *name = ui.file_names[i];
+        if (!strcmp(name, "..") || !term || lv_stristr(name, term))
+            v[k++] = i;
+    }
+    ui.file_view_n = k;
+    ui.file_scroll = 0;
+    ui.file_sel = -1;
+}
+
 static void file_list(void) {
     for (int i = 0; i < ui.file_n; i++) free(ui.file_names[i]);
     free(ui.file_names);
     ui.file_names = NULL; ui.file_n = 0;
+#ifdef _WIN32
+    if (ui.file_pseudo) {
+        /* pseudo-root above the drive roots: one entry per logical drive,
+           no ".." (nothing above COMPUTER). GetLogicalDrives only —
+           GetVolumeInformationW blocks on empty/sleepy drives. */
+        ui.file_n = drives_from_mask(GetLogicalDrives(), &ui.file_names);
+    } else
+#endif
+    {
     DIR *d = opendir(ui.file_dir);
-    if (!d) return;
+    if (!d) {
+        file_sync_field();
+        file_build_view();
+        return;
+    }
     char **dirs = NULL, **files = NULL;
     int nd = 0, nf = 0, cd = 0, cf = 0;
     struct dirent *de;
@@ -710,7 +792,12 @@ static void file_list(void) {
     closedir(d);
     qsort(dirs, (size_t)nd, sizeof *dirs, fcmp);
     qsort(files, (size_t)nf, sizeof *files, fcmp);
+#ifdef _WIN32
+    /* drive roots KEEP "..": it hops to the COMPUTER pseudo-root */
+    int root = 0;
+#else
     int root = fs_is_root(ui.file_dir);
+#endif
     ui.file_n = nd + nf + (root ? 0 : 1);
     ui.file_names = malloc((size_t)(ui.file_n + 1) * sizeof *ui.file_names);
     if (!ui.file_names) {
@@ -718,6 +805,8 @@ static void file_list(void) {
         for (int i = 0; i < nf; i++) free(files[i]);
         free(dirs); free(files);
         ui.file_n = 0;
+        file_sync_field();
+        file_build_view();
         return;
     }
     int k = 0;
@@ -725,7 +814,11 @@ static void file_list(void) {
     for (int i = 0; i < nd; i++) ui.file_names[k++] = dirs[i];
     for (int i = 0; i < nf; i++) ui.file_names[k++] = files[i];
     free(dirs); free(files);
+    }
     ui.file_scroll = 0; ui.file_sel = -1;
+    ui.file_focus = 0;
+    file_sync_field();
+    file_build_view();
 }
 
 static void raise_all(void) {
@@ -777,6 +870,11 @@ static void focus_click_drag(Uint32 wid) {
     SDL_GetWindowPosition(w, &wx, &wy);
     SDL_GetWindowSize(w, &ww, &wh);
     if (gx >= wx && gx < wx + ww && gy >= wy && gy - wy < 22) {
+        /* the close button lives inside the title strip: a press there is a
+           click, not a drag. Latching a drag here left the X stuck down —
+           the button-up handler skips the action while a drag is live */
+        int lx = gx - wx, ly = gy - wy;
+        if (lx >= ww - 18 && lx < ww - 6 && ly >= 4 && ly < 16) return;
         ui.drag = drag;
         drag_begin(w);
     }
@@ -784,6 +882,7 @@ static void focus_click_drag(Uint32 wid) {
 
 static void file_close(void) {
     ui.file_visible = 0;
+    ui.file_focus = 0;
     if (ui.wfile) SDL_HideWindow(ui.wfile);
 }
 
@@ -812,6 +911,8 @@ static void file_open(void) {
         else if (!getcwd(ui.file_dir, sizeof ui.file_dir))
             lv_strlcpy(ui.file_dir, "/", sizeof ui.file_dir);
     }
+    ui.file_tf.buf = ui.file_field;
+    ui.file_tf.cap = sizeof ui.file_field;
     file_list();
     ui.file_visible = 1;
     SDL_ShowWindow(ui.wfile);
@@ -831,7 +932,25 @@ static void file_adddir(void) {
 }
 
 static void file_choose(const char *name) {
+#ifdef _WIN32
+    if (ui.file_pseudo) {
+        /* pseudo-root entries ARE full drive roots: descend and leave
+           the pseudo state (no "%s/%s" join) */
+        lv_strlcpy(ui.file_dir, name, sizeof ui.file_dir);
+        ui.file_pseudo = 0;
+        file_list();
+        return;
+    }
+#endif
     if (!strcmp(name, "..")) {
+#ifdef _WIN32
+        /* ".." from any drive root hops to the COMPUTER pseudo-root */
+        if (fs_is_root(ui.file_dir)) {
+            ui.file_pseudo = 1;
+            file_list();
+            return;
+        }
+#endif
         char *slash = lv_strrsep(ui.file_dir);
         if (slash && slash != ui.file_dir) *slash = 0;
         else if (slash) ui.file_dir[1] = 0; /* stay at "/" */
@@ -864,6 +983,50 @@ static void file_choose(const char *name) {
     file_close();
 }
 
+/* Draw the text of an editable field inside its box: unfocused text
+   scrolls left so the trailing suffix shows; focused text is anchored on
+   the caret so it stays visible while editing mid-string. Draws the
+   select-all highlight and the caret when focused && caret_on (the file
+   field blinks its caret on the search cadence; options draw it solid).
+   Shared by the options fields and the file path field. */
+static void draw_field_text(SDL_Surface *s, const Rect f, const char *val,
+                            TField *tf, int focused, int caret_on) {
+    char disp[LV_MAX_PATH];
+    const char *shown;
+    int caret_w = 0;
+    if (focused) {
+        int len = (int)strlen(val);
+        if (tf->caret < 0 || tf->caret > len) tf->caret = len;
+        char pre[LV_MAX_PATH];
+        lv_strlcpy(pre, val, (size_t)tf->caret + 1);
+        const char *st = font_fit_tail(pre, f.w - 8);
+        int off = (int)(st - pre);
+        caret_w = font_w16(st);
+        int room = (f.w - 8) - caret_w;
+        int extra = room > 0 ? font_fit(val + tf->caret, room) : 0;
+        int shown_len = (tf->caret - off) + extra;
+        memcpy(disp, val + off, (size_t)shown_len);
+        disp[shown_len] = 0;
+        shown = disp;
+    } else {
+        shown = font_fit_tail(val, f.w - 8);
+    }
+    if (focused && tf->selall && shown[0]) {
+        SDL_Rect hl = { f.x + 3, f.y + 1, (unsigned)font_w16(shown), (unsigned)(f.h - 2) };
+        if (hl.x + (int)hl.w > f.x + f.w - 3)
+            hl.w = f.x + f.w - 3 - hl.x;
+        if (hl.w > 0) SDL_FillRect(s, &hl, col(s, 40, 60, 120));
+    }
+    font_puts16(s, f.x + 3, f.y + 1, shown, col(s, 220, 220, 220));
+    if (focused && caret_on) {
+        int cx = f.x + 3 + caret_w + 1;
+        if (cx < f.x + f.w - 2) {
+            SDL_Rect c = { cx, f.y + 3, 1, f.h - 6 };
+            SDL_FillRect(s, &c, col(s, 255, 255, 255));
+        }
+    }
+}
+
 static void draw_file(void) {
     SDL_Surface *s = ui.sfile;
     if (!s) return;
@@ -871,39 +1034,67 @@ static void draw_file(void) {
     font_puts(s, 10, 6, "OPEN FILE OR FOLDER", col(s, 0, 224, 255));
     { Rect x = close_rect(FILE_W); draw_x(s, &x, ui.pressed == FB_X); }
     FILE_LIST_RECT;
+    FILE_FLD_RECT;
     FILE_ADD_RECT;
+    /* path field: the editable twin of file_dir. Unfocused it always
+       shows the current folder (COMPUTER in the pseudo-root); focused it
+       shows what the user typed and filters the list live. */
+    SDL_Rect fb = { fld.x, fld.y, fld.w, fld.h };
+    SDL_FillRect(s, &fb, col(s, 0, 0, 0));
+    SDL_Rect t = { fld.x, fld.y, fld.w, 1 }, b = { fld.x, fld.y + fld.h - 1, fld.w, 1 };
+    SDL_Rect l = { fld.x, fld.y, 1, fld.h }, r = { fld.x + fld.w - 1, fld.y, 1, fld.h };
+    int fwin_focused = ui.app_focused && ui.wfile &&
+                       ui.focus_wid == SDL_GetWindowID(ui.wfile);
+    Uint32 bc = (ui.file_focus && fwin_focused) ? col(s, 0, 224, 255) : col(s, 90, 90, 90);
+    SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+    SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+    if (ui.file_err) {
+        /* plain red, no bold: the field text returns after ~1 s */
+        font_puts16(s, fld.x + 3, fld.y + 1, "path not valid", col(s, 255, 60, 60));
+    } else {
+        int blink = (SDL_GetTicks() / 500) % 2 == 0;
+        draw_field_text(s, fld, ui.file_field, &ui.file_tf,
+                        ui.file_focus && fwin_focused, blink);
+    }
     SDL_Rect lb = {list.x, list.y, list.w, list.h};
     SDL_FillRect(s, &lb, col(s, 0, 0, 0));
     int lines = list.h / 17;
-    if (ui.file_scroll > ui.file_n - lines && ui.file_n >= lines)
-        ui.file_scroll = ui.file_n - lines;
+    if (ui.file_scroll > ui.file_view_n - lines && ui.file_view_n >= lines)
+        ui.file_scroll = ui.file_view_n - lines;
     if (ui.file_scroll < 0) ui.file_scroll = 0;
     for (int i = 0; i < lines; i++) {
-        int idx = ui.file_scroll + i;
-        if (idx >= ui.file_n) break;
-        char *name = ui.file_names[idx];
+        int vi = ui.file_scroll + i;
+        if (vi >= ui.file_view_n) break;
+        char *name = ui.file_names[ui.file_view[vi]];
         char full[LV_MAX_PATH];
         snprintf(full, sizeof full, "%s/%s", ui.file_dir, name);
         struct stat st;
-        int isdir = !strcmp(name, "..") || (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+        int isdir = ui.file_pseudo || !strcmp(name, "..") ||
+                    (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
         char line[LV_MAX_PATH];
-        snprintf(line, sizeof line, "%s%s", name, isdir ? "/" : "");
+        /* pseudo-root entries are drive roots, already ending in "\" */
+        snprintf(line, sizeof line, "%s%s", name,
+                 (isdir && name[strlen(name) - 1] != '\\') ? "/" : "");
         int fit = font_fit(line, list.w - 6);
         if ((int)strlen(line) > fit) line[fit] = 0;
         Uint32 c = isdir ? col(s, 255, 255, 255) : col(s, 170, 170, 170);
-        if (idx == ui.file_sel) c = col(s, 0, 255, 0);
+        if (vi == ui.file_sel) c = col(s, 0, 255, 0);
         font_puts16(s, list.x + 2, list.y + 1 + i * 17, line, c);
     }
-    if (ui.file_n > lines) {
-        int th = list.h * lines / ui.file_n;
+    if (ui.file_view_n > lines) {
+        int th = list.h * lines / ui.file_view_n;
         if (th < 8) th = 8;
-        int ty = list.y + (list.h - th) * ui.file_scroll / (ui.file_n - lines);
+        int ty = list.y + (list.h - th) * ui.file_scroll / (ui.file_view_n - lines);
         SDL_Rect r = {list.x + list.w - 7, ty, 5, th};
         SDL_FillRect(s, &r, col(s, 110, 110, 110));
     }
     skin_button(s, &addb, ui.pressed == FB_ADDDIR, 0);
     font_puts(s, addb.x + (addb.w - font_w("ADD DIR")) / 2, addb.y + 3, "ADD DIR", col(s, 220, 220, 220));
     char dir[LV_MAX_PATH];
+#ifdef _WIN32
+    if (ui.file_pseudo) lv_strlcpy(dir, "COMPUTER", sizeof dir);
+    else
+#endif
     lv_strlcpy(dir, ui.file_dir, sizeof dir);
     int fit = font_fit(dir, FILE_W - 76);
     if ((int)strlen(dir) > fit) {
@@ -917,15 +1108,29 @@ static void draw_file(void) {
 static void handle_file_mouse(SDL_Event *e) {
     int x = e->motion.x, y = e->motion.y;
     FILE_LIST_RECT;
+    FILE_FLD_RECT;
     FILE_ADD_RECT;
     int lines = list.h / 17;
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
         Rect xc = close_rect(FILE_W);
         if (in_rect(&xc, x, y)) { ui.pressed = FB_X; return; }
         if (in_rect(&addb, x, y)) { ui.pressed = FB_ADDDIR; return; }
+        if (in_rect(&fld, x, y)) {
+            /* caret to end like the opt fields; the field already mirrors
+               the current folder whenever it is unfocused */
+            ui.file_focus = 1;
+            ui.file_err = 0;
+            ui.file_tf.caret = (int)strlen(ui.file_field);
+            ui.file_tf.selall = 0;
+            return;
+        }
         if (in_rect(&list, x, y)) {
-            int idx = ui.file_scroll + (y - list.y) / 17;
-            if (idx < ui.file_n) { ui.file_sel = idx; file_choose(ui.file_names[idx]); }
+            ui.file_focus = 0;
+            int vi = ui.file_scroll + (y - list.y) / 17;
+            if (vi < ui.file_view_n) {
+                ui.file_sel = vi;
+                file_choose(ui.file_names[ui.file_view[vi]]);
+            }
             return;
         }
         if (y < 22) { ui.drag = 9; drag_begin(ui.wfile); }
@@ -940,9 +1145,84 @@ static void handle_file_mouse(SDL_Event *e) {
     } else if (e->type == SDL_MOUSEWHEEL) {
         ui.file_scroll -= e->wheel.y;
         if (ui.file_scroll < 0) ui.file_scroll = 0;
-        if (ui.file_scroll > ui.file_n - lines)
-            ui.file_scroll = ui.file_n > lines ? ui.file_n - lines : 0;
+        if (ui.file_scroll > ui.file_view_n - lines)
+            ui.file_scroll = ui.file_view_n > lines ? ui.file_view_n - lines : 0;
     }
+}
+
+/* Enter in the path field: valid dir -> navigate; valid audio file ->
+   load + play + close (same tail as file_choose); anything else -> red
+   "path not valid" for ~1 s with the typed text UNTOUCHED (the browser
+   stays put so the entry can be corrected). */
+static void file_field_enter(void) {
+    if (!ui.file_field[0]) return;
+    struct stat st;
+    if (stat(ui.file_field, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            lv_strlcpy(ui.file_dir, ui.file_field, sizeof ui.file_dir);
+            ui.file_pseudo = 0;
+            file_list();
+            return;
+        }
+        const char *base = lv_strrsep(ui.file_field);
+        base = base ? base + 1 : ui.file_field;
+        if (audio_name(base)) {
+            Player *p = ui.pl;
+            pthread_mutex_lock(&p->mtx);
+            pl_add(p->pl, ui.file_field);
+            lib_fill_playlist(p->pl);
+            int idx = p->pl->count - 1;
+            pthread_mutex_unlock(&p->mtx);
+            pl_post(p, CMD_PLAY, idx);
+            file_close();
+            return;
+        }
+    }
+    ui.file_err = 1;
+    ui.file_err_at = SDL_GetTicks();
+}
+
+/* keys for the file window while the path field has the caret. Returns 1
+   when consumed: while the caret is in the field EVERY key belongs to the
+   field, so typing 'c' or 'o' must not fire the global playback/browser
+   shortcuts in handle_key. Unfocused (caret not in the field) the keys
+   fall through to the global shortcuts as before. */
+static int file_key(SDL_Event *e) {
+    if (!ui.file_focus) return 0;
+    int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
+    switch (e->key.keysym.sym) {
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        file_field_enter();
+        break;
+    case SDLK_ESCAPE:
+        /* restore the field to the current folder, clear the filter and
+           any error; the window itself closes via X / FB_X only */
+        ui.file_focus = 0;
+        ui.file_err = 0;
+        file_sync_field();
+        file_build_view();
+        break;
+    case SDLK_LEFT:      tf_left(&ui.file_tf);  break;
+    case SDLK_RIGHT:     tf_right(&ui.file_tf); break;
+    case SDLK_HOME:      tf_home(&ui.file_tf);  break;
+    case SDLK_END:       tf_end(&ui.file_tf);   break;
+    case SDLK_BACKSPACE: tf_backspace(&ui.file_tf); break;
+    case SDLK_DELETE:    tf_del(&ui.file_tf);   break;
+    case SDLK_a: if (ctrl) tf_selectall(&ui.file_tf); break;
+    case SDLK_c: if (ctrl) tf_copy(&ui.file_tf); break;
+    case SDLK_x: if (ctrl) tf_cut(&ui.file_tf); break;
+    case SDLK_v: if (ctrl) tf_paste(&ui.file_tf); break;
+    default: break;
+    }
+    file_build_view();
+    return 1;
+}
+
+static void file_text(const char *text) {
+    if (!ui.file_focus) return;
+    tf_insert(&ui.file_tf, text);
+    file_build_view();
 }
 
 /* ---------- options window ---------- */
@@ -1155,40 +1435,9 @@ static void draw_opt(void) {
         /* text longer than the box scrolls left. Unfocused: the trailing
            suffix shows. Focused: the window is anchored on the caret so it
            and its surroundings stay visible while editing mid-string. */
-        char disp[LV_MAX_PATH];
-        const char *shown;
-        int caret_w = 0;
-        if (ui.opt_focus == i) {
-            int len = (int)strlen(val);
-            if (ui.opt_caret < 0 || ui.opt_caret > len) ui.opt_caret = len;
-            char pre[LV_MAX_PATH];
-            lv_strlcpy(pre, val, (size_t)ui.opt_caret + 1);
-            const char *st = font_fit_tail(pre, f.w - 8);
-            int off = (int)(st - pre);
-            caret_w = font_w16(st);
-            int room = (f.w - 8) - caret_w;
-            int extra = room > 0 ? font_fit(val + ui.opt_caret, room) : 0;
-            int shown_len = (ui.opt_caret - off) + extra;
-            memcpy(disp, val + off, (size_t)shown_len);
-            disp[shown_len] = 0;
-            shown = disp;
-        } else {
-            shown = font_fit_tail(val, f.w - 8);
-        }
-        if (ui.opt_focus == i && ui.opt_selall && shown[0]) {
-            SDL_Rect hl = { f.x + 3, f.y + 1, (unsigned)font_w16(shown), (unsigned)(f.h - 2) };
-            if (hl.x + (int)hl.w > f.x + f.w - 3)
-                hl.w = f.x + f.w - 3 - hl.x;
-            if (hl.w > 0) SDL_FillRect(s, &hl, col(s, 40, 60, 120));
-        }
-        font_puts16(s, f.x + 3, f.y + 1, shown, col(s, 220, 220, 220));
-        if (ui.opt_focus == i) {
-            int cx = f.x + 3 + caret_w + 1;
-            if (cx < f.x + f.w - 2) {
-                SDL_Rect c = { cx, f.y + 3, 1, f.h - 6 };
-                SDL_FillRect(s, &c, col(s, 255, 255, 255));
-            }
-        }
+        TField tf = { val, sizeof val, ui.opt_caret, ui.opt_selall };
+        draw_field_text(s, f, val, &tf, ui.opt_focus == i, 1);
+        ui.opt_caret = tf.caret;   /* the helper clamps a stale caret */
     }
 
     if (!ui.opt_adv) {
@@ -1374,92 +1623,39 @@ static void handle_opt_mouse(SDL_Event *e) {
     }
 }
 
+/* options field editing rides the shared TField ops (textedit.c); the
+   ESC close and the per-field focus gate stay here, as do all OPTB_*
+   side effects — only buffer editing moved */
 static void opt_key(SDL_Event *e) {
     if (e->key.keysym.sym == SDLK_ESCAPE) { opt_close(); return; }
     if (ui.opt_focus < 0) return;
-    char *f = ui.opt_field[ui.opt_focus];
+    TField tf = { ui.opt_field[ui.opt_focus], LV_MAX_PATH,
+                  ui.opt_caret, ui.opt_selall };
     int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
     switch (e->key.keysym.sym) {
-    case SDLK_LEFT:
-        if (ui.opt_selall) { ui.opt_caret = 0; ui.opt_selall = 0; break; }
-        if (ui.opt_caret > 0) {
-            int q = ui.opt_caret - 1;
-            while (q > 0 && ((unsigned char)f[q] & 0xC0) == 0x80) q--;
-            ui.opt_caret = q;
-        }
-        break;
-    case SDLK_RIGHT:
-        if (ui.opt_selall) { ui.opt_caret = (int)strlen(f); ui.opt_selall = 0; break; }
-        if (ui.opt_caret < (int)strlen(f)) {
-            unsigned cp;
-            ui.opt_caret += font_utf8_next(f + ui.opt_caret, &cp);
-        }
-        break;
-    case SDLK_HOME:
-        ui.opt_caret = 0; ui.opt_selall = 0;
-        break;
-    case SDLK_END:
-        ui.opt_caret = (int)strlen(f); ui.opt_selall = 0;
-        break;
-    case SDLK_a:
-        if (ctrl) ui.opt_selall = f[0] ? 1 : 0;
-        break;
-    case SDLK_c:
-        if (ctrl) ui_clip_copy(f);
-        break;
-    case SDLK_x:
-        if (ctrl) {
-            if (ui.opt_selall && f[0]) { ui_clip_copy(f); f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; }
-        }
-        break;
-    case SDLK_v:
-        if (ctrl) {
-            if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; }
-            char tmp[LV_MAX_PATH];
-            tmp[0] = 0;
-            if (ui_clip_paste(tmp, sizeof tmp)) {
-                size_t tl = strlen(tmp), len = strlen(f);
-                if (len + tl < LV_MAX_PATH - 1) {
-                    memmove(f + ui.opt_caret + tl, f + ui.opt_caret, len - (size_t)ui.opt_caret + 1);
-                    memcpy(f + ui.opt_caret, tmp, tl);
-                    ui.opt_caret += (int)tl;
-                }
-            }
-        }
-        break;
-    case SDLK_BACKSPACE: {
-        if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; return; }
-        int c = ui.opt_caret;
-        if (c <= 0) return;
-        int q = c - 1;
-        while (q > 0 && ((unsigned char)f[q] & 0xC0) == 0x80) q--;
-        size_t len = strlen(f);
-        memmove(f + q, f + c, len - (size_t)c + 1);
-        ui.opt_caret = q;
-        break;
+    case SDLK_LEFT:      tf_left(&tf);  break;
+    case SDLK_RIGHT:     tf_right(&tf); break;
+    case SDLK_HOME:      tf_home(&tf);  break;
+    case SDLK_END:       tf_end(&tf);   break;
+    case SDLK_a: if (ctrl) tf_selectall(&tf); else return; break;
+    case SDLK_c: if (ctrl) tf_copy(&tf); else return; break;
+    case SDLK_x: if (ctrl) tf_cut(&tf); else return; break;
+    case SDLK_v: if (ctrl) tf_paste(&tf); else return; break;
+    case SDLK_BACKSPACE: tf_backspace(&tf); break;
+    case SDLK_DELETE:    tf_del(&tf);   break;
+    default: return;
     }
-    case SDLK_DELETE:
-        if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; break; }
-        if (ui.opt_caret < (int)strlen(f)) {
-            unsigned cp;
-            int n = font_utf8_next(f + ui.opt_caret, &cp);
-            size_t len = strlen(f);
-            memmove(f + ui.opt_caret, f + ui.opt_caret + n, len - (size_t)ui.opt_caret - (size_t)n + 1);
-        }
-        break;
-    }
+    ui.opt_caret = tf.caret;
+    ui.opt_selall = tf.selall;
 }
 
 static void opt_text(const char *text) {
     if (ui.opt_focus < 0) return;
-    char *f = ui.opt_field[ui.opt_focus];
-    if (ui.opt_selall) { f[0] = 0; ui.opt_caret = 0; ui.opt_selall = 0; }
-    size_t tl = strlen(text), len = strlen(f);
-    if (len + tl >= LV_MAX_PATH - 1) return;
-    if (ui.opt_caret < 0 || ui.opt_caret > (int)len) ui.opt_caret = (int)len;
-    memmove(f + ui.opt_caret + tl, f + ui.opt_caret, len - (size_t)ui.opt_caret + 1);
-    memcpy(f + ui.opt_caret, text, tl);
-    ui.opt_caret += (int)tl;
+    TField tf = { ui.opt_field[ui.opt_focus], LV_MAX_PATH,
+                  ui.opt_caret, ui.opt_selall };
+    tf_insert(&tf, text);
+    ui.opt_caret = tf.caret;
+    ui.opt_selall = tf.selall;
 }
 
 static void pl_add_lib_cb(const LibEntry *e, void *ud) {
@@ -1575,10 +1771,14 @@ static void handle_main_mouse(SDL_Event *e) {
         return;
     }
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
+        /* a button press cancels any latched drag (focus_click_drag can
+           latch one before the click-through press arrives): without this
+           the up handler's drag==0 gate swallows the click and leaves the
+           button painted down */
         Rect xc = close_rect(MAIN_W);
-        if (in_rect(&xc, x, y)) { ui.pressed = B_XMAIN; return; }
+        if (in_rect(&xc, x, y)) { ui.pressed = B_XMAIN; ui.drag = 0; return; }
         for (size_t i = 0; i < sizeof MAIN_BTNS / sizeof MAIN_BTNS[0]; i++)
-            if (in_rect(MAIN_BTNS[i].r, x, y)) { ui.pressed = MAIN_BTNS[i].id; return; }
+            if (in_rect(MAIN_BTNS[i].r, x, y)) { ui.pressed = MAIN_BTNS[i].id; ui.drag = 0; return; }
         if (in_rect(&R_SEEK, x, y)) {
             ui.drag = 1;
             pl_post_seek(p, (double)(x - R_SEEK.x - SEEK_KNOB_W / 2) / (double)(R_SEEK.w - SEEK_KNOB_W));
@@ -1997,6 +2197,7 @@ int ui_run(Player *p, int show_pl) {
                 focus_click_drag(e.window.windowID);
                 if (search_is_open() && e.window.windowID == search_window_id()) SDL_StartTextInput();
                 else if (ui.opt_visible && ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) SDL_StartTextInput();
+                else if (ui.file_visible && ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) SDL_StartTextInput();
                 else SDL_StopTextInput();
                 /* the set surfaces as a unit: when focus arrives from another
                    app, raise every visible window, not just the one the WM
@@ -2020,6 +2221,14 @@ int ui_run(Player *p, int show_pl) {
             default:
                 if (search_is_open() && ui.focus_wid == search_window_id()) search_key(&e);
                 else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_key(&e);
+                else if (ui.file_visible && ui.wfile && ui.focus_wid == SDL_GetWindowID(ui.wfile)) {
+                    /* the file field eats its keys BEFORE the global
+                       shortcuts: typing 'c'/'o' must not pause or reopen */
+                    if (file_key(&e)) {
+                        ui_dirty |= D_FILE;
+                        next = SDL_GetTicks(); /* paint the edit now */
+                    } else handle_key(&e);
+                }
                 else if (ui.pl_visible && ui.wpl && ui.focus_wid == SDL_GetWindowID(ui.wpl)) {
                     if (!pl_key(&e)) handle_key(&e);
                 } else handle_key(&e);
@@ -2029,6 +2238,12 @@ int ui_run(Player *p, int show_pl) {
         case SDL_TEXTINPUT:
             if (search_is_open() && ui.focus_wid == search_window_id()) search_text(e.text.text);
             else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_text(e.text.text);
+            else if (ui.file_visible && ui.wfile && ui.focus_wid == SDL_GetWindowID(ui.wfile) &&
+                     ui.file_focus) {
+                file_text(e.text.text);
+                ui_dirty |= D_FILE;
+                next = SDL_GetTicks();
+            }
             ui_dirty |= D_SRCH | D_OPT;
             break;
         case SDL_MOUSEBUTTONDOWN:
@@ -2045,6 +2260,11 @@ int ui_run(Player *p, int show_pl) {
             else if (ui.wfile && wid == SDL_GetWindowID(ui.wfile)) { handle_file_mouse(&e); ui_dirty |= D_FILE; }
             else if (ui.wopt && wid == SDL_GetWindowID(ui.wopt)) { handle_opt_mouse(&e); ui_dirty |= D_OPT; }
             else if (search_is_open() && wid == search_window_id()) { search_mouse(&e); ui_dirty |= D_SRCH; }
+            /* a latched press must paint its pressed frame NOW: the 100 ms
+               coalesce below would swallow the animation of a fast click
+               (release arrives before any repaint, pressed already NONE) */
+            if (e.type == SDL_MOUSEBUTTONDOWN && ui.pressed != B_NONE)
+                next = SDL_GetTicks();
             break;
         }
         }
@@ -2096,6 +2316,17 @@ int ui_run(Player *p, int show_pl) {
                                ui.focus_wid == search_window_id();
             search_set_focus(srch_focused);
 
+            /* the file path field blinks on the same cadence when its
+               window holds the caret */
+            int file_focused = ui.file_visible && ui.app_focused &&
+                               ui.file_focus && ui.wfile &&
+                               ui.focus_wid == SDL_GetWindowID(ui.wfile);
+            /* "path not valid" shows ~1 s, then the field text returns */
+            if (ui.file_err && now - ui.file_err_at >= 1000) {
+                ui.file_err = 0;
+                ui_dirty |= D_FILE;
+            }
+
             int vis_live = ui.vis_on && playing;
             int f10_live = cfg.ui_always10 > 0 && ui.marquee;
             int anim = (ui.marquee && (playing || f10_live)) || vis_live ||
@@ -2109,7 +2340,7 @@ int ui_run(Player *p, int show_pl) {
                 }
                 if ((ui_dirty & D_PL) && ui.pl_visible) { draw_pl(); win_present(ui.wpl); }
                 if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
-                if ((ui_dirty & D_FILE) && ui.file_visible && ui.sfile) { draw_file(); win_present(ui.wfile); }
+                if (((ui_dirty & D_FILE) || file_focused) && ui.file_visible && ui.sfile) { draw_file(); win_present(ui.wfile); }
                 if ((ui_dirty & D_OPT) && ui.opt_visible && ui.sopt) { draw_opt(); win_present(ui.wopt); }
                 if (((ui_dirty & D_SRCH) || srch_focused) && so && search_window()) { search_draw(); win_present(search_window()); }
                 ui_dirty = 0;
@@ -2136,7 +2367,7 @@ int ui_run(Player *p, int show_pl) {
                position slider keep pace instead of jumping on refocus;
                unfocused idle sleeps on events. */
             if (anim) next = now + 100;
-            else if (srch_focused) next = now + (unsigned)(500 - (int)(now % 500));
+            else if (srch_focused || file_focused) next = now + (unsigned)(500 - (int)(now % 500));
             else if (ui.app_focused) next = now + 1000;
             else if (playing) next = now + 1000;
             else next = 0;   /* unfocused, nothing playing: sleep on events */
