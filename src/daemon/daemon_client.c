@@ -1,6 +1,11 @@
+/* struct ucred (SO_PEERCRED) is a GNU extension in glibc headers */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "daemon.h"
 #include "../common.h"
 #include "../config/config.h"
+#include "peercred.h"
 #ifdef _WIN32
 #include "../compat/win32.h"
 #else
@@ -58,6 +63,12 @@ static conn_t conn_open(const char *path) {
         close(c);
         return CONN_BAD;
     }
+    /* with XDG_RUNTIME_DIR unset the path falls back to /tmp: verify the
+       listener we just connected to is ours, not a pre-bound impostor */
+    if (!peer_is_self(c)) {
+        close(c);
+        return CONN_BAD;
+    }
     return c;
 }
 static int conn_write(conn_t c, const void *b, size_t n) {
@@ -107,13 +118,24 @@ int cli_run(int argc, char **argv) {
         size_t used = strlen(line);
         size_t argn = strlen(argv[i]);
         size_t sep = used ? 1 : 0;
-        /* sep + arg + the newline appended below + NUL */
-        if (used + sep + argn + 2 > sizeof line) {
+        /* args with spaces travel double-quoted (the daemon's play
+           tokenizer honors quotes); args containing a quote stay raw */
+        int quote = strchr(argv[i], ' ') != NULL &&
+                    strchr(argv[i], '"') == NULL;
+        size_t qn = quote ? 2 : 0;
+        /* sep + quotes + arg + the newline appended below + NUL */
+        if (used + sep + qn + argn + 2 > sizeof line) {
             fprintf(stderr, "levari: command line truncated at %d args\n", i - 1);
             break;
         }
         if (sep) strcat(line, " ");
-        strcat(line, argv[i]);
+        if (quote) {
+            strcat(line, "\"");
+            strcat(line, argv[i]);
+            strcat(line, "\"");
+        } else {
+            strcat(line, argv[i]);
+        }
     }
     char path[512];
     sock_path(path, sizeof path);

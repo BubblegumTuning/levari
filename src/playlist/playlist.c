@@ -36,7 +36,7 @@ static int audio_ext(const char *name) {
            !lv_strcasecmp(e, ".aac") || !lv_strcasecmp(e, ".m4a") ||
            !lv_strcasecmp(e, ".wma") || !lv_strcasecmp(e, ".mod") ||
            !lv_strcasecmp(e, ".s3m") || !lv_strcasecmp(e, ".xm") ||
-           !lv_strcasecmp(e, ".it");
+           !lv_strcasecmp(e, ".it") || !lv_strcasecmp(e, ".spc");
 }
 
 static int cmpstr(const void *a, const void *b) {
@@ -67,7 +67,13 @@ static void pl_add_dir(Playlist *p, const char *dir) {
         char full[LV_MAX_PATH];
         snprintf(full, sizeof full, "%s/%s", dir, names[i]);
         struct stat st;
-        /* lstat: never descend into a symlinked directory (cycle guard) */
+        /* lstat: never descend into a symlinked directory (cycle guard).
+           On Windows lstat is plain stat (compat/win32.h) and follows
+           junctions, so refuse reparse points outright: a junction loop
+           would recurse until the stack overflows. */
+#ifdef _WIN32
+        if (GetFileAttributesA(full) & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+#endif
         if (lstat(full, &st) == 0 && S_ISDIR(st.st_mode))
             pl_add_dir(p, full);
         else if (audio_ext(names[i]))
@@ -192,6 +198,7 @@ int pl_load_cue(Playlist *p, const char *cue) {
     char line[2048];
     char file[LV_MAX_PATH] = "";
     int idx = -1;
+    int file_first = -1; /* first item belonging to the current FILE */
     while (fgets(line, sizeof line, f)) {
         char *s = line;
         while (*s == ' ' || *s == '\t') s++;
@@ -205,6 +212,7 @@ int pl_load_cue(Playlist *p, const char *cue) {
             *q2 = 0;
             if (lv_is_abs(q1 + 1)) lv_strlcpy(file, q1 + 1, sizeof file);
             else lv_path_join(file, sizeof file, dir, q1 + 1);
+            file_first = p->count;
         } else if (!strncmp(s, "TRACK ", 6)) {
             idx = p->count;
             pl_add(p, file);
@@ -227,7 +235,14 @@ int pl_load_cue(Playlist *p, const char *cue) {
             if (sscanf(s + 9, "%d:%d:%d", &mm, &ss, &ff) == 3) {
                 double sec = mm * 60 + ss + ff / 75.0;
                 if (idx >= 0) {
-                    if (idx >= 1 && p->items[idx - 1].end_sec == 0)
+                    /* close the previous track only if it belongs to the
+                       same FILE and came from this cue: an INDEX from a
+                       new FILE (or a cue loaded onto a populated playlist)
+                       used to truncate an unrelated item — and across
+                       FILEs the seconds refer to a different file, giving
+                       end_sec < start_sec */
+                    if (file_first >= 0 && idx - 1 >= file_first &&
+                        p->items[idx - 1].end_sec == 0)
                         p->items[idx - 1].end_sec = sec;
                     p->items[idx].start_sec = sec;
                 }
@@ -247,15 +262,33 @@ int pl_load_cue(Playlist *p, const char *cue) {
 }
 
 void pl_scan_tags(Playlist *p, pthread_mutex_t *mtx) {
-    for (int i = 0; i < p->count; i++) {
+    /* every read of count/items happens under mtx: the daemon's add/play
+       realloc or swap the array under the same lock, and an unlocked walk
+       here could follow a freed items pointer (or a shifted row) */
+    for (int i = 0;; i++) {
+        char path[LV_MAX_PATH];
+        if (mtx) pthread_mutex_lock(mtx);
+        if (i >= p->count) {
+            if (mtx) pthread_mutex_unlock(mtx);
+            break;
+        }
+        Track *t = &p->items[i];
         /* notag: the index already probed this file and found no tags;
            re-reading it over a network share would find nothing again */
-        if (p->items[i].tags.title[0] || p->items[i].notag) continue;
-        /* per-track locking: tag_read touches tags the player thread may
-           be reading in load_track; one lock for the whole playlist would
-           stall track loads on big lists */
+        int skip = t->tags.title[0] || t->notag;
+        lv_strlcpy(path, t->path, sizeof path);
+        if (mtx) pthread_mutex_unlock(mtx);
+        if (skip) continue;
+        /* per-track locking: tag_read is file I/O and one lock for the
+           whole playlist would stall track loads on big lists */
+        Tags tags;
+        tag_init(&tags);
+        tag_read(path, &tags);
         if (mtx) pthread_mutex_lock(mtx);
-        tag_read(p->items[i].path, &p->items[i].tags);
+        /* the row may have moved or changed while we were reading: only
+           write back if item i is still the file we probed */
+        if (i < p->count && !strcmp(p->items[i].path, path))
+            p->items[i].tags = tags;
         if (mtx) pthread_mutex_unlock(mtx);
     }
 }

@@ -58,7 +58,17 @@ static void design_peaking(Biquad *b, double fs, double f0, double db, double q)
 void eq_design_locked(EQ *e) {
     for (int i = 0; i < EQ_BANDS; i++)
         for (int c = 0; c < 2; c++) {
-            design_peaking(&e->bq[i][c], e->rate, FREQ[i], e->band_db[i], 1.0);
+            /* a peaking biquad at f0 >= ~Nyquist flips sin(w0) negative,
+               which flips alpha's sign and puts a pole outside the unit
+               circle (measured a2 up to 2.1 at 22050 Hz): the output
+               explodes into noise. bypass bands the rate cannot reproduce
+               instead — identity coefficients. */
+            if (e->rate <= 0 || FREQ[i] >= 0.45 * e->rate) {
+                Biquad *b = &e->bq[i][c];
+                b->b0 = 1.0f; b->b1 = b->b2 = b->a1 = b->a2 = 0.0f;
+            } else {
+                design_peaking(&e->bq[i][c], e->rate, FREQ[i], e->band_db[i], 1.0);
+            }
             e->bq[i][c].x1 = e->bq[i][c].x2 = e->bq[i][c].y1 = e->bq[i][c].y2 = 0;
         }
 }

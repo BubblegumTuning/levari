@@ -73,6 +73,9 @@ window's width within 12 px.
 
 | Control | Action |
 |---|---|
+| Path field (top row) | Editable twin of the current folder. Click to focus, type/paste a path, `Enter` to act on it (see below). While focused, the text after the last `/` (or `\`) live-filters the list by entry name, case-insensitive — like the song search. `Esc` restores the field to the current folder and clears the filter. |
+| `Enter` in the path field | Valid folder: navigate into it. Valid audio file: queue it, start playing, close the browser. Anything else: plain red `path not valid` for ~1 s, then your typed text returns so you can fix it (the list stays put). |
+| Paste in the path field | `Ctrl+V` sanitizes: trims surrounding whitespace/newlines, strips one pair of surrounding `"` quotes, drops control chars. `Ctrl+C`/`Ctrl+X` copy/cut the whole field (`Ctrl+A` first, like the options fields). |
 | List entry (folder, white with trailing `/`) | Enter that folder. |
 | `..` | Go up one directory (stays at `/` when already at the root). |
 | List entry (file, gray) | Add that file to the end of the playlist, start playing it, and close the browser. |
@@ -82,6 +85,13 @@ window's width within 12 px.
 The current directory is shown along the bottom; a scrollbar appears on
 the right when the list overflows. The browser opens in the folder of
 the current track (or the working directory if nothing is loaded).
+Typing in the field never triggers the global playback hotkeys.
+
+On Windows, `..` from a drive root (`C:\`) opens the `COMPUTER`
+pseudo-root: one entry per logical drive (`A:\`, `C:\`, ...), nothing
+above it; the bottom readout shows `COMPUTER`. Unmapped network shares
+(`\\server\share`) are reached by typing or pasting the path into the
+field.
 
 ## Options window
 

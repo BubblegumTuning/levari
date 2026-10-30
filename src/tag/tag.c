@@ -168,7 +168,10 @@ static void read_id3v1(FILE *f, Tags *t) {
     fill_fixed(t->title, sizeof t->title, r + 3, 30);
     fill_fixed(t->artist, sizeof t->artist, r + 33, 30);
     fill_fixed(t->album, sizeof t->album, r + 63, 30);
-    if (!t->track && r[93 + 28] == 0 && r[93 + 29] != 0) t->track = r[93 + 29];
+    /* v1.1: comment[28]==0 && comment[29]!=0 -> track number. the comment
+       field starts at r[97] (title 3..32, artist 33..62, album 63..92,
+       year 93..96) — the old 93-based offset read four bytes early. */
+    if (!t->track && r[97 + 28] == 0 && r[97 + 29] != 0) t->track = r[97 + 29];
 }
 
 /* skip the tail seek entirely once the display fields are present: an
@@ -315,13 +318,17 @@ static void read_riff(FILE *f, Tags *t) {
     unsigned char ch[8];
     while (fread(ch, 1, 8, f) == 8) {
         unsigned sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | ((unsigned)ch[7] << 24);
-        long next = (sz + 1) & ~1L;
+        /* 64-bit: on Windows long is 32-bit and a chunk size >= 0x80000000
+           turned `next` negative, so the skip seek moved backwards, failed,
+           and the loop re-read the same header forever. fseeko/off_t is
+           64-bit on both targets (tag.c already uses fseeko above). */
+        long long next = ((long long)sz + 1) & ~1LL;
         if (!memcmp(ch, "LIST", 4)) {
             unsigned char lt[4];
             if (fread(lt, 1, 4, f) != 4) return;
             if (!memcmp(lt, "INFO", 4)) {
-                long end = (long)ftell(f) + (long)sz - 4;
-                while ((long)ftell(f) + 8 <= end) {
+                off_t end = ftello(f) + (off_t)sz - 4;
+                while (ftello(f) + 8 <= end) {
                     unsigned char sh[8];
                     if (fread(sh, 1, 8, f) != 8) return;
                     unsigned ssz = sh[4] | (sh[5] << 8) | (sh[6] << 16) | ((unsigned)sh[7] << 24);
@@ -343,10 +350,10 @@ static void read_riff(FILE *f, Tags *t) {
                 }
                 return;
             } else {
-                fseek(f, next - 4, SEEK_CUR);
+                fseeko(f, (off_t)(next - 4), SEEK_CUR);
             }
         } else {
-            fseek(f, next, SEEK_CUR);
+            fseeko(f, (off_t)next, SEEK_CUR);
         }
     }
 }
@@ -392,7 +399,10 @@ static int mp3_head_duration(const unsigned char *b, size_t n, size_t off,
         /* XING/Info follows the frame header and side info; scan a small
            window instead of computing the exact side-info length */
         for (size_t k = body; k + 12 <= n && k < body + 96; k++) {
-            if (memcmp(b + k, "XING", 4) && memcmp(b + k, "INFO", 4)) continue;
+            /* markers are mixed-case: "Xing"/"Info" (VBRI below is all-caps
+               by spec). the old all-caps compare never matched, so every
+               VBR mp3 fell through to the CBR size estimate. */
+            if (memcmp(b + k, "Xing", 4) && memcmp(b + k, "Info", 4)) continue;
             if (be32(b + k + 4) & 1) {
                 unsigned frames = be32(b + k + 8);
                 if (frames && (long long)frames * spf < (long long)rate * 86400)
@@ -411,6 +421,38 @@ static int mp3_head_duration(const unsigned char *b, size_t n, size_t off,
         return 0;
     }
     return 0;
+}
+
+/* SPC/ID666 length field: 3 bytes at 0xA9, text digits ("180") or binary
+   LE, sometimes ambiguous. Digits first, fall back to LE16, reject over
+   0x1FFF seconds (GME's proven decode). decode.c reuses this on its
+   slurped copy to size the play/fade window. */
+int spc_tag_duration(const unsigned char *h, long n) {
+    if (n < 0x100) return 0;
+    int secs = 0;
+    for (int i = 0; i < 3; i++) {
+        unsigned d = (unsigned)h[0xA9 + i] - '0';
+        if (d > 9) break;
+        secs = secs * 10 + (int)d;
+    }
+    if (!secs || secs > 0x1FFF)
+        secs = h[0xA9] | (h[0xAA] << 8);
+    if (secs <= 0 || secs > 0x1FFF) return 0;
+    return secs;
+}
+
+/* ID666 tag block of the SPC v0.30 header (fixed offsets). Returns
+   duration in seconds (0 = unknown). */
+static int read_spc(const unsigned char *b, long n, Tags *t) {
+    if (n < 0x100) return 0;
+    copy_fixed(t->title, sizeof t->title, b + 0x2E, 32);   /* song */
+    copy_fixed(t->album, sizeof t->album, b + 0x4E, 32);   /* game */
+    /* author at 0xB0: rippers sometimes prefix a marker byte (official
+       SPC spec quirk, handled the same way by GME): skip it when the
+       first byte is not text */
+    int off = (b[0xB0] < ' ' || (b[0xB0] >= '0' && b[0xB0] <= '9')) ? 1 : 0;
+    copy_fixed(t->artist, sizeof t->artist, b + 0xB0 + off, 32 - off);
+    return spc_tag_duration(b, n);
 }
 
 int tag_probe(const char *path, long long size_hint, Tags *t) {
@@ -448,6 +490,8 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
     } else if (n >= 4 && b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F') {
         fseek(f, 0, SEEK_SET);
         read_riff(f, t);
+    } else if (n >= 27 && !memcmp(b, "SNES-SPC700 Sound File Data", 27)) {
+        dur = read_spc(b, (long)n, t);
     } else {
         dur = mp3_head_duration(b, n, 0, size_hint, f);
         if (!tags_complete(t)) read_id3v1(f, t);

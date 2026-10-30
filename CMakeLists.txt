@@ -1,8 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.2.7 LANGUAGES C)
+project(levari VERSION 0.2.9 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# -DLV_SANITIZE=ON builds the whole tree with ASan+UBSan (dev builds only;
+# catches the races/overflows that the AFL front finds only via its harness)
+option(LV_SANITIZE "build with ASan+UBSan" OFF)
+if(LV_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 if(WIN32)
     # MinGW cross builds: point SDL2_DIR at the SDL2-mingw cmake dir, e.g.
@@ -61,9 +69,31 @@ else()
     target_compile_options(modplug PRIVATE -Os -flto -fPIE -w)
 endif()
 
+# vendored snes_spc (LGPL 2.1, see third_party/snes_spc/LICENSE): SPC ->
+# stereo 32kHz pcm through the C API in spc.h; fast DSP core (the one
+# blargg recommends for music players)
+add_library(snes_spc STATIC
+    third_party/snes_spc/spc.cpp
+    third_party/snes_spc/SNES_SPC.cpp
+    third_party/snes_spc/SNES_SPC_misc.cpp
+    third_party/snes_spc/SNES_SPC_state.cpp
+    third_party/snes_spc/SPC_DSP.cpp
+    third_party/snes_spc/SPC_Filter.cpp
+)
+target_include_directories(snes_spc PRIVATE third_party/snes_spc)
+if(WIN32)
+    target_compile_options(snes_spc PRIVATE -Os -w)
+elseif(APPLE)
+    target_compile_options(snes_spc PRIVATE -Os -flto -w)
+else()
+    # -fPIE required so the static archive can join a PIE link
+    target_compile_options(snes_spc PRIVATE -Os -flto -fPIE -w)
+endif()
+
 add_executable(levari
     src/main.c
     src/ui/ui.c
+    src/ui/textedit.c
     src/ui/search.c
     src/skin/skin.c
     src/skin/cjk_font.c
@@ -90,7 +120,7 @@ if(WIN32)
     target_include_directories(levari PRIVATE src third_party ${SDL2_INCLUDE_DIRS})
     # static SDL2: single self-contained exe, no SDL2.dll needed
     target_link_libraries(levari "${SDL2_LIBDIR}/libSDL2.a"
-        ${ZLIB_LINK} modplug winpthread m advapi32
+        ${ZLIB_LINK} modplug snes_spc winpthread m advapi32
         user32 gdi32 winmm imm32 ole32 oleaut32 setupapi version uuid
         dinput8 dxguid)
 else()
@@ -99,9 +129,9 @@ else()
     target_link_directories(levari PRIVATE ${SDL2_LIBRARY_DIRS})
     if(APPLE)
         # no libdl on macOS (dlopen is in libSystem); ld64 has no --gc-sections/-s
-        target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug pthread m)
+        target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug snes_spc pthread m)
     else()
-        target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug dl pthread m)
+        target_link_libraries(levari ${SDL2_LIBRARIES} ZLIB::ZLIB modplug snes_spc dl pthread m)
     endif()
 endif()
 target_compile_definitions(levari PRIVATE LV_VERSION="${PROJECT_VERSION}")
@@ -138,6 +168,7 @@ set(LV_TUNE "" CACHE STRING "-mcpu target, e.g. arm1176jzf-s (Pi Zero) / cortex-
 if(LV_TUNE AND NOT WIN32)
     target_compile_options(levari PRIVATE -mcpu=${LV_TUNE})
     target_compile_options(modplug PRIVATE -mcpu=${LV_TUNE})
+    target_compile_options(snes_spc PRIVATE -mcpu=${LV_TUNE})
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv7")
         target_compile_options(levari PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=hard)
         target_compile_options(modplug PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=hard)
@@ -203,11 +234,11 @@ if(ENABLE_MCP)
     target_compile_definitions(levari-mcp PRIVATE LV_VERSION="${PROJECT_VERSION}")
     if(WIN32)
         target_compile_definitions(levari-mcp PRIVATE MODPLUG_BUILD)
-        target_link_libraries(levari-mcp modplug winpthread m advapi32)
+        target_link_libraries(levari-mcp modplug snes_spc winpthread m advapi32)
     elseif(APPLE)
-        target_link_libraries(levari-mcp modplug pthread m)
+        target_link_libraries(levari-mcp modplug snes_spc pthread m)
     else()
-        target_link_libraries(levari-mcp modplug dl pthread m)
+        target_link_libraries(levari-mcp modplug snes_spc dl pthread m)
     endif()
     if(WIN32)
         target_compile_options(levari-mcp PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)

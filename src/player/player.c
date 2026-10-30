@@ -85,7 +85,6 @@ static void load_track_locked(Player *p, int idx) {
     }
     if (t->end_sec > 0 && p->total_frames > 0)
         p->track_end = (long long)(t->end_sec * p->rate);
-    if (!t->tags.title[0] && !t->notag) tag_read(t->path, &t->tags);
     if (!t->duration) {
         long long len = (p->track_end ? p->track_end : p->total_frames) - p->track_start;
         if (len > 0 && p->rate > 0) t->duration = (int)(len / p->rate);
@@ -93,7 +92,29 @@ static void load_track_locked(Player *p, int idx) {
 }
 
 static void load_track(Player *p, int idx) {
+    /* tag_read is file I/O (128 KB head read, slow on network shares) and
+       the UI draw path blocks on p->mtx every frame: probe the tags BEFORE
+       taking the lock, then write them back under it only if the row is
+       still the same file (the daemon may have swapped the playlist). */
+    char path[LV_MAX_PATH] = "";
+    int need_tags = 0;
     pthread_mutex_lock(&p->mtx);
+    if (idx >= 0 && idx < p->pl->count) {
+        Track *t = &p->pl->items[idx];
+        if (!t->tags.title[0] && !t->notag) {
+            lv_strlcpy(path, t->path, sizeof path);
+            need_tags = 1;
+        }
+    }
+    pthread_mutex_unlock(&p->mtx);
+    Tags tags;
+    tag_init(&tags);
+    if (need_tags) tag_read(path, &tags);
+    pthread_mutex_lock(&p->mtx);
+    if (need_tags && idx >= 0 && idx < p->pl->count &&
+        !strcmp(p->pl->items[idx].path, path) &&
+        !p->pl->items[idx].tags.title[0])
+        p->pl->items[idx].tags = tags;
     load_track_locked(p, idx);
     pthread_mutex_unlock(&p->mtx);
 }
@@ -301,7 +322,14 @@ void pl_post_seek(Player *p, double frac) {
 }
 
 const char *pl_current_title(Player *p, char *buf, size_t n) {
-    if (p->cur < 0 || p->cur >= p->pl->count) { buf[0] = 0; return buf; }
+    /* items[] can be realloc'd/freed at any moment by the daemon's
+       play/add handlers under p->mtx; read the row under the same lock */
+    pthread_mutex_lock(&p->mtx);
+    if (p->cur < 0 || p->cur >= p->pl->count) {
+        buf[0] = 0;
+        pthread_mutex_unlock(&p->mtx);
+        return buf;
+    }
     Track *t = &p->pl->items[p->cur];
     if (t->tags.title[0]) {
         if (t->tags.artist[0]) snprintf(buf, n, "%s - %s", t->tags.artist, t->tags.title);
@@ -309,5 +337,6 @@ const char *pl_current_title(Player *p, char *buf, size_t n) {
     } else {
         lv_pretty_name(t->path, buf, n);
     }
+    pthread_mutex_unlock(&p->mtx);
     return buf;
 }

@@ -1,8 +1,13 @@
+/* struct ucred (SO_PEERCRED) is a GNU extension in glibc headers */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "daemon.h"
 #include "../playlist/playlist.h"
 #include "../library/library.h"
 #include "../config/config.h"
 #include "../common.h"
+#include "peercred.h"
 #ifdef _WIN32
 #include "../compat/win32.h"
 #include <sddl.h>
@@ -57,9 +62,15 @@ static void status_line(Player *p, char *out, size_t n) {
     fmt_t(ts, sizeof ts, tot);
     const char *st = p->state == ST_PLAY ? "playing" : p->state == ST_PAUSE ? "paused" : "stopped";
     char title[256];
+    /* count/cur read under p->mtx: the daemon's own play handler swaps
+       the playlist under that lock; pl_current_title takes it internally,
+       so grab the scalars first and release before calling it */
+    pthread_mutex_lock(&p->mtx);
+    int cur = p->cur, count = p->pl->count;
+    pthread_mutex_unlock(&p->mtx);
     pl_current_title(p, title, sizeof title);
     snprintf(out, n, "%s %d/%d pos=%s/%s shuffle=%d repeat=%d vol=%d title=%s",
-             st, p->cur + 1, p->pl->count, ps, ts,
+             st, cur + 1, count, ps, ts,
              p->shuffle, p->repeat, p->vol, title);
 }
 
@@ -81,12 +92,25 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
                unresponsive. only the swap is locked. */
             Playlist np;
             pl_init(&np);
-            char *tok = strtok(rest, " ");
-            while (tok) {
+            /* split on spaces but honor double quotes: strtok(" ") made
+               every path containing a space into several bogus paths */
+            for (char *s = rest; *s; ) {
+                char *tok = s;
+                if (*tok == '"') {
+                    tok++;
+                    char *q = strchr(tok, '"');
+                    if (q) { *q = 0; s = q + 1; }
+                    else s = tok + strlen(tok);
+                } else {
+                    char *sp = strchr(tok, ' ');
+                    if (sp) { *sp = 0; s = sp + 1; }
+                    else s = tok + strlen(tok);
+                }
+                while (*s == ' ') s++;
+                if (!*tok) continue;
                 const char *dot = strrchr(tok, '.');
                 if (dot && !lv_strcasecmp(dot, ".m3u")) pl_load_m3u(&np, tok);
                 else pl_add(&np, tok);
-                tok = strtok(NULL, " ");
             }
             /* index first: library queries arrive as bare paths, and the
                index already holds tags + duration for scanned files */
@@ -236,10 +260,18 @@ static void *srv_thread(void *arg) {
             continue;
         }
         if (!srv_quit) {
-            char line[2048];
-            DWORD n = 0;
-            if (ReadFile(h, line, sizeof line - 1, &n, NULL) && n > 0) {
-                line[n] = 0;
+            /* read until newline: one ReadFile truncated long commands
+               (the client sends up to 8 KB); the pipe's 1000 ms timeout
+               bounds each read so a silent client cannot park us */
+            char line[8192];
+            DWORD n = 0, off = 0;
+            while (off < sizeof line - 1 &&
+                   ReadFile(h, line + off, (DWORD)(sizeof line - 1 - off), &n, NULL) && n > 0) {
+                off += n;
+                line[off] = 0;
+                if (strchr(line, '\n')) break;
+            }
+            if (off > 0) {
                 char *nl = strchr(line, '\n');
                 if (nl) *nl = 0;
                 char resp[4096];
@@ -283,21 +315,37 @@ static void *srv_thread(void *arg) {
         if (poll(&pf, 1, 200) <= 0) continue;
         int c = accept(listen_fd, NULL, NULL);
         if (c < 0) continue;
-        char line[2048];
-        ssize_t n = read(c, line, sizeof line - 1);
-        if (n > 0) {
-            line[n] = 0;
+        /* with XDG_RUNTIME_DIR unset the socket path falls back to
+           world-writable /tmp: refuse a peer owned by another uid so a
+           pre-bound impostor cannot harvest our status/title responses */
+        if (!peer_is_self(c)) { close(c); continue; }
+        /* bound the read: a client that connects and sends nothing must
+           not park the server thread forever (that deadlocks CLI/MCP),
+           and the client sends up to 8 KB in one line — one read() into
+           2 KB used to truncate long commands mid-path */
+        struct timeval tv = { 5, 0 };
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char line[8192];
+        ssize_t off = 0;
+        while (off < (ssize_t)sizeof line - 1) {
+            ssize_t n = read(c, line + off, sizeof line - 1 - off);
+            if (n <= 0) break;
+            off += n;
+            line[off] = 0;
+            if (strchr(line, '\n')) break;
+        }
+        if (off > 0) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = 0;
             char resp[4096];
             handle_cmd(srv_p, line, resp, sizeof resp);
             size_t rl = strlen(resp);
             resp[rl++] = '\n';
-            ssize_t off = 0;
-            while (off < (ssize_t)rl) {
-                ssize_t w = write(c, resp + off, rl - off);
+            ssize_t off2 = 0;
+            while (off2 < (ssize_t)rl) {
+                ssize_t w = write(c, resp + off2, rl - off2);
                 if (w <= 0) break;
-                off += w;
+                off2 += w;
             }
         }
         close(c);

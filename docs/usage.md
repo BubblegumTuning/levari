@@ -4,8 +4,9 @@
 
     levari [flags] [files...]
 
-Files may be audio (`.mp3 .ogg .oga .opus .flac .wav .mod .s3m .xm .it`,
-plus `.aac .m4a .wma` when built with the optional libav* backend),
+Files may be audio (`.mp3 .ogg .oga .opus .flac .wav .mod .s3m .xm .it
+.spc`, plus `.aac .m4a .wma` when built with the optional libav*
+backend),
 `.m3u` playlists (loaded into the playlist), or `.cue` sheets (virtual
 tracks with INDEX offsets). The first file starts playing automatically.
 
@@ -116,7 +117,8 @@ It is also the data source for the UI search window's `LIB` scope.
 
 Scanning reads each new file once (one open, one head read): tags plus an
 MP3 duration from its XING/VBRI header or a CBR size/bitrate estimate, and
-a FLAC duration from its STREAMINFO block; other formats get their
+a FLAC duration from its STREAMINFO block or an SPC duration from its
+ID666 tag; other formats get their
 duration from the decoder header. When a playlist
 is loaded (`library play`, the daemon `play`/`add`, the file browser),
 items found in the index take their tags and duration from it instead of

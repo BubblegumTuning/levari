@@ -4747,7 +4747,13 @@ static int seek_to_sample_coarse(stb_vorbis *f, uint32 sample_number)
    }
 
    while (left.page_end != right.page_start) {
-      assert(left.page_end < right.page_start);
+      /* LEVARI PATCH: crafted Ogg with inverted page bounds reaches the
+         bisection loop with left.page_end >= right.page_start; any seek
+         aborts debug/ASan builds. Release behavior was verified clean
+         (seeks fail or land wrong, no memory error), so fail the seek
+         gracefully instead of asserting. */
+      if (!(left.page_end < right.page_start))
+         return error(f, VORBIS_seek_failed);
       // search range in bytes
       delta = right.page_start - left.page_end;
       if (delta <= 65536) {
@@ -4894,7 +4900,16 @@ int stb_vorbis_seek_frame(stb_vorbis *f, unsigned int sample_number)
    if (!seek_to_sample_coarse(f, sample_number))
       return 0;
 
-   assert(f->current_loc_valid);
+   /* LEVARI PATCH: seek_to_sample_coarse can return success with
+      current_loc_valid still FALSE: its tail sets it FALSE and
+      vorbis_pump_first_frame only restores it when the first packet ends on
+      a known-loc segment (crafted pages skip that), violating the contract
+      documented at the function head. Upstream master (003501f, verified
+      2026-10-30) unfixed. Release behavior verified clean via
+      scratch-selftest/seek-locvalid/driver (-DNDEBUG: all seeks fail -1, no
+      hang, 0.01s), so fail the seek gracefully instead of asserting.
+      THIRD LEVARI PATCH hunk in this file. */
+   if (!f->current_loc_valid) return error(f, VORBIS_seek_failed);
    assert(f->current_loc <= sample_number);
 
    // linear search for the relevant packet

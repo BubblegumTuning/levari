@@ -29,10 +29,17 @@ static int (*p_snd_pcm_recover)(snd_pcm_t *, int, int);
 /* ---------- PulseAudio (dlopen libpulse-simple) ---------- */
 typedef struct { unsigned char channels; int position[32]; } lv_map;
 typedef struct { int format; unsigned rate; unsigned char channels; lv_map map; } lv_spec;
+/* mirror of pa_buffer_attr (5 x uint32): the server default buffers
+   ~0.5-2 s on desktop setups, and the decode-side viz/time display runs
+   that far ahead of the audible audio. Request a small buffer instead:
+   the display then leads by ~150 ms, imperceptible, and pause/seek
+   response improves by the same margin. */
+typedef struct { unsigned maxlen, tlen, prebuf, minreq, fragsize; } lv_battr;
 typedef void pa_simple_t;
 static void *pa_lib;
 static pa_simple_t *pas;
 static lv_spec pas_ss;
+static lv_battr pas_ba;
 static pa_simple_t *(*p_pa_simple_new)(const char *, const char *, int, const char *,
                                        const char *, const lv_spec *, const lv_map *,
                                        const void *, int *);
@@ -79,8 +86,14 @@ static int try_pulse(int rate, int channels) {
     pas_ss.format = PA_SAMPLE_S16LE;
     pas_ss.rate = (unsigned)rate;
     pas_ss.channels = (unsigned char)channels;
+    unsigned bps = (unsigned)rate * (unsigned)channels * 2u; /* s16 bytes/sec */
+    pas_ba.maxlen   = bps / 2;       /* 500 ms hard ceiling */
+    pas_ba.tlen     = bps * 3 / 20;  /* 150 ms server-side target */
+    pas_ba.prebuf   = bps * 3 / 40;  /* start playing after 75 ms */
+    pas_ba.minreq   = 0;             /* server default */
+    pas_ba.fragsize = 0;             /* playback: server-chosen */
     int err = 0;
-    pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, NULL, &err);
+    pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, &pas_ba, &err);
     if (!pas) return -1;
     backend = 2;
     return 0;
@@ -102,7 +115,7 @@ static int try_alsa(int rate, int channels) {
         return -1;
     if (p_snd_pcm_open(&pcm, cfg.audio_device[0] ? cfg.audio_device : "default", 0, 0) < 0) { pcm = NULL; return -1; }
     if (p_snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                             (unsigned)channels, (unsigned)rate, 1, 500000) < 0) {
+                             (unsigned)channels, (unsigned)rate, 1, 150000) < 0) {
         p_snd_pcm_close(pcm); pcm = NULL; return -1;
     }
     backend = 1;
@@ -142,7 +155,7 @@ int ao_write(const int16_t *buf, int frames) {
     }
     if (backend == 4) {
         SDL_QueueAudio(sdl_dev, buf, (Uint32)((size_t)frames * cur_ch * 2));
-        size_t maxq = (size_t)cur_rate * cur_ch * 2 / 4; /* ~250ms */
+        size_t maxq = (size_t)cur_rate * cur_ch * 2 * 3 / 20; /* ~150ms */
         while (SDL_GetQueuedAudioSize(sdl_dev) > maxq) SDL_Delay(10);
         return frames;
     }
@@ -194,7 +207,7 @@ void ao_flush(void) {
         /* libpulse-simple has no flush: recreate the stream */
         p_pa_simple_free(pas);
         int err = 0;
-        pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, NULL, &err);
+        pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, &pas_ba, &err);
         if (!pas) backend = 3;
     }
 }

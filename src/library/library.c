@@ -44,7 +44,7 @@ static int is_audio(const char *name) {
            !lv_strcasecmp(e, ".aac") || !lv_strcasecmp(e, ".m4a") ||
            !lv_strcasecmp(e, ".wma") || !lv_strcasecmp(e, ".mod") ||
            !lv_strcasecmp(e, ".s3m") || !lv_strcasecmp(e, ".xm") ||
-           !lv_strcasecmp(e, ".it");
+           !lv_strcasecmp(e, ".it") || !lv_strcasecmp(e, ".spc");
 }
 
 typedef struct {
@@ -66,6 +66,30 @@ static int known_path(const ScanCtx *c, const char *p) {
         if (r < 0) lo = mid + 1; else hi = mid - 1;
     }
     return 0;
+}
+
+/* the index is tab-separated with one row per line: a path containing a
+   tab or newline would splice rows together. escape \t \n \\ in the path
+   field (tag fields are already control-char-free from tag.c) */
+static void esc_field(char *dst, size_t dn, const char *src) {
+    size_t j = 0;
+    for (const char *p = src; *p && j + 2 < dn; p++) {
+        if (*p == '\\') { dst[j++] = '\\'; dst[j++] = '\\'; }
+        else if (*p == '\t') { dst[j++] = '\\'; dst[j++] = 't'; }
+        else if (*p == '\n') { dst[j++] = '\\'; dst[j++] = 'n'; }
+        else dst[j++] = *p;
+    }
+    dst[j] = 0;
+}
+static void unesc_field(char *dst, const char *src, size_t sn) {
+    char *d = dst;
+    for (const char *p = src, *e = src + sn; p < e; p++) {
+        if (*p == '\\' && p + 1 < e) {
+            p++;
+            *d++ = *p == 't' ? '\t' : *p == 'n' ? '\n' : *p;
+        } else *d++ = *p;
+    }
+    *d = 0;
 }
 
 static void scan_dir(const char *dir, ScanCtx *c) {
@@ -105,7 +129,9 @@ static void scan_dir(const char *dir, ScanCtx *c) {
             /* only a scan that actually read tags may certify "no tags";
                a filenames-only pass must not mark anything */
             int notag = c->tags && !t.title[0] && !t.artist[0] && !t.album[0] && !t.track;
-            fprintf(c->out, "%s\t%s\t%s\t%s\t%d\t%d", full, t.artist, t.title, t.album, dur, t.track);
+            char esc[2 * LV_MAX_PATH];
+            esc_field(esc, sizeof esc, full);
+            fprintf(c->out, "%s\t%s\t%s\t%s\t%d\t%d", esc, t.artist, t.title, t.album, dur, t.track);
             /* sparse 7th field: only untagged files carry the marker, so
                tagged rows keep the original 6-field shape */
             if (notag) fprintf(c->out, "\t1");
@@ -154,12 +180,16 @@ int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *adde
     int sn = 0, cap = 0;
     FILE *r = fopen(idx, "r");
     if (r) {
-        char line[8192];
+        /* rows can reach 2*LV_MAX_PATH (escaped path) + tags + numbers:
+           8192 used to split long rows mid-line and corrupt the reload */
+        char line[2 * LV_MAX_PATH + 1024];
         while (fgets(line, sizeof line, r)) {
             char *tab = strchr(line, '\t');
             if (tab) *tab = 0;
             char *nl = strchr(line, '\n');
             if (nl) *nl = 0;
+            if (!line[0]) continue;
+            unesc_field(line, line, strlen(line)); /* in-place: only shrinks */
             if (!line[0]) continue;
             if (sn == cap) {
                 cap = cap ? cap * 2 : 256;
@@ -197,13 +227,14 @@ int lib_foreach_entry(void (*fn)(const LibEntry *e, void *ud), void *ud) {
     lib_index_path(idx, sizeof idx);
     FILE *f = fopen(idx, "r");
     if (!f) return -1;
-    char line[8192];
+    char line[2 * LV_MAX_PATH + 1024];
     int n = 0;
     while (fgets(line, sizeof line, f)) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         char *p1 = line;
         char *p2 = strchr(p1, '\t'); if (!p2) continue; *p2++ = 0;
+        unesc_field(p1, p1, strlen(p1)); /* in-place: only shrinks */
         char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
         char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
         char *p5 = strchr(p4, '\t');
