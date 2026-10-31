@@ -67,7 +67,10 @@ static int utf8_enc(unsigned cp, char *out) {
     return 4;
 }
 
-/* fold ASCII case and fullwidth forms; CJK passes through untouched */
+/* fold ascii and slavic case plus fullwidth forms; cjk passes through.
+   slavic pairs: А-Я/а-я and Ё/ё for russian, the Ђ-Џ block covers the
+   ukrainian/belarusian/sebian extras (І Ґ Ў Є Ѕ etc.), and the historic
+   0x0460+/0x0500+ blocks pair even->odd */
 static void norm(const char *src, char *dst, size_t dn) {
     size_t o = 0;
     const char *q = src;
@@ -75,12 +78,17 @@ static void norm(const char *src, char *dst, size_t dn) {
         unsigned cp;
         int n = font_utf8_next(q, &cp);
         q += n;
-        if (cp >= 'A' && cp <= 'Z') dst[o++] = (char)(cp + 32);
+        if (cp >= 'A' && cp <= 'Z') { dst[o++] = (char)(cp + 32); continue; }
+        if (cp >= 0x0410 && cp <= 0x042F) cp += 0x20;
+        else if (cp == 0x0401) cp = 0x0451;
+        else if (cp >= 0x0402 && cp <= 0x040F) cp += 0x50;
+        else if (cp >= 0x0460 && cp <= 0x04FF && !(cp & 1)) cp++;
+        else if (cp >= 0x0500 && cp <= 0x052E && !(cp & 1)) cp++;
         else if (cp >= 0xFF01 && cp <= 0xFF5E) {
-            char c = (char)(cp - 0xFEE0);
-            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-            dst[o++] = c;
-        } else if (cp == 0x3000) dst[o++] = ' ';
+            cp -= 0xFEE0;
+            if (cp >= 'A' && cp <= 'Z') cp += 32;
+        } else if (cp == 0x3000) cp = ' ';
+        if (cp < 0x80) dst[o++] = (char)cp;
         else o += (size_t)utf8_enc(cp, dst + o);
     }
     dst[o] = 0;
