@@ -49,6 +49,87 @@ static void copy_utf8(char *dst, size_t dn, const unsigned char *src, int n) {
     dst[j] = 0;
 }
 
+/* cp1251 (windows cyrillic) high half -> unicode; 0x98 is undefined there */
+static const uint16_t cp1251_hi[128] = {
+0x0402,0x0403,0x201A,0x0453,0x201E,0x2026,0x2020,0x2021,
+0x20AC,0x2030,0x0409,0x2039,0x040A,0x040C,0x040B,0x040F,
+0x0452,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
+0xFFFD,0x2122,0x0459,0x203A,0x045A,0x045C,0x045B,0x045F,
+0x00A0,0x040E,0x045E,0x0408,0x00A4,0x0490,0x00A6,0x00A7,
+0x0401,0x00A9,0x0404,0x00AB,0x00AC,0x00AD,0x00AE,0x0407,
+0x00B0,0x00B1,0x0406,0x0456,0x0491,0x00B5,0x00B6,0x00B7,
+0x0451,0x2116,0x0454,0x00BB,0x0458,0x0405,0x0455,0x0457,
+0x0410,0x0411,0x0412,0x0413,0x0414,0x0415,0x0416,0x0417,
+0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,0x041F,
+0x0420,0x0421,0x0422,0x0423,0x0424,0x0425,0x0426,0x0427,
+0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,0x042E,0x042F,
+0x0430,0x0431,0x0432,0x0433,0x0434,0x0435,0x0436,0x0437,
+0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,0x043F,
+0x0440,0x0441,0x0442,0x0443,0x0444,0x0445,0x0446,0x0447,
+0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,0x044E,0x044F,
+};
+
+/* is the payload valid utf-8 containing at least one multibyte sequence? */
+static int utf8_multibyte(const unsigned char *src, int n) {
+    int i = 0, mb = 0;
+    while (i < n && src[i]) {
+        unsigned c = src[i];
+        int len;
+        if (c < 0x80) { i++; continue; }
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else return 0;
+        if (i + len > n) return 0;
+        for (int k = 1; k < len; k++)
+            if ((src[i + k] & 0xC0) != 0x80) return 0;
+        mb = 1;
+        i += len;
+    }
+    return mb;
+}
+
+/* cyrillic words are runs of high bytes; western latin-1 accents sit
+   isolated among ascii, so two consecutive high bytes mean cp1251 */
+static int looks_cp1251(const unsigned char *src, int n) {
+    int run = 0;
+    for (int i = 0; i < n && src[i]; i++) {
+        if (src[i] >= 0x80) { if (++run >= 2) return 1; }
+        else run = 0;
+    }
+    return 0;
+}
+
+/* legacy 8-bit tag fields (id3v2 enc=0, id3v1): the spec says latin-1 but
+   russian taggers wrote cp1251 and sloppy ones wrote utf-8 outright.
+   classify by shape and decode accordingly; raw copying (the old behavior)
+   double-encoded every non-ascii byte into mojibake. */
+static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
+    if (utf8_multibyte(src, n)) { copy_utf8(dst, dn, src, n); return; }
+    if (!looks_cp1251(src, n)) { copy_fixed(dst, dn, src, n); return; }
+    size_t j = 0;
+    for (int i = 0; i < n && src[i]; i++) {
+        unsigned char c = src[i];
+        if (c < 0x20) continue;
+        unsigned cp = c < 0x80 ? c : cp1251_hi[c - 0x80];
+        if (cp < 0x80) {
+            if (j + 1 >= dn) break;
+            dst[j++] = (char)cp;
+        } else if (cp < 0x800) {
+            if (j + 2 >= dn) break;
+            dst[j++] = (char)(0xC0 | (cp >> 6));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (j + 3 >= dn) break;
+            dst[j++] = (char)(0xE0 | (cp >> 12));
+            dst[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    while (j > 0 && dst[j - 1] == ' ') j--;
+    dst[j] = 0;
+}
+
 static size_t utf16_to_utf8(char *dst, size_t dn, const unsigned char *src, size_t sn) {
     size_t o = 0;
     for (size_t i = 0; i + 1 < sn; i += 2) {
@@ -118,7 +199,7 @@ static void text_frame(Tags *t, const char *id, const unsigned char *p, size_t n
         }
         utf16_to_utf8(dst, 256, v, vn);
     } else {
-        copy_fixed(dst, 256, v, (int)(vn < 255 ? vn : 255));
+        copy_legacy(dst, 256, v, (int)(vn < 255 ? vn : 255));
     }
 }
 
@@ -157,7 +238,7 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, Tags *t) 
    exist (the old code let the v1 tail overwrite the v2 values) */
 static void fill_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
     if (dst[0]) return;
-    copy_fixed(dst, dn, src, n);
+    copy_legacy(dst, dn, src, n);
 }
 
 static void read_id3v1(FILE *f, Tags *t) {

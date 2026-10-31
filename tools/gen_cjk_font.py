@@ -28,6 +28,14 @@ def latin1_supplement():
     # supplement so western-european titles render instead of falling back to '?'
     return set(range(0xA0, 0x100))
 
+def cyrillic():
+    # JIS X 0208 carries only the Russian alphabet + yo; Ukrainian/Serbian/
+    # Belarusian letters (i yi ye ghe-upshortedje, dje tshe dzhe, short u)
+    # live outside it. Take the whole Cyrillic block + supplements so any
+    # slavic title renders. Unifont's cyrillic glyphs are 8-wide, so they
+    # land on the half-width table automatically like the russian set.
+    return set(range(0x0400, 0x0530))
+
 def common_punctuation():
     # curly quotes, dashes, ellipsis etc. show up constantly in track titles
     return {0x2013, 0x2014, 0x2018, 0x2019, 0x201A, 0x201B, 0x201C, 0x201D,
@@ -55,7 +63,7 @@ def load_unifont(path):
 
 def main():
     uni, half = load_unifont(sys.argv[1])
-    want = jis0208_codepoints() | latin1_supplement() | common_punctuation()
+    want = jis0208_codepoints() | latin1_supplement() | cyrillic() | common_punctuation()
     cps = sorted(c for c in want if c in uni)
     missing = len(want) - len(cps)
     sys.stderr.write('font: %d glyphs, %d missing in unifont\n' % (len(cps), missing))
