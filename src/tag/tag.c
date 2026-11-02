@@ -14,15 +14,21 @@ void tag_init(Tags *t) {
 }
 
 static void copy_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
-    /* windows-1252 tier: the bytes 0x80-0x9F where cp1251 and windows-1252
-       AGREE (smart quotes, dashes, ellipsis, bullet, euro, per-mille, tm).
-       Taggers on Windows wrote these bytes for punctuation in enc=0/id3v1
-       fields — extremely common in real titles ("Don\u2019t Start Now");
-       latin-1 calls them C1 controls, which are never legitimate tag content
-       and render as invisible garbage. The disagreeing bytes (cyrillic
-       letters like 0x80 Ђ, 0x9A Њ, 0x9C ѕ/œ, and the undefined 0x90/0x98)
-       keep the latin-1 C1 reading: the cp1251 classifier already handles
-       them when context says cyrillic, and guessing would move other pins.
+    /* windows-1252 tier: taggers on Windows wrote bytes 0x80-0x9F for
+       punctuation in enc=0/id3v1 fields — extremely common in real titles
+       ("Don\u2019t Start Now"); latin-1 calls those bytes C1 controls,
+       which are never legitimate tag content and render as invisible
+       garbage. Mapped: the 16 bytes where cp1251 and windows-1252 AGREE
+       (smart quotes, dashes, ellipsis, daggers, bullet, per-mille, tm,
+       guillemets) plus ONE deliberate exception, 0x88 -> euro sign:
+       cp1251 puts € at 0x88 (common in price-bearing titles) while
+       windows-1252 puts a lone modifier circumflex there (effectively
+       nonexistent in titles). windows-1252's € at 0x80 is NOT mapped —
+       that byte reads as Ђ under cp1251, and the tier must not guess.
+       The disagreeing bytes (cyrillic letters like 0x80 Ђ, 0x9A Њ,
+       0x9C ѕ/œ, and the undefined 0x90/0x98) keep the latin-1 C1
+       reading: the cp1251 classifier already handles the letters when
+       context says cyrillic, and guessing would move other pins.
        Mirror of test/tagwords/tagcheck.py W1252 — keep in sync. */
     static const struct { unsigned char b; unsigned cp; } w1252[] = {
         {0x82,0x201A},{0x84,0x201E},{0x85,0x2026},{0x86,0x2020},{0x87,0x2021},

@@ -81,10 +81,12 @@ def enc_cyr(s):
         else: raise SystemExit("char U+%04X not encodable via tag.c cp1251 table" % cp)
     return bytes(out)
 
-# bytes 0x80-0x9F where windows-1252 and cp1251 AGREE — tag.c's copy_fixed
-# decodes these as punctuation (the w1252 tier); mirror of tag.c's table,
-# keep in sync. Disagreeing bytes (0x80 Ђ, 0x9C ѕ/œ, 0x90/0x98 undefined,
-# ...) keep the latin-1 C1 reading and are NOT encodable here.
+# the bytes tag.c's w1252 tier decodes as punctuation: the 16 where
+# windows-1252 and cp1251 AGREE, plus the documented exception 0x88 ->
+# euro (cp1251's €; w1252's lone modifier circumflex never occurs in
+# real titles). Mirror of tag.c's table, keep in sync. Bytes with a
+# cyrillic reading (0x80 Ђ, 0x9A Њ, 0x9C ѕ/œ) or undefined (0x90/0x98)
+# keep the latin-1 C1 reading and are NOT encodable here.
 W1252 = {0x82:0x201A, 0x84:0x201E, 0x85:0x2026, 0x86:0x2020, 0x87:0x2021,
          0x88:0x20AC, 0x89:0x2030, 0x8B:0x2039,
          0x91:0x2018, 0x92:0x2019, 0x93:0x201C, 0x94:0x201D, 0x95:0x2022,

@@ -60,13 +60,18 @@ build build-rel-linux-legacy-zig -DCMAKE_TOOLCHAIN_FILE="$root/tools/zig-legacy-
 # refuses to load or SIGILLs on the legacy target):
 #   glibc: highest GLIBC_* symbol version must be 2.17 (no GLIBCXX_* at
 #   all: libc++/libmodplug are linked statically).
-#   ISA: zero AVX/BMI/movbe mnemonics. lzcnt appears only in dr_flac's
-#   runtime-CPUID-guarded rice decoder (drflac__is_lzcnt_supported) and is
-#   benign there; the gate's discriminators are vpxor/movbe/tzcnt.
+#   ISA: zero AVX, zero SSE3+ scalars. The umbrella '\tv[a-z0-9]+\t'
+#   matches every AT&T AVX/AVX2 mnemonic (all start with 'v') in objdump's
+#   tab-delimited mnemonic column; the enumeration covers the SSE3-SSE4.2/
+#   BMI instructions without the 'v' prefix. lzcnt appears ~23x, inside
+#   dr_flac's rice decoder behind its runtime CPUID guard
+#   (drflac__is_lzcnt_supported) — benign; do NOT add lzcnt to the gate.
+#   NOTE the '|| true': on a clean binary grep -c prints 0 AND exits 1 —
+#   under set -euo pipefail that would kill the script before packaging.
 floor=$(objdump -T build-rel-linux-legacy-zig/levari | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
 [ "$floor" = "GLIBC_2.17" ] || { echo "legacy glibc floor is $floor, expected GLIBC_2.17" >&2; exit 1; }
-n=$(objdump -d build-rel-linux-legacy-zig/levari | grep -cE '\b(vpxor|movbe|tzcnt)\b')
-[ "$n" = 0 ] || { echo "legacy ISA scan: $n AVX/BMI/movbe refs found" >&2; exit 1; }
+n=$(objdump -d build-rel-linux-legacy-zig/levari | grep -cE $'\tv[a-z0-9]+([ \t]|$)|\b(movbe|tzcnt|pshufb|pblendvb|palignr|lddqu|movntdqa|ptest|roundps|pminud|pminsb|packusdw|pcmpgtq|popcnt|crc32|andn|bextr|blsr|mulx)\b' || true)
+[ "$n" = 0 ] || { echo "legacy ISA scan: $n AVX/SSE3+ refs found" >&2; exit 1; }
 package linux-legacy x86-64 build-rel-linux-legacy-zig levari README.md assets/levari.desktop assets/levari.svg
 
 sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}

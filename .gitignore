@@ -1,0 +1,12 @@
+# never public — standing convention across levari/ projects
+internal_docs/
+
+# generated test corpora (divegen.py output, frequency wordlists)
+test-assets/
+
+# python bytecode (embeds absolute build paths — never commit)
+__pycache__/
+*.pyc
+
+# cmake build trees (build/, build-rel-linux/, build-rel-win/, ...)
+build*/

@@ -21,9 +21,10 @@ v1l/v1c (ID3v1 tail shape, NUL-padded: padding must neutralize the trap),
 u8cut/u8cut2 (utf-8 cut at a char boundary in a fixed-width field),
 v1cut/v1u8 (id3v1's 30 bytes cutting cp1251 / UTF-8 text mid-char),
 bigc/bigl (two-word legacy fields: boundary adjacency rules),
-l1w/v1w (windows-1252 bytes of TEXT: the 0x80-0x9F punctuation where
-cp1251 and windows-1252 AGREE — smart quotes, dashes, ellipsis; the
-latin-1 fallback must read them as punctuation, never as C1 controls),
+l1w/v1w (windows-1252 bytes of TEXT: the 0x80-0x9F punctuation tag.c's
+w1252 tier maps — the bytes where cp1251 and windows-1252 AGREE plus the
+documented 0x88→euro exception; the latin-1 fallback must read them as
+punctuation, never as C1 controls),
 au8/au8t/au8cut/au8cut2 (the u8 shapes in a TPE1 frame instead of TIT2:
 the ARTIST field is pinned; probe.c prints title and artist),
 obs (ambiguous byte strings: reported, never asserted).
@@ -75,8 +76,10 @@ top-2500 streamed songs' TITLES AND ARTISTS from kworb.net/spotify/songs.html
 including TPE1/id3v1-artist variants. Zero new decode bug classes — the
 UTF-8 path was spotless; it exposed the windows-1252 tier instead: a lone
 smart-quote byte (usually 0x92) in a legacy field decoded as a latin-1 C1
-control (18/2413 titles carry one). The fix pins the 17 cp1251/w1252-agreed
-bytes as l1w/v1w (SECTION 11); the 85 matrix lines for those bytes moved
+control (18/2413 titles carry one). The fix pins the 17 tier bytes — the
+16 cp1251/w1252-agreed plus the documented exception 0x88→euro (cp1251's
+€, common in titles; w1252's lone ˆ never occurs) — as l1w/v1w
+(SECTION 11); the 85 matrix lines for those bytes moved
 l1m->l1w with the contract, the disagreeing bytes keep the C1 reading and
 stay l1m. The tool lived in a scratch dir (one-shot, corpus lists are not
 kept in git); SECTION 11 documents the counts and artist-field proof.
