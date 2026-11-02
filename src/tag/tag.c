@@ -122,9 +122,21 @@ static const uint16_t cp1251_hi[128] = {
    field over that tail re-decodes clean utf-8 as latin-1/cp1251 mojibake.
    *clamped receives the length through the last COMPLETE sequence and
    *mb whether any multibyte sequence is present (a truncated tail counts) */
+/* defined below — classify bytes by cp1251 word shape */
+static int cp1251_letter(unsigned char c);
+static int ascii_alpha(unsigned char c);
+
+/* is the pair (lead,cont) plausibly INSIDE a cp1251 word: both bytes
+   cp1251 letter bytes, and not glued to an ascii letter (looks_cp1251's
+   own boundary rule: accents touching ascii letters are latin-1) */
+static int cyr_pair(const unsigned char *src, size_t i) {
+    return cp1251_letter(src[i]) && cp1251_letter(src[i + 1])
+        && (i == 0 || !ascii_alpha(src[i - 1]));
+}
+
 static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) {
     size_t i = 0, last = 0;
-    int m = 0, badpair = 0;
+    int m = 0, m3 = 0, noncyr = 0, masq = 0;
     while (i < (size_t)n && src[i]) {
         unsigned c = src[i];
         int len;
@@ -138,31 +150,44 @@ static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) 
         else if ((c & 0xF8) == 0xF0) len = 4;
         else return 0;
         if (i + (size_t)len > (size_t)n) {
-            /* truncated tail: accept when the tail carries >=2 real
-               continuation bytes (a 4-byte char/emoji cut — the 0.3.2
-               clamp case), or when the field ALREADY contains a complete
-               multibyte char and no complete 2-byte pair decoded to a
-               latin-1 symbol. that pair class (U+0080-0x00BF, ×, ÷) is
-               exactly how cp1251 words masquerade ("Від"=C2 B3 E4: a
-               pseudo-pair + trailing lead), while real UTF-8 cyrillic/
-               cjk pairs decode to letters — accept those and clamp the
-               cut. a lone lead-class byte with no continuation behind it
-               and no prior multibyte stays the latin-1/cp1251 field-end
-               shape (é=0xE9, "да"=E4 E0): reject the whole field and let
-               the shape rules read it. */
+            /* truncated tail — accept (clamp the cut) when the UTF-8 read
+               outweighs the cp1251/latin-1 shape read:
+               - >=2 continuation bytes: a 4-byte char/emoji cut (the 0.3.2
+                 clamp case) — unambiguous;
+               - a 1-continuation tail ("abc日" cut at E6 97) whose tail pair
+                 could NOT sit inside a cp1251 word (e.g. 0x97 is punctuation
+                 in cp1251, or the pair touches an ascii letter) — the cut
+                 itself is not cp1251 evidence, clean-trim it;
+               - prior complete multibyte with REAL UTF-8 evidence (a
+                 complete 3/4-byte char, or a 2-byte pair that could not be
+                 a cp1251 word run — e.g. « = C2 AB is В+«: the « byte ends
+                 every cp1251 word run, so guillemets/©/°/NBSP pairs weigh
+                 FOR utf-8, not against it), and no pair that is BOTH a
+                 latin-1 symbol decode AND cp1251-word-plausible ("Від" =
+                 C2 B3 E4: В+і is a letter run — that masquerade still
+                 rejects). a lone lead-class byte with no UTF-8 evidence
+                 behind it stays the latin-1/cp1251 field-end shape
+                 (é=0xE9, "да"=E4 E0). */
             size_t k = 1;
             while (i + k < (size_t)n && (src[i + k] & 0xC0) == 0x80) k++;
-            if (last > 0 && (k >= 3 || (m && !badpair))) { *clamped = last; *mb = 1; return 1; }
+            if (last > 0 && (k >= 3
+                             || (k == 2 && !cyr_pair(src, i))
+                             || (m && !masq && (m3 || noncyr)))) { *clamped = last; *mb = 1; return 1; }
             return 0;
         }
         for (int k = 1; k < len; k++)
             if ((src[i + k] & 0xC0) != 0x80) return 0;
         if (len > 1) m = 1;
-        if (len == 2) {                          /* decoded class of a complete
-                                                    2-byte pair: latin-1 symbol
-                                                    = cp1251 masquerade evidence */
+        if (len >= 3) m3 = 1;                    /* complete 3/4-byte char: UTF-8 evidence */
+        if (len == 2) {                          /* classify a complete 2-byte pair:
+                                                    not cp1251-word-plausible = UTF-8
+                                                    evidence (noncyr); cp1251-plausible
+                                                    AND latin-1-symbol-class (U+0080-
+                                                    0x00BF, ×, ÷) = cp1251 masquerade
+                                                    evidence (masq) */
             unsigned cp = ((c & 0x1F) << 6) | (src[i + 1] & 0x3F);
-            if (cp <= 0xBF || cp == 0xD7 || cp == 0xF7) badpair = 1;
+            if (!cyr_pair(src, i)) noncyr = 1;
+            else if (cp <= 0xBF || cp == 0xD7 || cp == 0xF7) masq = 1;
         }
         i += (size_t)len;
         last = i;
