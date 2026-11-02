@@ -235,7 +235,7 @@ def main():
     print('\n== OBSERVE (not asserted) ==')
     for t, act_s in observes: print('  %r decodes to %r' % (t, act_s))
     if fails:
-        print('\n== %d PINNED FAILURES (expected pre-fix: see docs/fixlist-0.3.3.md) ==' % len(fails))
+        print('\n== %d PINNED FAILURES (gate contract is ZERO: fix the code, or move genuinely ambiguous inputs to OBSERVE) ==' % len(fails))
         for m, t, act, exp in fails:
             print('  %s %r: got %r want %r' % (m, t, act.decode('utf-8','replace'), exp.decode('utf-8','replace')))
     total_fail = len(fails)

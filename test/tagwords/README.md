@@ -46,8 +46,7 @@ fixed (adjacency latin-1, emoji clamp, strict-then-shape ordering controls
 u8/u8t/v1) must stay green, and everything 0.3.2 regressed (truncation clamp
 eating latin-1 tails AND cyrillic function words; the cp1251 letter-set gap
 for i/Ye/Yi/Ge bytes 0x80-0xBF) must turn green. A classifier change that
-keeps 0.3.0 at 45 while taking 0.3.2 to 0 is the bar — see
-docs/fixlist-0.3.3.md item 2.
+keeps 0.3.0 at 45 while taking 0.3.2 to 0 is the bar.
 
 Rules:
 - NEVER delete a failing line to get green. Fix the code, or move the line

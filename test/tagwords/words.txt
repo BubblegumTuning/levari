@@ -1,7 +1,8 @@
 # levari tag decoding regression corpus — consumed by test/tagwords/tagcheck.py
 # mode<TAB>text; expected decode is ALWAYS the text itself unless mode is 'obs'.
-# Entries failing today are PINNED RED by design: they are the spec for the tag
-# classifier fix (docs/fixlist-0.3.3.md). Never delete a failing line: fix the code
+# The gate contract is GREEN: zero pinned failures (the v0.3.0/v0.3.2
+# failures were fixed and every one of their shapes is now pinned as a
+# regression). Never delete a failing line: fix the code
 # or move the line into the OBSERVE section with a comment if the ambiguity is real.
 
 # == SECTION 1: byte-trap matrix: every legacy byte 0x80-0xFF at every tail
