@@ -32,7 +32,7 @@ int lib_idx_getline(FILE *f, char *line, size_t n);
    dirs are expanded (~) and realpath'd; added/seen receive counts.
    with_tags=0 indexes filenames only (skips tag + decoder reads).
    returns 0 on success, 1 if the index cannot be opened for writing. */
-int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen);
+int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen, int *skipped);
 
 /* one parsed row of the index (fields point into a scratch buffer) */
 typedef struct {

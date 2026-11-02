@@ -82,11 +82,18 @@ static void norm(const char *src, char *dst, size_t dn) {
         if (cp >= 0x0410 && cp <= 0x042F) cp += 0x20;
         else if (cp == 0x0401) cp = 0x0451;
         else if (cp >= 0x0402 && cp <= 0x040F) cp += 0x50;
+        /* 0x04C1-0x04CE pair INVERTED: capitals are ODD, smalls EVEN.
+           Fold those capitals down +1; the block must stay out of the
+           even->odd rule below or its smalls fold into the wrong letter
+           (0x04C2 would become 0x04C3, a different capital). */
+        else if (cp >= 0x04C1 && cp <= 0x04CD && (cp & 1)) cp++;
         /* historic blocks pair even->odd, but the thousands sign and the
-           descriptive combining marks (0x0482-0x0489) and palochka 0x04C0
-           have no case pair: folding them mutates the letter */
+           descriptive combining marks (0x0482-0x0489) have no case pair,
+           and palochka 0x04C0 plus the inverted block 0x04C1-0x04CE are
+           handled above: parity-folding any of them mutates the letter */
         else if (cp >= 0x0460 && cp <= 0x04FF && !(cp & 1) &&
-                 !(cp >= 0x0482 && cp <= 0x0489) && cp != 0x04C0) cp++;
+                 !(cp >= 0x0482 && cp <= 0x0489) &&
+                 !(cp >= 0x04C0 && cp <= 0x04CE)) cp++;
         else if (cp >= 0x0500 && cp <= 0x052E && !(cp & 1)) cp++;
         else if (cp >= 0xFF01 && cp <= 0xFF5E) {
             cp -= 0xFEE0;

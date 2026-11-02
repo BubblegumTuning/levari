@@ -102,7 +102,20 @@ static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) 
         else if ((c & 0xF0) == 0xE0) len = 3;
         else if ((c & 0xF8) == 0xF0) len = 4;
         else return 0;
-        if (i + (size_t)len > (size_t)n) { *clamped = last; *mb = 1; return 1; }
+        if (i + (size_t)len > (size_t)n) {
+            /* truncated tail: accept ONLY when the lead is followed by at
+               least one real continuation byte and complete content precedes
+               it — that shape is a fixed-width field cutting an emoji (or a
+               3-4 byte char) mid-sequence. A lead-class byte with no
+               continuation bytes behind it is how latin-1/cp1251 accents sit
+               at a field end (é=0xE9, "да"=E4 E0, the E4 closing cp1251
+               "Від"): reject the whole field and let the shape rules read it
+               instead of clamping the text away before the accent. */
+            size_t k = 1;
+            while (i + k < (size_t)n && (src[i + k] & 0xC0) == 0x80) k++;
+            if (k > 1 && last > 0) { *clamped = last; *mb = 1; return 1; }
+            return 0;
+        }
         for (int k = 1; k < len; k++)
             if ((src[i + k] & 0xC0) != 0x80) return 0;
         if (len > 1) m = 1;
@@ -121,7 +134,24 @@ static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) 
    join a run: punctuation (cp1251 « », latin-1 ° ·) separates runs. */
 static int cp1251_letter(unsigned char c) {
     if (c == 0xA8 || c == 0xB8) return 1;          /* Ё ё */
-    if (c < 0xC0 || c == 0xD7 || c == 0xF7) return 0; /* × ÷ are not letters */
+    if (c < 0x80) return 0;
+    if (c < 0xC0) {
+        /* the cp1251-specific cyrillic letters of the 0x80-0xBF block per
+           cp1251_hi: ukrainian і ї є ґ Ґ, belarusian ў і, macedonian/serbian
+           ѓ ѕ љ њ џ Ћ Ќ and companions. excluding them made "Від" "Київ"
+           "їсти" fall to latin-1 — 0.3.0's crude >=0x80 adjacency read them
+           fine. the latin-1 punctuation that shares the range (°±µ¹½¼¾»
+           № «¬ etc.) stays a non-letter so Hääyö/Grüße/"12½" stay latin-1 */
+        static const unsigned char lo[] = {
+            0x80,0x81,0x83,0x8A,0x8C,0x8D,0x8E,0x8F,0x90,0x9A,
+            0x9C,0x9D,0x9E,0x9F,0xA1,0xA2,0xA3,0xA5,0xAA,0xAF,
+            0xB2,0xB3,0xB4,0xBA,0xBC,0xBD,0xBE,0xBF,
+        };
+        for (unsigned i = 0; i < sizeof lo; i++)
+            if (lo[i] == c) return 1;
+        return 0;
+    }
+    if (c == 0xD7 || c == 0xF7) return 0;          /* × ÷ are not letters */
     return 1;                                      /* А-Я / а-я */
 }
 static int ascii_alpha(unsigned char c) {
@@ -264,8 +294,8 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags
     size_t i = 0;
     /* extended header (flag 0x40): without skipping it the frame walk
        starts inside the ext header and loses every frame. v3: 4 plain
-       bytes, the size includes the size field itself. v4: 4 syncsafe
-       bytes, the size excludes it. */
+       bytes, the size EXCLUDES the size field itself (skip = size + 4).
+       v4: 4 syncsafe bytes, the size INCLUDES them (skip = size). */
     if (ver >= 3 && (flags & 0x40)) {
         if (sz < 4) return;
         size_t eh;
@@ -274,7 +304,7 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags
                  ((size_t)buf[2] << 7) | buf[3];
         else
             eh = be32(buf);
-        i = ver == 4 ? eh + 4 : eh;
+        i = ver == 4 ? eh : eh + 4;
         if (i > sz) return;
     }
     int idlen = ver == 2 ? 3 : 4;

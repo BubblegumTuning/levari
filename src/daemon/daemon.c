@@ -41,6 +41,7 @@ static pthread_mutex_t pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
 #else
 static int listen_fd = -1;
 static char srv_path[512];   /* the path actually bound (random in /tmp fallback) */
+static char srv_ptr_pub[512]; /* pointer file this instance published ('' if none) */
 #endif
 
 static void fmt_t(char *b, size_t n, long long sec) {
@@ -309,42 +310,62 @@ static void *srv_thread(void *arg) {
         sap = &sa;
     }
     while (!srv_quit) {
-        HANDLE h = CreateNamedPipeA(path, PIPE_ACCESS_DUPLEX,
+        /* FILE_FLAG_OVERLAPPED: the only supported way to bound a pipe
+           read. SetCommTimeouts is documented for communications devices
+           (not named pipes) and its return value was not even checked —
+           the old "bounded read" comment claimed more than the code did. */
+        HANDLE h = CreateNamedPipeA(path, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                     1, 0, 4096, 1000, sap);
         if (h == INVALID_HANDLE_VALUE) { if (psd) LocalFree(psd); return NULL; }
         pthread_mutex_lock(&pipe_mtx);
         cur_pipe = h;
         pthread_mutex_unlock(&pipe_mtx);
-        if (!ConnectNamedPipe(h, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+        OVERLAPPED conn = {0};
+        conn.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+        BOOL cok = ConnectNamedPipe(h, &conn);
+        DWORD ce = GetLastError();
+        if (!cok && ce == ERROR_IO_PENDING)
+            cok = WaitForSingleObject(conn.hEvent, INFINITE) == WAIT_OBJECT_0;
+        if (!cok && GetLastError() != ERROR_PIPE_CONNECTED && ce != ERROR_PIPE_CONNECTED) {
             pthread_mutex_lock(&pipe_mtx);
             cur_pipe = INVALID_HANDLE_VALUE;
             pthread_mutex_unlock(&pipe_mtx);
+            if (conn.hEvent) CloseHandle(conn.hEvent);
             CloseHandle(h);
             continue;
         }
-        /* CreateNamedPipe's nDefaultTimeOut is advisory (client-side
-           WaitNamedPipe only): a PIPE_WAIT ReadFile blocks forever, so a
-           client that connects and sends nothing parked the daemon thread.
-           MAXDWORD interval + 1000 ms total makes ReadFile return 0 bytes
-           once a second of silence elapses. */
-        COMMTIMEOUTS ct;
-        ct.ReadIntervalTimeout = MAXDWORD;
-        ct.ReadTotalTimeoutMultiplier = 0;
-        ct.ReadTotalTimeoutConstant = 1000;
-        SetCommTimeouts(h, &ct);
+        /* read one newline-framed line under a deadline over the WHOLE
+           line: the per-read 1 s wait only bounds silence — a client
+           dribbling bytes just under 1 s apart kept this serial loop
+           busy byte-by-byte. 5 s total: an idle, dribbling or stalled
+           client is dropped and the loop re-accepts. */
         if (!srv_quit) {
-            /* read until newline: one ReadFile truncated long commands
-               (the client sends up to 8 KB); the pipe's 1000 ms timeout
-               bounds each read so a silent client cannot park us */
+            OVERLAPPED rd = {0};
+            rd.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
             char line[8192];
+            ULONGLONG t0 = GetTickCount64();
             DWORD n = 0, off = 0;
-            while (off < sizeof line - 1 &&
-                   ReadFile(h, line + off, (DWORD)(sizeof line - 1 - off), &n, NULL) && n > 0) {
+            while (off < sizeof line - 1) {
+                ULONGLONG spent = GetTickCount64() - t0;
+                DWORD left = spent >= 5000 ? 0 : (DWORD)(5000 - spent);
+                if (left == 0) break; /* whole-line budget spent: drop it */
+                ResetEvent(rd.hEvent);
+                if (!ReadFile(h, line + off, (DWORD)(sizeof line - 1 - off), &n, &rd)) {
+                    if (GetLastError() != ERROR_IO_PENDING) break;
+                    if (WaitForSingleObject(rd.hEvent, left) != WAIT_OBJECT_0) {
+                        CancelIoEx(h, &rd);
+                        WaitForSingleObject(rd.hEvent, INFINITE);
+                        break; /* budget/silence expired: drop the client */
+                    }
+                    if (!GetOverlappedResult(h, &rd, &n, FALSE)) break;
+                }
+                if (n == 0) break;
                 off += n;
                 line[off] = 0;
                 if (strchr(line, '\n')) break;
             }
+            if (rd.hEvent) CloseHandle(rd.hEvent);
             if (off > 0) {
                 char *nl = strchr(line, '\n');
                 if (nl) *nl = 0;
@@ -357,6 +378,7 @@ static void *srv_thread(void *arg) {
                 FlushFileBuffers(h);
             }
         }
+        if (conn.hEvent) CloseHandle(conn.hEvent);
         DisconnectNamedPipe(h);
         pthread_mutex_lock(&pipe_mtx);
         cur_pipe = INVALID_HANDLE_VALUE;
@@ -403,12 +425,22 @@ static void *srv_thread(void *arg) {
         /* bound the read: a client that connects and sends nothing must
            not park the server thread forever (that deadlocks CLI/MCP),
            and the client sends up to 8 KB in one line — one read() into
-           2 KB used to truncate long commands mid-path */
-        struct timeval tv = { 5, 0 };
-        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+           2 KB used to truncate long commands mid-path. The bound is a
+           deadline over the WHOLE line read: SO_RCVTIMEO bounds a single
+           read() only, so a client dribbling a byte every few seconds
+           kept this serial accept loop from serving anyone else for
+           minutes. */
+        struct timespec t0, now;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         char line[8192];
         ssize_t off = 0;
         while (off < (ssize_t)sizeof line - 1) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long left = 5000 - ((long)(now.tv_sec - t0.tv_sec) * 1000
+                                + (now.tv_nsec - t0.tv_nsec) / 1000000);
+            if (left <= 0) break; /* whole-line budget spent: drop it */
+            struct pollfd cp = { c, POLLIN, 0 };
+            if (poll(&cp, 1, (int)left) <= 0) break;
             ssize_t n = read(c, line + off, sizeof line - 1 - off);
             if (n <= 0) break;
             off += n;
@@ -504,7 +536,7 @@ int srv_start(Player *p) {
         lv_strlcpy(dir, pf, sizeof dir);
         if (lv_dirname(dir)) mkdir(dir, 0755);
         FILE *w = pf[0] ? fopen(pf, "w") : NULL;
-        if (w) { fputs(path, w); fclose(w); }
+        if (w) { fputs(path, w); fclose(w); lv_strlcpy(srv_ptr_pub, pf, sizeof srv_ptr_pub); }
         else fprintf(stderr, "levari: cannot publish socket path to %s; "
                              "CLI/MCP cannot reach this instance\n", pf);
     }
@@ -520,6 +552,9 @@ void srv_stop(void) {
     close(listen_fd);
     listen_fd = -1;
     unlink(srv_path);   /* the published path may differ from the default */
+    /* the pointer file is ours to remove too: a stale one makes every
+       client resolve a dead path before falling back */
+    if (srv_ptr_pub[0]) { unlink(srv_ptr_pub); srv_ptr_pub[0] = 0; }
 }
 
 #endif

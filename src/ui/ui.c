@@ -1021,12 +1021,14 @@ static void file_choose(const char *name) {
     Player *p = ui.pl;
     LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
     pthread_mutex_lock(&p->mtx);
-    pl_add(p->pl, full);
+    int added = pl_add(p->pl, full);
     lib_fill_playlist_ix(p->pl, &ix);
     int idx = p->pl->count - 1;
     pthread_mutex_unlock(&p->mtx);
     lib_index_free(&ix);
-    pl_post(p, CMD_PLAY, idx);
+    /* a failed add (OOM) would make count-1 the PREVIOUS track: never
+       post a play for a row that did not land */
+    if (added == 0) pl_post(p, CMD_PLAY, idx);
     file_close();
 }
 
@@ -1222,12 +1224,12 @@ static void file_field_enter(void) {
             Player *p = ui.pl;
             LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
             pthread_mutex_lock(&p->mtx);
-            pl_add(p->pl, ui.file_field);
+            int added = pl_add(p->pl, ui.file_field);
             lib_fill_playlist_ix(p->pl, &ix);
             int idx = p->pl->count - 1;
             pthread_mutex_unlock(&p->mtx);
             lib_index_free(&ix);
-            pl_post(p, CMD_PLAY, idx);
+            if (added == 0) pl_post(p, CMD_PLAY, idx); /* failed add: no wrong-track play */
             file_close();
             return;
         }
@@ -1403,7 +1405,7 @@ typedef struct { char (*dirs)[LV_MAX_PATH]; int n; int tags; } ScanArg;
 static int scan_thread(void *p) {
     ScanArg *a = p;
     int added = 0, seen = 0;
-    lib_scan_add(a->dirs, a->n, a->tags, &added, &seen);
+    lib_scan_add(a->dirs, a->n, a->tags, &added, &seen, NULL);
     ui.opt_scan_added = added;
     ui.opt_scan_seen = seen;
     SDL_AtomicSet(&ui.opt_scan_done, 1);
@@ -1791,8 +1793,10 @@ static void action(int id) {
         pthread_mutex_lock(&p->mtx);
         for (int i = 0; i < ix.n; i++) {
             const LibRow *r = &ix.rows[i];
-            pl_add_file(p->pl, r->path); /* index rows are always files: no stat */
-            if (!p->pl->count) continue;
+            /* index rows are always files: no stat. a failed add (OOM)
+               must NOT fall through: items[count-1] would be the PREVIOUS
+               track and the row's tags would overwrite its fields */
+            if (pl_add_file(p->pl, r->path) != 0) continue;
             Track *t = &p->pl->items[p->pl->count - 1];
             lv_strlcpy(t->tags.artist, r->artist, sizeof t->tags.artist);
             lv_strlcpy(t->tags.title, r->title, sizeof t->tags.title);

@@ -54,6 +54,7 @@ typedef struct {
     int added;
     int seen;
     int tags; /* 0 = index filenames only (skip tag + decoder reads) */
+    int toolong; /* paths dropped for length: reported, never silent */
 } ScanCtx;
 
 static int known_path(const ScanCtx *c, const char *p) {
@@ -132,9 +133,14 @@ int lib_idx_getline(FILE *f, char *line, size_t n) {
     return 1;
 }
 
-/* ensure the v2 format on disk: create a missing index with the header,
-   rewrite a legacy (headerless) index with escaped path fields. legacy
-   rows keep their tag fields verbatim; only the path field is escaped. */
+/* ensure the v2 format on disk: create a missing index with the header.
+   a HEADERLESS index is DISCARDED, not translated: 0.3.0 already wrote
+   escaped paths without ever writing a header, so legacy rows are
+   ambiguous (0.3.0: escaped; older: raw) and re-escaping them double-
+   escaped every backslash/tab/newline path on upgrade (C:\\Music became
+   C:\\\\Music) — lookups missed, rescans appended duplicates, play got
+   corrupt paths. the index is a cache: dropping it forces a re-scan that
+   rebuilds it correctly. */
 static void idx_migrate(const char *idx) {
     FILE *r = fopen(idx, "r");
     if (!r) {
@@ -143,36 +149,9 @@ static void idx_migrate(const char *idx) {
         return;
     }
     if (lib_idx_header(r)) { fclose(r); return; } /* already v2 */
-    char **lines = NULL;
-    int n = 0, cap = 0;
-    char line[2 * LV_MAX_PATH + 1024];
-    while (fgets(line, sizeof line, r)) {
-        char *tab = strchr(line, '\t');
-        char esc[2 * LV_MAX_PATH];
-        if (tab) { *tab = 0; esc_field(esc, sizeof esc, line); *tab = '\t'; }
-        else esc_field(esc, sizeof esc, line);
-        size_t el = strlen(esc) + (tab ? strlen(tab) : 0) + 1;
-        char *out = malloc(el);
-        if (!out) continue;
-        snprintf(out, el, "%s%s", esc, tab ? tab : "");
-        if (n == cap) {
-            cap = cap ? cap * 2 : 256;
-            char **t2 = realloc(lines, (size_t)cap * sizeof *lines);
-            if (!t2) { free(out); break; }
-            lines = t2;
-        }
-        lines[n++] = out;
-    }
     fclose(r);
-    char tmp[LV_MAX_PATH + 8];
-    snprintf(tmp, sizeof tmp, "%s.tmp", idx);
-    FILE *w = fopen(tmp, "w");
-    if (!w) { for (int i = 0; i < n; i++) free(lines[i]); free(lines); return; }
-    fputs(IDX_HEADER, w);
-    for (int i = 0; i < n; i++) { fputs(lines[i], w); free(lines[i]); }
-    free(lines);
-    fclose(w);
-    rename(tmp, idx);
+    FILE *w = fopen(idx, "w"); /* legacy: drop rows, keep only the format */
+    if (w) { fputs(IDX_HEADER, w); fclose(w); }
 }
 
 static void scan_dir(const char *dir, ScanCtx *c) {
@@ -188,13 +167,24 @@ static void scan_dir(const char *dir, ScanCtx *c) {
            symlink cycle in the tree recurses until the stack dies */
         if (lstat(full, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
+#ifdef _WIN32
+            /* MinGW maps lstat->stat (compat/win32.h), so junctions and
+               other reparse points look exactly like real directories in
+               st_mode; a junction pointing at an ancestor recurses until
+               the stack dies. Skipping reparse dirs is the Windows
+               counterpart of not descending into symlinks above. */
+            DWORD attr = GetFileAttributesA(full);
+            if (attr != INVALID_FILE_ATTRIBUTES &&
+                (attr & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+#endif
             scan_dir(full, c);
         } else if (is_audio(de->d_name)) {
             /* the index row stores the escaped path (up to 2x): a path
                near LV_MAX_PATH full of backslashes produces a row longer
                than the readers' line buffer, which then splits mid-row.
-               skip anything whose escaped form cannot fit one row */
-            if (strlen(full) > LV_MAX_PATH / 2) continue;
+               skip anything whose escaped form cannot fit one row, but
+               COUNT the drop: a silent skip hides whole subtrees. */
+            if (strlen(full) > LV_MAX_PATH / 2) { c->toolong++; continue; }
             c->seen++;
             if (known_path(c, full)) continue;
             Tags t;
@@ -244,8 +234,8 @@ static int cmd_scan(const char *dir, FILE *out) {
     if (!realpath(exp, abs)) { fprintf(out, "levari: no such dir: %s\n", dir); return 1; }
     char dirs[1][LV_MAX_PATH];
     lv_strlcpy(dirs[0], abs, LV_MAX_PATH);
-    int added = 0, seen = 0;
-    if (lib_scan_add(dirs, 1, 1, &added, &seen) != 0) {
+    int added = 0, seen = 0, skipped = 0;
+    if (lib_scan_add(dirs, 1, 1, &added, &seen, &skipped) != 0) {
         char idx[LV_MAX_PATH];
         lib_index_path(idx, sizeof idx);
         fprintf(out, "levari: cannot write %s\n", idx);
@@ -254,6 +244,9 @@ static int cmd_scan(const char *dir, FILE *out) {
     char idx[LV_MAX_PATH];
     lib_index_path(idx, sizeof idx);
     fprintf(out, "scanned %d files into %s\n", seen, idx);
+    if (skipped)
+        fprintf(out, "levari: %d paths longer than %d chars were not indexed\n",
+                skipped, LV_MAX_PATH / 2);
     return 0;
 }
 
@@ -261,7 +254,7 @@ static int cmpstr(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen) {
+int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen, int *skipped) {
     char idx[LV_MAX_PATH];
     lib_index_path(idx, sizeof idx);
     idx_migrate(idx);
@@ -302,7 +295,7 @@ int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *adde
         free(sorted);
         return 1;
     }
-    ScanCtx c = { f, sorted, sn, 0, 0, with_tags };
+    ScanCtx c = { f, sorted, sn, 0, 0, with_tags, 0 };
     for (int i = 0; i < n; i++) {
         char abs[LV_MAX_PATH], exp[LV_MAX_PATH];
         lv_expand_home(dirs[i], exp, sizeof exp);
@@ -313,6 +306,7 @@ int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *adde
     free(sorted);
     if (added) *added = c.added;
     if (seen) *seen = c.seen;
+    if (skipped) *skipped = c.toolong;
     return 0;
 }
 
@@ -462,8 +456,10 @@ void lib_fill_playlist_ix(Playlist *p, const LibIndex *ix) {
 
 void lib_fill_playlist(Playlist *p) {
     LibIndex ix = lib_index_load();
-    if (!ix.n) return;
-    lib_fill_playlist_ix(p, &ix);
+    /* free unconditionally: on an OOM row lib_index_load can return n==0
+       with rows already allocated (realloc before strdup) — the old early
+       return leaked it */
+    if (ix.n) lib_fill_playlist_ix(p, &ix);
     lib_index_free(&ix);
 }
 
