@@ -72,6 +72,9 @@ typedef struct {
     int file_n, file_scroll, file_sel, file_visible;
     int *file_view;      /* indices into file_names while the field filters;
                             file_sel/file_scroll index THIS, not file_names */
+    char *file_isdir;    /* parallel to file_names: dir flags captured while
+                            listing, so the draw loop never stats per row
+                            (NULL = not captured, fall back to stat) */
     int file_view_n;
     char file_field[LV_MAX_PATH]; /* editable twin of file_dir: path entry
                                      + live filter source (text after the
@@ -107,8 +110,8 @@ typedef struct {
     char title[512];
     int scroll_off;
     int marquee;            /* 1 when draw_main took the scrolling-title path */
-    int drag_gx, drag_gy;   /* global mouse pos at drag start */
-    int drag_wx, drag_wy;   /* window pos at drag start */
+    int drag_gx, drag_gy;   /* global mouse pos anchor, re-anchored each drag step */
+    int drag_wx, drag_wy;   /* window size at resize start (drag 8) */
     Uint32 focus_wid;       /* window id of the focused one of ours */
     int app_focused;        /* 1 while any of our windows holds WM focus */
     /* windows snapped beside the main one: follow it while it moves.
@@ -141,7 +144,11 @@ int ui_clip_paste(char *dst, size_t n) {
     while (*q && len + 4 < n) {
         unsigned cp;
         int k = font_utf8_next(q, &cp);
-        if (cp >= 0x20 && cp != 0x7F) {
+        /* same printable filter as the search query: DEL, C1 and CESU-8
+           surrogates must not reach path/query fields, the daemon or D-Bus */
+        if (cp >= 0x20 && cp != 0x7F &&
+            !(cp >= 0x80 && cp <= 0x9F) &&
+            !(cp >= 0xD800 && cp <= 0xDFFF)) {
             memcpy(dst + len, q, (size_t)k);
             len += (size_t)k;
             dst[len] = 0;
@@ -182,14 +189,21 @@ static void pl_dock_pos(int *x, int *y) {
 }
 
 static void drag_begin(SDL_Window *w) {
+    (void)w;
     SDL_GetGlobalMouseState(&ui.drag_gx, &ui.drag_gy);
-    SDL_GetWindowPosition(w, &ui.drag_wx, &ui.drag_wy);
 }
 
+/* Incremental drag: apply the mouse delta since the previous step to the
+   window's CURRENT position, not a cumulative delta from drag start. A WM
+   that clamps the window (dock/strut at a screen edge) then leaves no
+   phantom overshoot: pulling back moves the window immediately instead of
+   first retracing however far we pushed against the clamp. */
 static void drag_move(SDL_Window *w) {
-    int gx, gy;
+    int gx, gy, wx, wy;
     SDL_GetGlobalMouseState(&gx, &gy);
-    SDL_SetWindowPosition(w, ui.drag_wx + gx - ui.drag_gx, ui.drag_wy + gy - ui.drag_gy);
+    SDL_GetWindowPosition(w, &wx, &wy);
+    SDL_SetWindowPosition(w, wx + gx - ui.drag_gx, wy + gy - ui.drag_gy);
+    ui.drag_gx = gx; ui.drag_gy = gy;
 }
 
 static int snap_idx(SDL_Window *w) {
@@ -221,11 +235,13 @@ void ui_snap_next_to_main(SDL_Window *w, int *x, int *y) {
 }
 
 static void drag_move_snap(SDL_Window *w) {
-    int gx, gy;
+    int gx, gy, x, y;
     SDL_GetGlobalMouseState(&gx, &gy);
-    int x = ui.drag_wx + gx - ui.drag_gx, y = ui.drag_wy + gy - ui.drag_gy;
+    SDL_GetWindowPosition(w, &x, &y);
+    x += gx - ui.drag_gx; y += gy - ui.drag_gy;
     ui_snap_next_to_main(w, &x, &y);
     SDL_SetWindowPosition(w, x, y);
+    ui.drag_gx = gx; ui.drag_gy = gy;
 }
 
 /* playlist drag: live-snap flush under the main window's bottom edge,
@@ -234,7 +250,9 @@ static void drag_move_snap(SDL_Window *w) {
 static void drag_move_pl(void) {
     int gx, gy;
     SDL_GetGlobalMouseState(&gx, &gy);
-    int x = ui.drag_wx + gx - ui.drag_gx, y = ui.drag_wy + gy - ui.drag_gy;
+    int x, y;
+    SDL_GetWindowPosition(ui.wpl, &x, &y);
+    x += gx - ui.drag_gx; y += gy - ui.drag_gy;
     int mx, my, mw, mh;
     SDL_GetWindowPosition(ui.wmain, &mx, &my);
     SDL_GetWindowSize(ui.wmain, &mw, &mh);
@@ -243,6 +261,7 @@ static void drag_move_pl(void) {
     if (snapped && abs(x - mx) <= DOCK_SNAP) x = mx;
     ui.pl_docked = snapped;
     SDL_SetWindowPosition(ui.wpl, x, y);
+    ui.drag_gx = gx; ui.drag_gy = gy;
 }
 
 static Uint32 col(SDL_Surface *s, int r, int g, int b) { return SDL_MapRGB(s->format, r, g, b); }
@@ -649,6 +668,9 @@ static void refresh_title(void) {
         }
     }
     pthread_mutex_unlock(&p->mtx);
+    /* the "artist - N - title" snprintf above can cut a multi-byte tag char
+       at the 511-byte mark */
+    lv_utf8_trim(buf);
     if (strcmp(buf, ui.title) != 0) {
         lv_strlcpy(ui.title, buf, sizeof ui.title);
         ui.scroll_off = 0;
@@ -745,13 +767,18 @@ static void file_build_view(void) {
 static void file_list(void) {
     for (int i = 0; i < ui.file_n; i++) free(ui.file_names[i]);
     free(ui.file_names);
-    ui.file_names = NULL; ui.file_n = 0;
+    free(ui.file_isdir);
+    ui.file_names = NULL; ui.file_isdir = NULL; ui.file_n = 0;
 #ifdef _WIN32
     if (ui.file_pseudo) {
         /* pseudo-root above the drive roots: one entry per logical drive,
            no ".." (nothing above COMPUTER). GetLogicalDrives only —
            GetVolumeInformationW blocks on empty/sleepy drives. */
         ui.file_n = drives_from_mask(GetLogicalDrives(), &ui.file_names);
+        if (ui.file_n > 0) {
+            ui.file_isdir = malloc((size_t)ui.file_n);
+            if (ui.file_isdir) memset(ui.file_isdir, 1, (size_t)ui.file_n);
+        }
     } else
 #endif
     {
@@ -771,6 +798,7 @@ static void file_list(void) {
         struct stat st;
         if (stat(full, &st) != 0) continue;
         char *dup = strdup(de->d_name);
+        if (!dup) continue; /* a NULL entry would crash fcmp's strcmp */
         if (S_ISDIR(st.st_mode)) {
             if (nd == cd) {
                 cd = cd ? cd * 2 : 32;
@@ -810,9 +838,24 @@ static void file_list(void) {
         return;
     }
     int k = 0;
-    if (!root) ui.file_names[k++] = strdup("..");
-    for (int i = 0; i < nd; i++) ui.file_names[k++] = dirs[i];
-    for (int i = 0; i < nf; i++) ui.file_names[k++] = files[i];
+    /* capture dir flags while listing: the draw loop used to stat every
+       visible row on every repaint (brutal on network shares) */
+    ui.file_isdir = ui.file_n > 0 ? malloc((size_t)ui.file_n) : NULL;
+    if (!root) {
+        char *up = strdup("..");
+        if (up) {
+            ui.file_names[k++] = up;
+            if (ui.file_isdir) ui.file_isdir[k - 1] = 1;
+        }
+    }
+    for (int i = 0; i < nd; i++) {
+        ui.file_names[k++] = dirs[i];
+        if (ui.file_isdir) ui.file_isdir[k - 1] = 1;
+    }
+    for (int i = 0; i < nf; i++) {
+        ui.file_names[k++] = files[i];
+        if (ui.file_isdir) ui.file_isdir[k - 1] = 0;
+    }
     free(dirs); free(files);
     }
     ui.file_scroll = 0; ui.file_sel = -1;
@@ -921,12 +964,14 @@ static void file_open(void) {
 
 static void file_adddir(void) {
     Player *p = ui.pl;
+    LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
     pthread_mutex_lock(&p->mtx);
     int old = p->pl->count;
     pl_add(p->pl, ui.file_dir);
-    lib_fill_playlist(p->pl);
+    lib_fill_playlist_ix(p->pl, &ix);
     int added = p->pl->count - old;
     pthread_mutex_unlock(&p->mtx);
+    lib_index_free(&ix);
     if (added > 0) pl_post(p, CMD_PLAY, old);
     file_close();
 }
@@ -974,11 +1019,13 @@ static void file_choose(const char *name) {
         return;
     }
     Player *p = ui.pl;
+    LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
     pthread_mutex_lock(&p->mtx);
     pl_add(p->pl, full);
-    lib_fill_playlist(p->pl);
+    lib_fill_playlist_ix(p->pl, &ix);
     int idx = p->pl->count - 1;
     pthread_mutex_unlock(&p->mtx);
+    lib_index_free(&ix);
     pl_post(p, CMD_PLAY, idx);
     file_close();
 }
@@ -1066,11 +1113,16 @@ static void draw_file(void) {
         int vi = ui.file_scroll + i;
         if (vi >= ui.file_view_n) break;
         char *name = ui.file_names[ui.file_view[vi]];
-        char full[LV_MAX_PATH];
-        snprintf(full, sizeof full, "%s/%s", ui.file_dir, name);
-        struct stat st;
-        int isdir = ui.file_pseudo || !strcmp(name, "..") ||
-                    (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+        int isdir = ui.file_pseudo || !strcmp(name, "..");
+        if (!isdir && ui.file_isdir)
+            isdir = ui.file_isdir[ui.file_view[vi]];
+        if (!isdir && !ui.file_isdir) {
+            /* flags not captured (OOM while listing): last-resort stat */
+            char full[LV_MAX_PATH];
+            snprintf(full, sizeof full, "%s/%s", ui.file_dir, name);
+            struct stat st;
+            isdir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+        }
         char line[LV_MAX_PATH];
         /* pseudo-root entries are drive roots, already ending in "\" */
         snprintf(line, sizeof line, "%s%s", name,
@@ -1168,11 +1220,13 @@ static void file_field_enter(void) {
         base = base ? base + 1 : ui.file_field;
         if (audio_name(base)) {
             Player *p = ui.pl;
+            LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
             pthread_mutex_lock(&p->mtx);
             pl_add(p->pl, ui.file_field);
-            lib_fill_playlist(p->pl);
+            lib_fill_playlist_ix(p->pl, &ix);
             int idx = p->pl->count - 1;
             pthread_mutex_unlock(&p->mtx);
+            lib_index_free(&ix);
             pl_post(p, CMD_PLAY, idx);
             file_close();
             return;
@@ -1312,6 +1366,9 @@ static void opt_close(void) {
 }
 
 static void opt_save(void) {
+    /* field writes under cfg lock: a concurrent daemon shuffle toggle
+       must not interleave and let cfg_save persist a mixed snapshot */
+    cfg_lock();
     cfg.lib_dir_n = 0;
     char copy[LV_MAX_PATH];
     lv_strlcpy(copy, ui.opt_field[OPTF_LIBDIRS], sizeof copy);
@@ -1337,6 +1394,7 @@ static void opt_save(void) {
     ui.pl->fade_stop = ui.opt_fade; /* apply without waiting for a restart */
     cfg.allow_large = ui.opt_large; /* decode.c reads cfg live: no restart */
     cfg.ui_always10 = ui.opt_f10;   /* scheduler reads cfg live: no restart */
+    cfg_unlock();
     cfg_save();
 }
 
@@ -1658,26 +1716,10 @@ static void opt_text(const char *text) {
     ui.opt_selall = tf.selall;
 }
 
-static void pl_add_lib_cb(const LibEntry *e, void *ud) {
-    Playlist *pl = ud;
-    pl_add_file(pl, e->path); /* index rows are always files: no stat needed */
-    if (!pl->count) return;
-    Track *t = &pl->items[pl->count - 1];
-    lv_strlcpy(t->tags.artist, e->artist, sizeof t->tags.artist);
-    lv_strlcpy(t->tags.title, e->title, sizeof t->tags.title);
-    lv_strlcpy(t->tags.album, e->album, sizeof t->tags.album);
-    t->duration = e->duration;
-    t->tags.track = e->track;
-    t->notag = e->notag;
-}
-
 /* when the options window's SHUF startup toggle is on, keep the shuffle
    state in the config file so it survives sessions */
 static void shuffle_persist(void) {
-    if (cfg.shuffle_remember > 0) {
-        cfg.shuffle = ui.pl->shuffle;
-        cfg_save();
-    }
+    if (cfg.shuffle_remember > 0) cfg_set_shuffle(ui.pl->shuffle);
 }
 
 static void action(int id) {
@@ -1744,11 +1786,25 @@ static void action(int id) {
         ui.pl_visible = 0;
         SDL_HideWindow(ui.wpl);
         break;
-    case PB_LIB:
+    case PB_LIB: {
+        LibIndex ix = lib_index_load(); /* whole-index read off the player lock */
         pthread_mutex_lock(&p->mtx);
-        lib_foreach_entry(pl_add_lib_cb, p->pl);
+        for (int i = 0; i < ix.n; i++) {
+            const LibRow *r = &ix.rows[i];
+            pl_add_file(p->pl, r->path); /* index rows are always files: no stat */
+            if (!p->pl->count) continue;
+            Track *t = &p->pl->items[p->pl->count - 1];
+            lv_strlcpy(t->tags.artist, r->artist, sizeof t->tags.artist);
+            lv_strlcpy(t->tags.title, r->title, sizeof t->tags.title);
+            lv_strlcpy(t->tags.album, r->album, sizeof t->tags.album);
+            t->duration = r->dur;
+            t->tags.track = r->track;
+            t->notag = r->notag;
+        }
         pthread_mutex_unlock(&p->mtx);
+        lib_index_free(&ix);
         break;
+    }
     case B_OPEN: case PB_ADD: file_open(); break;
     case B_SEARCH:
         if (search_is_open()) search_close();

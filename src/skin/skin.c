@@ -267,6 +267,14 @@ int font_utf8_next(const char *s, unsigned *cp) {
         *cp = ((unsigned)(c & 0xF) << 12) | ((unsigned)(s[1] & 0x3F) << 6) | (unsigned)(s[2] & 0x3F);
         return 3;
     }
+    /* 4-byte (emoji, astral planes): without this branch the caret and
+       Delete stepped one byte into the sequence and shredded it */
+    if ((c & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80
+        && (s[3] & 0xC0) == 0x80) {
+        *cp = ((unsigned)(c & 0x7) << 18) | ((unsigned)(s[1] & 0x3F) << 12)
+            | ((unsigned)(s[2] & 0x3F) << 6) | (unsigned)(s[3] & 0x3F);
+        return 4;
+    }
     *cp = '?';
     return 1;
 }

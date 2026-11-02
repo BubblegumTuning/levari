@@ -408,6 +408,11 @@ static void ff_copy(AVFrame *fr, int from, int n, int ch, int16_t *out) {
     int bps = p_av_get_bytes_per_sample(fmt);
     for (int r = 0; r < n; r++)
         for (int c = 0; c < ch; c++) {
+            /* ch comes from the codec context at open time; a decoder that
+               shrinks its channel layout mid-stream leaves data[c] NULL for
+               the extra channels: keep those samples silent instead of
+               dereferencing NULL */
+            if (!fr->data[planar ? c : 0]) continue;
             const unsigned char *p = planar
                 ? fr->data[c] + (size_t)(from + r) * (size_t)bps
                 : fr->data[0] + ((size_t)(from + r) * (size_t)ch + (size_t)c) * (size_t)bps;
@@ -584,7 +589,15 @@ Decoder *dec_open(const char *path) {
         if (mp3dec_ex_open(&d->u.mp3, path, MP3D_SEEK_TO_SAMPLE) != 0) goto fail;
         d->ch = d->u.mp3.info.channels;
         d->rate = d->u.mp3.info.hz;
-        d->total = d->u.mp3.vbr_tag_found ? (long long)d->u.mp3.samples / d->ch : 0;
+        /* Without MP3D_DO_NOT_SCAN the open scan-counts EXACT samples over
+           the whole stream even when no Xing/VBRI tag exists. The old
+           vbr_tag_found gate discarded that count for tag-less VBR files
+           and fell to the first-frame CBR estimate — a stream opening on
+           an 8 kbps silence frame inflated length ~9x. With no Xing there
+           is no delay/padding subtraction, and the decoder emits exactly
+           the samples it counts, so trust samples; keep the size-based
+           estimate only when the scan produced nothing. */
+        d->total = (long long)d->u.mp3.samples / d->ch;
         if (d->total == 0) {
             int kbps = d->u.mp3.info.bitrate_kbps;
             long long fs = 0;

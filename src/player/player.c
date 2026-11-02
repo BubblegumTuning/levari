@@ -5,13 +5,27 @@
 
 #define CHUNK 2048
 
+/* shuffle picker: rand() shared global state across threads (we call it
+   under p->mtx, but rand's own contract is still dicey) and % biases
+   toward small indexes. xorshift64+ seeded once, Lemire's multiply-shift
+   reduction keeps it unbiased without a modulo */
+static uint64_t rng_state;
+
+static int rng_below(int n) { /* caller holds p->mtx */
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    uint32_t r = (uint32_t)(rng_state >> 32);
+    return (int)(((uint64_t)r * (uint32_t)n) >> 32);
+}
+
 static int pick_next(Player *p, int cur) {
     pthread_mutex_lock(&p->mtx);
     int n = p->pl->count;
     int r = -1;
     if (n > 0) {
         if (p->shuffle && n > 1) {
-            do { r = rand() % n; } while (r == cur);
+            do { r = rng_below(n); } while (r == cur);
         } else if (cur + 1 < n) r = cur + 1;
         else if (p->repeat) r = 0;
     }
@@ -289,7 +303,8 @@ void pl_player_init(Player *p, Playlist *pl) {
     pthread_mutex_init(&p->mtx, NULL);
     pthread_mutex_init(&p->viz_mtx, NULL);
     eq_init(&p->eq, 44100);
-    srand((unsigned)time(NULL));
+    rng_state = (uint64_t)time(NULL) ^ ((uint64_t)(unsigned)getpid() << 32) ^ 0x9E3779B97F4A7C15ull;
+    if (!rng_state) rng_state = 0xA5A5A5A5u;
 }
 
 void pl_player_start(Player *p) {
@@ -309,15 +324,20 @@ void pl_post(Player *p, int cmd, int arg) {
 }
 
 void pl_post_seek(Player *p, double frac) {
-    long long base = p->track_start;
-    long long endf = p->track_end > 0 ? p->track_end : p->total_frames;
-    if (endf <= base) return;
     if (frac < 0) frac = 0;
     if (frac > 1) frac = 1;
-    long long frame = base + (long long)(frac * (double)(endf - base));
+    /* the scalars are read under p->mtx: during a track load the player
+       thread updates them under that lock, and a bare read could mix the
+       old track's bounds with the new track's rate (atomics fix tearing,
+       not consistency across fields) */
     pthread_mutex_lock(&p->mtx);
-    p->seek_frame = frame;
-    p->cmd = CMD_SEEK;
+    long long base = p->track_start;
+    long long endf = p->track_end > 0 ? p->track_end : p->total_frames;
+    if (endf > base) {
+        long long frame = base + (long long)(frac * (double)(endf - base));
+        p->seek_frame = frame;
+        p->cmd = CMD_SEEK;
+    }
     pthread_mutex_unlock(&p->mtx);
 }
 

@@ -70,7 +70,24 @@ static int known_path(const ScanCtx *c, const char *p) {
 
 /* the index is tab-separated with one row per line: a path containing a
    tab or newline would splice rows together. escape \t \n \\ in the path
-   field (tag fields are already control-char-free from tag.c) */
+   field (tag fields are already control-char-free from tag.c).
+   the first line "#levari-index v2" marks the escaped format: headerless
+   (pre-0.3.0) indexes store RAW paths and must never be unescaped — a
+   Windows path C:\Users\me\new would lose backslashes (\n -> newline).
+   lib_scan_add migrates a legacy index to v2 in place. */
+#define IDX_HEADER "#levari-index v2\n"
+
+int lib_idx_header(FILE *f) {
+    /* consume the v2 header line if present; leave the stream at row 1 */
+    long start = ftell(f);
+    char probe[32];
+    if (fgets(probe, sizeof probe, f)) {
+        if (!strncmp(probe, "#levari-index", 13)) return 1;
+        fseek(f, start, SEEK_SET);
+    }
+    return 0;
+}
+
 static void esc_field(char *dst, size_t dn, const char *src) {
     size_t j = 0;
     for (const char *p = src; *p && j + 2 < dn; p++) {
@@ -81,15 +98,81 @@ static void esc_field(char *dst, size_t dn, const char *src) {
     }
     dst[j] = 0;
 }
-static void unesc_field(char *dst, const char *src, size_t sn) {
+/* dn is the dst capacity: the unescape only shrinks (every escape is a
+   2-byte pair) but callers hand in buffers sized by the line reader, not
+   by a contract — take the bound like esc_field does. In-place calls pass
+   the string length as dn: output can never exceed input there. */
+static void unesc_field(char *dst, size_t dn, const char *src, size_t sn) {
+    if (dn == 0) return;
     char *d = dst;
-    for (const char *p = src, *e = src + sn; p < e; p++) {
+    const char *de = dst + dn - 1;
+    for (const char *p = src, *e = src + sn; p < e && d < de; p++) {
         if (*p == '\\' && p + 1 < e) {
             p++;
             *d++ = *p == 't' ? '\t' : *p == 'n' ? '\n' : *p;
         } else *d++ = *p;
     }
     *d = 0;
+}
+
+/* the in-place string carries its own NUL, so the buffer is len+1 bytes */
+void lib_unesc_path(char *p) { size_t l = strlen(p); unesc_field(p, l + 1, p, l); }
+
+/* fgets splits an index row longer than the line buffer: the tail half
+   would re-parse as a garbage row and self-corrupt the index, so drain
+   to EOL and report the row as truncated (callers skip it). returns 1
+   when a line was read, 2 when that line was cut mid-row. */
+int lib_idx_getline(FILE *f, char *line, size_t n) {
+    if (!fgets(line, (int)n, f)) return 0;
+    if (!strchr(line, '\n') && !feof(f)) {
+        int c;
+        while ((c = fgetc(f)) != '\n' && c != EOF) {}
+        return 2;
+    }
+    return 1;
+}
+
+/* ensure the v2 format on disk: create a missing index with the header,
+   rewrite a legacy (headerless) index with escaped path fields. legacy
+   rows keep their tag fields verbatim; only the path field is escaped. */
+static void idx_migrate(const char *idx) {
+    FILE *r = fopen(idx, "r");
+    if (!r) {
+        FILE *w = fopen(idx, "w");
+        if (w) { fputs(IDX_HEADER, w); fclose(w); }
+        return;
+    }
+    if (lib_idx_header(r)) { fclose(r); return; } /* already v2 */
+    char **lines = NULL;
+    int n = 0, cap = 0;
+    char line[2 * LV_MAX_PATH + 1024];
+    while (fgets(line, sizeof line, r)) {
+        char *tab = strchr(line, '\t');
+        char esc[2 * LV_MAX_PATH];
+        if (tab) { *tab = 0; esc_field(esc, sizeof esc, line); *tab = '\t'; }
+        else esc_field(esc, sizeof esc, line);
+        size_t el = strlen(esc) + (tab ? strlen(tab) : 0) + 1;
+        char *out = malloc(el);
+        if (!out) continue;
+        snprintf(out, el, "%s%s", esc, tab ? tab : "");
+        if (n == cap) {
+            cap = cap ? cap * 2 : 256;
+            char **t2 = realloc(lines, (size_t)cap * sizeof *lines);
+            if (!t2) { free(out); break; }
+            lines = t2;
+        }
+        lines[n++] = out;
+    }
+    fclose(r);
+    char tmp[LV_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", idx);
+    FILE *w = fopen(tmp, "w");
+    if (!w) { for (int i = 0; i < n; i++) free(lines[i]); free(lines); return; }
+    fputs(IDX_HEADER, w);
+    for (int i = 0; i < n; i++) { fputs(lines[i], w); free(lines[i]); }
+    free(lines);
+    fclose(w);
+    rename(tmp, idx);
 }
 
 static void scan_dir(const char *dir, ScanCtx *c) {
@@ -107,6 +190,11 @@ static void scan_dir(const char *dir, ScanCtx *c) {
         if (S_ISDIR(st.st_mode)) {
             scan_dir(full, c);
         } else if (is_audio(de->d_name)) {
+            /* the index row stores the escaped path (up to 2x): a path
+               near LV_MAX_PATH full of backslashes produces a row longer
+               than the readers' line buffer, which then splits mid-row.
+               skip anything whose escaped form cannot fit one row */
+            if (strlen(full) > LV_MAX_PATH / 2) continue;
             c->seen++;
             if (known_path(c, full)) continue;
             Tags t;
@@ -176,6 +264,7 @@ static int cmpstr(const void *a, const void *b) {
 int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen) {
     char idx[LV_MAX_PATH];
     lib_index_path(idx, sizeof idx);
+    idx_migrate(idx);
     char **sorted = NULL;
     int sn = 0, cap = 0;
     FILE *r = fopen(idx, "r");
@@ -183,21 +272,26 @@ int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *adde
         /* rows can reach 2*LV_MAX_PATH (escaped path) + tags + numbers:
            8192 used to split long rows mid-line and corrupt the reload */
         char line[2 * LV_MAX_PATH + 1024];
-        while (fgets(line, sizeof line, r)) {
+        lib_idx_header(r); /* migrate() guarantees the header is present */
+        int gr;
+        while ((gr = lib_idx_getline(r, line, sizeof line)) != 0) {
+            if (gr == 2) continue; /* over-long row: already drained */
             char *tab = strchr(line, '\t');
             if (tab) *tab = 0;
             char *nl = strchr(line, '\n');
             if (nl) *nl = 0;
             if (!line[0]) continue;
-            unesc_field(line, line, strlen(line)); /* in-place: only shrinks */
-            if (!line[0]) continue;
+            size_t sl = strlen(line);
+            unesc_field(line, sl + 1, line, sl); /* in-place: only shrinks */
             if (sn == cap) {
                 cap = cap ? cap * 2 : 256;
                 char **s2 = realloc(sorted, (size_t)cap * sizeof *sorted);
                 if (!s2) break;
                 sorted = s2;
             }
-            sorted[sn++] = strdup(line);
+            char *dup = strdup(line);
+            if (!dup) break;
+            sorted[sn++] = dup;
         }
         fclose(r);
         if (sn) qsort(sorted, (size_t)sn, sizeof *sorted, cmpstr);
@@ -228,13 +322,16 @@ int lib_foreach_entry(void (*fn)(const LibEntry *e, void *ud), void *ud) {
     FILE *f = fopen(idx, "r");
     if (!f) return -1;
     char line[2 * LV_MAX_PATH + 1024];
+    int v2 = lib_idx_header(f);
     int n = 0;
-    while (fgets(line, sizeof line, f)) {
+    int gr;
+    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
+        if (gr == 2) continue; /* over-long row: already drained */
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         char *p1 = line;
         char *p2 = strchr(p1, '\t'); if (!p2) continue; *p2++ = 0;
-        unesc_field(p1, p1, strlen(p1)); /* in-place: only shrinks */
+        if (v2) { size_t sl = strlen(p1); unesc_field(p1, sl + 1, p1, sl); }
         char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
         char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
         char *p5 = strchr(p4, '\t');
@@ -261,27 +358,28 @@ int lib_foreach_entry(void (*fn)(const LibEntry *e, void *ud), void *ud) {
 /* one pass over the index, sorted for binary search: fills tags and
    duration for playlist items whose title is still empty. exact path
    match only (index paths are realpath'd at scan time); anything not
-   found falls through to the file-based pl_scan_tags. the caller must
-   hold the playlist lock. */
-typedef struct { char *path, *artist, *title, *album; int dur, track, notag; } IdxRow;
-
+   found falls through to the file-based pl_scan_tags. */
 static int cmprow(const void *a, const void *b) {
-    return strcmp(((const IdxRow *)a)->path, ((const IdxRow *)b)->path);
+    return strcmp(((const LibRow *)a)->path, ((const LibRow *)b)->path);
 }
 
-void lib_fill_playlist(Playlist *p) {
+LibIndex lib_index_load(void) {
+    LibIndex ix = { NULL, 0 };
     char idx[LV_MAX_PATH];
     lib_index_path(idx, sizeof idx);
     FILE *r = fopen(idx, "r");
-    if (!r) return;
-    IdxRow *rows = NULL;
-    int rn = 0, cap = 0;
-    char line[8192];
-    while (fgets(line, sizeof line, r)) {
+    if (!r) return ix;
+    int cap = 0;
+    char line[2 * LV_MAX_PATH + 1024];
+    int v2 = lib_idx_header(r);
+    int gr;
+    while ((gr = lib_idx_getline(r, line, sizeof line)) != 0) {
+        if (gr == 2) continue; /* over-long row: already drained */
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         char *p1 = line;
         char *p2 = strchr(p1, '\t'); if (!p2) continue; *p2++ = 0;
+        if (v2) { size_t sl = strlen(p1); unesc_field(p1, sl + 1, p1, sl); } /* match real paths */
         char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
         char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
         char *p5 = strchr(p4, '\t');
@@ -298,44 +396,75 @@ void lib_fill_playlist(Playlist *p) {
             } else dur = atoi(p5);
         }
         if (!p1[0]) continue;
-        if (rn == cap) {
+        if (ix.n == cap) {
             cap = cap ? cap * 2 : 256;
-            IdxRow *x = realloc(rows, (size_t)cap * sizeof *rows);
+            LibRow *x = realloc(ix.rows, (size_t)cap * sizeof *ix.rows);
             if (!x) break;
-            rows = x;
+            ix.rows = x;
         }
-        rows[rn].path = strdup(p1);
-        rows[rn].artist = strdup(p2);
-        rows[rn].title = strdup(p3);
-        rows[rn].album = strdup(p4);
-        rows[rn].dur = dur;
-        rows[rn].track = track;
-        rows[rn].notag = notag;
-        rn++;
+        /* an unchecked strdup leaves a NULL path/artist in the row:
+           cmprow's strcmp and the hit->artist[0] test below deref it */
+        char *rp = strdup(p1), *ra = strdup(p2);
+        char *rt = strdup(p3), *ral = strdup(p4);
+        if (!rp || !ra || !rt || !ral) {
+            free(rp); free(ra); free(rt); free(ral);
+            break;
+        }
+        LibRow *row = &ix.rows[ix.n++];
+        row->path = rp; row->artist = ra; row->title = rt; row->album = ral;
+        row->dur = dur; row->track = track; row->notag = notag;
     }
     fclose(r);
-    if (!rn) { free(rows); return; }
-    qsort(rows, (size_t)rn, sizeof *rows, cmprow);
+    if (ix.n) qsort(ix.rows, (size_t)ix.n, sizeof *ix.rows, cmprow);
+    return ix;
+}
+
+void lib_index_free(LibIndex *ix) {
+    for (int i = 0; i < ix->n; i++) {
+        free(ix->rows[i].path);
+        free(ix->rows[i].artist);
+        free(ix->rows[i].title);
+        free(ix->rows[i].album);
+    }
+    free(ix->rows);
+    ix->rows = NULL;
+    ix->n = 0;
+}
+
+/* index rows are only trusted as far as our own writer: a hand-edited or
+   tampered index can carry control bytes and broken utf-8 that would
+   otherwise flow into Track.tags and from there to MPRIS, the daemon
+   status/pl output and m3u saves. tag.c guarantees cleanliness only for
+   values it wrote, so sanitize on *read*. */
+static void idx_copy(char *dst, size_t dn, const char *src) {
+    size_t j = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && j + 1 < dn; p++)
+        if (*p >= 0x20 && *p != 0x7f) dst[j++] = (char)*p;
+    dst[j] = 0;
+    lv_utf8_trim(dst);
+}
+
+void lib_fill_playlist_ix(Playlist *p, const LibIndex *ix) {
     for (int i = 0; i < p->count; i++) {
         Track *t = &p->items[i];
         if (t->tags.title[0]) continue;
-        IdxRow key = { t->path, NULL, NULL, NULL, 0, 0, 0 };
-        IdxRow *hit = bsearch(&key, rows, (size_t)rn, sizeof *rows, cmprow);
+        LibRow key = { t->path, NULL, NULL, NULL, 0, 0, 0 };
+        LibRow *hit = bsearch(&key, ix->rows, (size_t)ix->n, sizeof *ix->rows, cmprow);
         if (!hit) continue;
-        if (hit->artist[0]) lv_strlcpy(t->tags.artist, hit->artist, sizeof t->tags.artist);
-        if (hit->title[0]) lv_strlcpy(t->tags.title, hit->title, sizeof t->tags.title);
-        if (hit->album[0]) lv_strlcpy(t->tags.album, hit->album, sizeof t->tags.album);
+        if (hit->artist[0]) idx_copy(t->tags.artist, sizeof t->tags.artist, hit->artist);
+        if (hit->title[0]) idx_copy(t->tags.title, sizeof t->tags.title, hit->title);
+        if (hit->album[0]) idx_copy(t->tags.album, sizeof t->tags.album, hit->album);
         if (hit->track) t->tags.track = hit->track;
         if (hit->dur) t->duration = hit->dur;
         t->notag = hit->notag;
     }
-    for (int i = 0; i < rn; i++) {
-        free(rows[i].path);
-        free(rows[i].artist);
-        free(rows[i].title);
-        free(rows[i].album);
-    }
-    free(rows);
+}
+
+void lib_fill_playlist(Playlist *p) {
+    LibIndex ix = lib_index_load();
+    if (!ix.n) return;
+    lib_fill_playlist_ix(p, &ix);
+    lib_index_free(&ix);
 }
 
 static int cmd_list(const char *filter, FILE *out) {
@@ -343,11 +472,23 @@ static int cmd_list(const char *filter, FILE *out) {
     lib_index_path(idx, sizeof idx);
     FILE *f = fopen(idx, "r");
     if (!f) { fprintf(out, "(library empty)\n"); return 0; }
-    char line[4096];
+    char line[2 * LV_MAX_PATH + 1024];
+    int v2 = lib_idx_header(f);
     int shown = 0;
-    while (fgets(line, sizeof line, f)) {
+    int gr;
+    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
+        if (gr == 2) continue; /* over-long row: already drained */
         if (filter && !contains_ci(line, filter)) continue;
-        fputs(line, out);
+        /* display the real path, not the escaped field */
+        char *tab = strchr(line, '\t');
+        if (v2 && tab) {
+            char path[2 * LV_MAX_PATH];
+            unesc_field(path, sizeof path, line, (size_t)(tab - line));
+            /* two fputs: snprintf'ing into line while tab points inside
+               it overlaps in/out and is formally undefined */
+            fputs(path, out);
+            fputs(tab, out);
+        } else fputs(line, out);
         shown++;
     }
     fclose(f);
@@ -360,18 +501,22 @@ static int cmd_play(const char *query, FILE *out) {
     lib_index_path(idx, sizeof idx);
     FILE *f = fopen(idx, "r");
     if (!f) { fprintf(out, "levari: library empty\n"); return 1; }
-    char line[4096];
+    char line[2 * LV_MAX_PATH + 1024];
+    int v2 = lib_idx_header(f);
     char cmd[8192] = "play";
     int n = 0;
-    while (fgets(line, sizeof line, f)) {
+    int gr;
+    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
+        if (gr == 2) continue; /* over-long row: already drained */
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         if (query && *query && !contains_ci(line, query)) continue;
         char *tab = strchr(line, '\t');
         if (tab) *tab = 0;
-        if (strlen(cmd) + strlen(line) + 2 > sizeof cmd) break;
-        strcat(cmd, " ");
-        strcat(cmd, line);
+        if (v2) { size_t sl = strlen(line); unesc_field(line, sl + 1, line, sl); } /* queue real paths */
+        /* cli_append_arg quotes (and escapes embedded quotes in) paths
+           that need it: the play tokenizer splits bare args on spaces */
+        if (cli_append_arg(cmd, sizeof cmd - 1, line) != 0) break;
         n++;
     }
     fclose(f);

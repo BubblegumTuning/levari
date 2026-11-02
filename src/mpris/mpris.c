@@ -137,7 +137,31 @@ static void uri_unescape(const char *in, char *out, size_t n) {
 }
 
 /* variant appenders */
+/* libdbus validates utf-8 on every string append and fails the append:
+   with unchecked returns a tampered tag or a path with control bytes
+   silently drops fields mid-dict. validate up front and skip the field
+   instead (paths go through file_uri, which is pure ASCII already) */
+static int utf8_ok(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned c = *p++;
+        if (c < 0x80) continue;
+        int n; unsigned min;
+        if (c >= 0xC2 && c <= 0xDF) { n = 1; min = 0x80; }
+        else if (c >= 0xE0 && c <= 0xEF) { n = 2; min = c == 0xE0 ? 0xA0 : 0x80; }
+        else if (c >= 0xF0 && c <= 0xF4) { n = 3; min = c == 0xF0 ? 0x90 : 0x80; }
+        else return 0;
+        if (c == 0xED && p[0] >= 0xA0) return 0; /* surrogates */
+        for (int i = 0; i < n; i++) {
+            unsigned cc = *p;
+            if (!cc || cc < (i == 0 ? min : 0x80) || cc > 0xBF) return 0;
+            p++;
+        }
+    }
+    return 1;
+}
 static void v_str(DBusMessageIter *it, const char *s) {
+    if (!utf8_ok(s)) return;
     DBusMessageIter v;
     dbus_message_iter_open_container(it, DBUS_TYPE_VARIANT, "s", &v);
     dbus_message_iter_append_basic(&v, DBUS_TYPE_STRING, &s);
@@ -180,13 +204,16 @@ static void v_strarr(DBusMessageIter *it, const char **arr, int n) {
     DBusMessageIter v, a;
     dbus_message_iter_open_container(it, DBUS_TYPE_VARIANT, "as", &v);
     dbus_message_iter_open_container(&v, DBUS_TYPE_ARRAY, "s", &a);
-    for (int i = 0; i < n; i++) dbus_message_iter_append_basic(&a, DBUS_TYPE_STRING, &arr[i]);
+    for (int i = 0; i < n; i++)
+        if (utf8_ok(arr[i]))
+            dbus_message_iter_append_basic(&a, DBUS_TYPE_STRING, &arr[i]);
     dbus_message_iter_close_container(&v, &a);
     dbus_message_iter_close_container(it, &v);
 }
 
 /* dict-entry appenders for a{sv} */
 static void d_str(DBusMessageIter *d, const char *k, const char *s) {
+    if (!utf8_ok(s)) return;
     DBusMessageIter e;
     dbus_message_iter_open_container(d, DBUS_TYPE_DICT_ENTRY, NULL, &e);
     dbus_message_iter_append_basic(&e, DBUS_TYPE_STRING, &k);
@@ -214,6 +241,11 @@ static void append_metadata(DBusMessageIter *v) {
         lv_strlcpy(title, t->tags.title, sizeof title);
         lv_strlcpy(artist, t->tags.artist, sizeof artist);
         lv_strlcpy(album, t->tags.album, sizeof album);
+        /* libdbus rejects invalid utf-8 strings: a truncated copy must not
+           leave a dangling sequence behind */
+        lv_utf8_trim(title);
+        lv_utf8_trim(artist);
+        lv_utf8_trim(album);
         tnum = t->tags.track;
         file_uri(t->path, url, sizeof url);
         if (t->duration > 0) len_us = (long long)t->duration * 1000000;
@@ -239,16 +271,12 @@ static void append_metadata(DBusMessageIter *v) {
     }
     if (title[0]) d_str(&d, "xesam:title", title);
     if (artist[0]) {
-        const char *one = artist;
-        DBusMessageIter e, va, a;
+        DBusMessageIter e;
         const char *k = "xesam:artist";
         dbus_message_iter_open_container(&d, DBUS_TYPE_DICT_ENTRY, NULL, &e);
         dbus_message_iter_append_basic(&e, DBUS_TYPE_STRING, &k);
-        dbus_message_iter_open_container(&e, DBUS_TYPE_VARIANT, "as", &va);
-        dbus_message_iter_open_container(&va, DBUS_TYPE_ARRAY, "s", &a);
-        dbus_message_iter_append_basic(&a, DBUS_TYPE_STRING, &one);
-        dbus_message_iter_close_container(&va, &a);
-        dbus_message_iter_close_container(&e, &va);
+        const char *arr1[1] = { artist };
+        v_strarr(&e, arr1, 1); /* utf8-guarded inside */
         dbus_message_iter_close_container(&d, &e);
     }
     if (album[0]) d_str(&d, "xesam:album", album);
@@ -536,11 +564,13 @@ static DBusHandlerResult filter(DBusConnection *c, DBusMessage *m, void *u) {
         }
         char path[LV_MAX_PATH];
         uri_unescape(fpath, path, sizeof path);
+        LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
         pthread_mutex_lock(&mp->mtx);
         pl_add(mp->pl, path);
-        lib_fill_playlist(mp->pl);
+        lib_fill_playlist_ix(mp->pl, &ix);
         int idx = mp->pl->count - 1;
         pthread_mutex_unlock(&mp->mtx);
+        lib_index_free(&ix);
         if (idx < 0) {
             reply_err(c, m, "org.mpris.MediaPlayer2.Error.NotAllowed", "cannot add");
             return DBUS_HANDLER_RESULT_HANDLED;
@@ -653,7 +683,13 @@ int mpris_start(Player *p) {
     }
     dbus_connection_add_filter(bus, filter, NULL, NULL);
     mp_quit = 0;
-    pthread_create(&mp_th, NULL, mp_thread, NULL);
+    if (pthread_create(&mp_th, NULL, mp_thread, NULL) != 0) {
+        /* stop() gates on bus: clear it so it never joins a thread that
+           never ran, and unref the shared connection we just acquired */
+        dbus_connection_unref(bus);
+        bus = NULL;
+        return -1;
+    }
     return 0;
 }
 

@@ -7,6 +7,7 @@
 #include <unistd.h>
 #endif
 #include <stdio.h>
+#include <pthread.h>
 
 Config cfg;
 
@@ -105,13 +106,23 @@ void cfg_load(void) {
 
 static const char *onoff_s(int v) { return v > 0 ? "on" : "off"; }
 
-int cfg_save(void) {
+/* cfg_save runs on the UI thread (options save, scan) AND the daemon
+   thread (shuffle_remember): serialize it, and swap the file atomically
+   so a concurrent reader never opens a half-written config. */
+static pthread_mutex_t cfg_save_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+void cfg_lock(void) { pthread_mutex_lock(&cfg_save_mtx); }
+void cfg_unlock(void) { pthread_mutex_unlock(&cfg_save_mtx); }
+
+static int cfg_save_locked(void) {
     char path[LV_MAX_PATH];
     cfg_path(path, sizeof path);
     char dir[LV_MAX_PATH];
     lv_strlcpy(dir, path, sizeof dir);
     if (lv_dirname(dir)) mkdir(dir, 0755);
-    FILE *f = fopen(path, "w");
+    char tmp[LV_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
     if (!f) return -1;
     fputs("# levari config\n", f);
     for (int i = 0; i < cfg.lib_dir_n; i++)
@@ -131,5 +142,28 @@ int cfg_save(void) {
     fprintf(f, "decode.allow_large = %s\n", onoff_s(cfg.allow_large));
     fprintf(f, "ui.always_10fps = %s\n", onoff_s(cfg.ui_always10));
     fclose(f);
+    /* mingw's rename refuses to replace an existing file: retry once
+       after unlinking the target (small race, better than losing saves) */
+    if (rename(tmp, path) != 0) {
+        remove(path);
+        if (rename(tmp, path) != 0) { remove(tmp); return -1; }
+    }
     return 0;
+}
+
+int cfg_save(void) {
+    pthread_mutex_lock(&cfg_save_mtx);
+    int rc = cfg_save_locked();
+    pthread_mutex_unlock(&cfg_save_mtx);
+    return rc;
+}
+
+/* daemon-thread shuffle persistence: the field write and the save are one
+   critical section, so a UI opt_save running concurrently neither sees nor
+   persists cfg with player.shuffle caught mid-update */
+void cfg_set_shuffle(int on) {
+    pthread_mutex_lock(&cfg_save_mtx);
+    cfg.shuffle = on;
+    cfg_save_locked();
+    pthread_mutex_unlock(&cfg_save_mtx);
 }
