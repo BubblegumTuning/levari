@@ -24,9 +24,13 @@ Flags:
 
 ## Daemon + remote control
 
-The player listens on `$XDG_RUNTIME_DIR/levari-<uid>.sock`
-(fallback `/tmp/levari-<uid>.sock`). A second `levari <command>` talks to
-the running instance instead of starting a new one:
+The player listens on `$XDG_RUNTIME_DIR/levari-<uid>.sock`. Without
+`XDG_RUNTIME_DIR` the fallback is `/tmp/levari-<uid>-<random>.sock`: the
+name is unpredictable (another user cannot pre-bind it on world-writable
+/tmp) and the daemon publishes it in `<config>/levari/socket`, which only
+the owner can write; the CLI reads that pointer file to find the socket.
+A second `levari <command>` talks to the running instance instead of
+starting a new one:
 
     play [files...]        with files: replace the playlist and play
                            (splits on spaces). Alone: resume, or play

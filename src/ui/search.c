@@ -38,7 +38,7 @@ static Result *res;
 static int res_cap;
 static LibEnt *libs;
 static int lib_n, lib_cap, lib_loaded;
-static int dgx, dgy, dwx, dwy;
+static int dgx, dgy;
 
 static int in_rect(const Rect *r, int x, int y) {
     return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
@@ -82,7 +82,11 @@ static void norm(const char *src, char *dst, size_t dn) {
         if (cp >= 0x0410 && cp <= 0x042F) cp += 0x20;
         else if (cp == 0x0401) cp = 0x0451;
         else if (cp >= 0x0402 && cp <= 0x040F) cp += 0x50;
-        else if (cp >= 0x0460 && cp <= 0x04FF && !(cp & 1)) cp++;
+        /* historic blocks pair even->odd, but the thousands sign and the
+           descriptive combining marks (0x0482-0x0489) and palochka 0x04C0
+           have no case pair: folding them mutates the letter */
+        else if (cp >= 0x0460 && cp <= 0x04FF && !(cp & 1) &&
+                 !(cp >= 0x0482 && cp <= 0x0489) && cp != 0x04C0) cp++;
         else if (cp >= 0x0500 && cp <= 0x052E && !(cp & 1)) cp++;
         else if (cp >= 0xFF01 && cp <= 0xFF5E) {
             cp -= 0xFEE0;
@@ -168,12 +172,16 @@ static void lib_load(void) {
     lib_index_path(idx, sizeof idx);
     FILE *f = fopen(idx, "r");
     if (!f) return;
-    char line[8192];
-    while (fgets(line, sizeof line, f)) {
+    char line[2 * LV_MAX_PATH + 1024];
+    int v2 = lib_idx_header(f);
+    int gr;
+    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
+        if (gr == 2) continue; /* over-long row: already drained */
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         char *f1 = line;
         char *f2 = strchr(f1, '\t'); if (!f2) continue; *f2++ = 0;
+        if (v2) lib_unesc_path(f1);
         char *f3 = strchr(f2, '\t'); if (!f3) continue; *f3++ = 0;
         char *f4 = strchr(f3, '\t'); if (!f4) continue; *f4++ = 0;
         char *f5 = strchr(f4, '\t'); if (f5) *f5 = 0;
@@ -183,8 +191,13 @@ static void lib_load(void) {
             if (!l2) break;
             libs = l2;
         }
-        LibEnt *e = &libs[lib_n++];
+        LibEnt *e = &libs[lib_n];
         e->path = dupn(f1); e->artist = dupn(f2); e->title = dupn(f3); e->album = dupn(f4);
+        if (!e->path || !e->artist || !e->title || !e->album) {
+            free(e->path); free(e->artist); free(e->title); free(e->album);
+            break; /* NULL path would crash the strrchr below */
+        }
+        lib_n++;
         char fb[512];
         const char *b = strrchr(e->path, '/');
         b = b ? b + 1 : e->path;
@@ -195,6 +208,12 @@ static void lib_load(void) {
         e->ntitle = norm_dup(e->title);
         e->nartist = norm_dup(e->artist);
         e->nalbum = norm_dup(e->album);
+        if (!e->nfile || !e->ntitle || !e->nartist || !e->nalbum) {
+            /* eval_fields derefs every F[f] without a NULL test */
+            free(e->path); free(e->artist); free(e->title); free(e->album);
+            free(e->nfile); free(e->ntitle); free(e->nalbum); free(e->nartist);
+            break;
+        }
     }
     fclose(f);
 }
@@ -230,13 +249,18 @@ static void res_push(const char *path, const char *title, const char *artist, in
     }
     Result *r = &res[nres++];
     lv_strlcpy(r->path, path, sizeof r->path);
-    if (title && *title)
-        snprintf(r->disp, sizeof r->disp, artist && *artist ? "%s - %s" : "%s",
-                 title, artist && *artist ? artist : "");
-    else {
+    if (title && *title) {
+        if (artist && *artist)
+            snprintf(r->disp, sizeof r->disp, "%s - %s", title, artist);
+        else
+            snprintf(r->disp, sizeof r->disp, "%s", title);
+    } else {
         const char *b = strrchr(path, '/');
         lv_strlcpy(r->disp, b ? b + 1 : path, sizeof r->disp);
     }
+    /* both fills above can truncate mid-sequence (title - artist and long
+       basenames into the 512-byte disp) */
+    lv_utf8_trim(r->disp);
     r->pl_idx = pl_idx;
 }
 
@@ -560,7 +584,6 @@ void search_mouse(SDL_Event *e) {
         if (y < 22) {
             drag = 1;
             SDL_GetGlobalMouseState(&dgx, &dgy);
-            SDL_GetWindowPosition(w, &dwx, &dwy);
         }
     } else if (e->type == SDL_MOUSEBUTTONUP) {
         Rect xc = srch_close_rect();
@@ -573,11 +596,15 @@ void search_mouse(SDL_Event *e) {
         if (drag == 1) drag = 0;
     } else if (e->type == SDL_MOUSEMOTION && drag == 1) {
         if (!(e->motion.state & SDL_BUTTON_LMASK)) { drag = 0; return; }
-        int gx, gy;
+        int gx, gy, wx, wy;
         SDL_GetGlobalMouseState(&gx, &gy);
-        int wx = dwx + gx - dgx, wy = dwy + gy - dgy;
+        /* incremental: delta since last step onto the CURRENT position, so a
+           WM clamp at a screen edge leaves no phantom overshoot (see ui.c) */
+        SDL_GetWindowPosition(w, &wx, &wy);
+        wx += gx - dgx; wy += gy - dgy;
         ui_snap_next_to_main(w, &wx, &wy);
         SDL_SetWindowPosition(w, wx, wy);
+        dgx = gx; dgy = gy;
     } else if (e->type == SDL_MOUSEWHEEL) {
         scroll -= e->wheel.y;
         if (scroll < 0) scroll = 0;
@@ -677,7 +704,12 @@ void search_text(const char *text) {
     while (*q && len + 4 < sizeof query) {
         unsigned cp;
         int n = font_utf8_next(q, &cp);
-        if (cp >= 0x20 || cp == 0x09) {
+        /* printable only: tab is accepted (tokenize splits on it anyway),
+           DEL, the C1 range and surrogates smuggled in as 3-byte CESU-8
+           must not reach the matcher or the render loop */
+        int keep = cp == 0x09 || (cp >= 0x20 && cp < 0x7F) ||
+                   (cp >= 0xA0 && !(cp >= 0xD800 && cp <= 0xDFFF));
+        if (keep) {
             char enc[4];
             int m = utf8_enc(cp, enc);
             memmove(query + caret + m, query + caret, len - (size_t)caret + 1);
@@ -707,6 +739,6 @@ void search_focus_drag(void) {
     SDL_GetWindowSize(w, &ww, &wh);
     if (gx >= wx && gx < wx + ww && gy >= wy && gy - wy < 22) {
         drag = 1;
-        dgx = gx; dgy = gy; dwx = wx; dwy = wy;
+        dgx = gx; dgy = gy;
     }
 }

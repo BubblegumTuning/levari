@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.0 LANGUAGES C)
+project(levari VERSION 0.3.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -11,6 +11,11 @@ if(LV_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address,undefined)
 endif()
+
+# 64-bit off_t/fseeko everywhere: MinGW defaults off_t to 32-bit (long), so
+# the RIFF chunk-skip math in tag.c could go negative and spin on files with
+# chunks >= 2 GB; 32-bit Linux (Pi arm32/armv6) needs it for LFS too.
+add_compile_definitions(_FILE_OFFSET_BITS=64)
 
 if(WIN32)
     # MinGW cross builds: point SDL2_DIR at the SDL2-mingw cmake dir, e.g.
@@ -38,8 +43,18 @@ endif()
 # vendored libmodplug (public domain): mod/s3m/xm/it -> 44.1kHz pcm
 # MODPLUG_BASIC_SUPPORT drops the exotic loaders (669/abc/amf/... kept
 # out of the build); exotic variants fall back to the libav* backend
+#
+# these two libs parse untrusted files directly: they get the same
+# hardening as levari itself (canaries, FORTIFY, PIE) and warnings stay
+# visible (-Wall -Wextra with the vendored-noise subset suppressed), so
+# an upstream regression cannot land silently behind a blanket -w
 enable_language(CXX)
 set(CMAKE_CXX_STANDARD 11)
+set(VEND_WARN -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
+    -Wno-missing-field-initializers -Wno-unknown-pragmas -Wno-comment
+    -Wno-unused-variable -Wno-unused-but-set-variable
+    -Wno-implicit-fallthrough)
+set(VEND_HARD -fstack-protector-strong -D_FORTIFY_SOURCE=2)
 add_library(modplug STATIC
     third_party/libmodplug/fastmix.cpp
     third_party/libmodplug/load_it.cpp
@@ -61,12 +76,12 @@ target_compile_definitions(modplug PRIVATE MODPLUG_BUILD HAVE_CONFIG_H MODPLUG_B
 if(WIN32)
     # no -flto on MinGW: LTO IR hides main() from archive member selection,
     # so mingw's crtexewin.o (main -> WinMain shim) wins and the link fails
-    target_compile_options(modplug PRIVATE -Os -w)
+    target_compile_options(modplug PRIVATE -Os ${VEND_HARD} ${VEND_WARN})
 elseif(APPLE)
-    target_compile_options(modplug PRIVATE -Os -flto -w)
+    target_compile_options(modplug PRIVATE -Os -flto ${VEND_HARD} ${VEND_WARN})
 else()
     # -fPIE required so the static archive can join a PIE link
-    target_compile_options(modplug PRIVATE -Os -flto -fPIE -w)
+    target_compile_options(modplug PRIVATE -Os -flto -fPIE ${VEND_HARD} ${VEND_WARN})
 endif()
 
 # vendored snes_spc (LGPL 2.1, see third_party/snes_spc/LICENSE): SPC ->
@@ -82,12 +97,12 @@ add_library(snes_spc STATIC
 )
 target_include_directories(snes_spc PRIVATE third_party/snes_spc)
 if(WIN32)
-    target_compile_options(snes_spc PRIVATE -Os -w)
+    target_compile_options(snes_spc PRIVATE -Os ${VEND_HARD} ${VEND_WARN})
 elseif(APPLE)
-    target_compile_options(snes_spc PRIVATE -Os -flto -w)
+    target_compile_options(snes_spc PRIVATE -Os -flto ${VEND_HARD} ${VEND_WARN})
 else()
     # -fPIE required so the static archive can join a PIE link
-    target_compile_options(snes_spc PRIVATE -Os -flto -fPIE -w)
+    target_compile_options(snes_spc PRIVATE -Os -flto -fPIE ${VEND_HARD} ${VEND_WARN})
 endif()
 
 add_executable(levari
@@ -250,7 +265,7 @@ if(ENABLE_MCP)
         target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter)
         target_link_options(levari-mcp PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
     endif()
-    set_source_files_properties(third_party/cJSON.c PROPERTIES COMPILE_OPTIONS "-w")
+    set_source_files_properties(third_party/cJSON.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter;-Wno-unknown-pragmas;-fstack-protector-strong;-D_FORTIFY_SOURCE=2")
     if(AV_FOUND)
         target_compile_definitions(levari-mcp PRIVATE HAVE_FFMPEG)
         target_include_directories(levari-mcp PRIVATE ${AV_INCLUDE_DIRS})

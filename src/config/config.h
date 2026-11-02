@@ -34,5 +34,12 @@ void cfg_path(char *out, size_t n);
 void cfg_load(void);
 /* write the current cfg back to the config file; 0 = ok */
 int  cfg_save(void);
+/* serialize field mutation across threads: the UI thread holds these
+   around its opt_save field writes, daemon-thread setters use them too,
+   so a snapshot save never captures a half-updated struct */
+void cfg_lock(void);
+void cfg_unlock(void);
+/* set player.shuffle and save in one critical section (daemon thread) */
+void cfg_set_shuffle(int on);
 
 #endif

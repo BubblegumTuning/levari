@@ -5,41 +5,47 @@
 #include "../decode/decode.h"
 #include "../dsp/dsp.h"
 #include <pthread.h>
+#include <stdatomic.h>
 
 enum { ST_STOP, ST_PLAY, ST_PAUSE };
 enum { CMD_NONE, CMD_PLAY, CMD_TOGGLE_PAUSE, CMD_STOP, CMD_SEEK, CMD_NEXT, CMD_PREV, CMD_SPEED };
 
+/* the cross-thread scalars are _Atomic, not volatile: the UI, daemon and
+   MPRIS threads read them lock-free while the player thread writes them,
+   and a volatile 64-bit load is two 32-bit loads on the supported
+   armv6/armv7 targets (LV_TUNE) — torn pos/track bounds meant wild seeks
+   and wrong progress at track boundaries. seq_cst is plenty at this rate */
 typedef struct {
     Playlist *pl;
-    volatile int cur;
-    volatile int state;
-    volatile int shuffle;
-    volatile int repeat;   /* 0 none, 1 all, 2 one */
-    volatile int vol;      /* 0..128 */
-    int vol_prev;          /* volume restored by unmute */
-    volatile int fade_stop;/* 1: CMD_STOP fades out over 0.5s before stopping */
+    _Atomic int cur;
+    _Atomic int state;
+    _Atomic int shuffle;
+    _Atomic int repeat;   /* 0 none, 1 all, 2 one */
+    _Atomic int vol;      /* 0..128 */
+    _Atomic int vol_prev; /* volume restored by unmute (daemon mute path) */
+    _Atomic int fade_stop;/* 1: CMD_STOP fades out over 0.5s before stopping */
     int fading;            /* player-thread only: a stop fade is in progress */
     long long fade_total, fade_left; /* frames of the running fade */
-    volatile int pan;      /* -32..32 left..right balance */
-    volatile int cmd;
-    volatile int cmd_arg;
-    volatile long long seek_frame;
+    _Atomic int pan;      /* -32..32 left..right balance */
+    _Atomic int cmd;
+    _Atomic int cmd_arg;
+    _Atomic long long seek_frame;
     Decoder *dec;
-    volatile long long pos_frames;
-    volatile long long total_frames;
-    volatile long long track_start, track_end; /* CUE bounds in frames */
-    volatile int rate, ch;
+    _Atomic long long pos_frames;
+    _Atomic long long total_frames;
+    _Atomic long long track_start, track_end; /* CUE bounds in frames */
+    _Atomic int rate, ch;
     EQ eq;
     WS ws;
-    volatile int speed; /* percent, 100 = normal */
-    volatile long long ab_a, ab_b; /* -1 = unset */
+    _Atomic int speed; /* percent, 100 = normal */
+    _Atomic long long ab_a, ab_b; /* -1 = unset */
     int16_t viz_buf[4096];
     volatile int viz_n;
     volatile unsigned viz_seq;
     pthread_mutex_t viz_mtx; /* viz_buf/n/seq: player writes, UI reads */
     int ao_open;
     pthread_mutex_t mtx; /* guards playlist mutations vs player thread */
-    volatile int quit;
+    _Atomic int quit;
     pthread_t th;
 } Player;
 

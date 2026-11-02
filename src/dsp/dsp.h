@@ -38,7 +38,6 @@ typedef struct {
     int16_t in[2][4 * WS_FRAME];
     int in_n[2];
     int16_t tail[2][WS_FRAME / 2]; /* last min(ov, Hs) samples; Hs == WS_FRAME/2 */
-    int tail_n;
     int primed;
 } WS;
 

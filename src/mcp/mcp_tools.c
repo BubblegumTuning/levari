@@ -6,12 +6,14 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* the daemon socket protocol splits arguments on whitespace,
-   so single path/query tokens must not contain spaces */
+/* the daemon socket protocol splits arguments on whitespace but honors
+   double quotes, escaping embedded " and \ as \" and \\: paths with
+   spaces and quotes survive. tabs and newlines remain inexpressible
+   (the protocol is line-based) so they stay rejected */
 static int bad_token(const char *s) {
     if (!s || !*s) return 1;
     for (const char *p = s; *p; p++)
-        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') return 1;
+        if (*p == '\t' || *p == '\n' || *p == '\r') return 1;
     return 0;
 }
 
@@ -32,6 +34,7 @@ static int run_cmd(const char *cmd, char *text, size_t n) {
     size_t l = strlen(resp);
     while (l && (resp[l - 1] == '\n' || resp[l - 1] == '\r')) resp[--l] = 0;
     lv_strlcpy(text, resp, n);
+    lv_utf8_trim(text);   /* the copy can end mid-sequence; JSON must stay valid */
     return rc;
 }
 
@@ -47,6 +50,7 @@ static int run_lib(const char *sub, const char *arg, char *text, size_t n) {
     size_t l = strlen(buf);
     while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
     lv_strlcpy(text, buf, n);
+    lv_utf8_trim(text);
     return 0;
 }
 
@@ -70,15 +74,13 @@ static int tool_play(const cJSON *args, char *text, size_t n) {
     const cJSON *f = NULL;
     cJSON_ArrayForEach(f, files) {
         if (!cJSON_IsString(f) || bad_token(f->valuestring)) {
-            snprintf(text, n, "error: every path must be a single string without spaces");
+            snprintf(text, n, "error: paths must be single-line strings without tab or newline");
             return 1;
         }
-        if (strlen(cmd) + strlen(f->valuestring) + 2 > sizeof cmd) {
+        if (cli_append_arg(cmd, sizeof cmd, f->valuestring) != 0) {
             snprintf(text, n, "error: too many files");
             return 1;
         }
-        strcat(cmd, " ");
-        strcat(cmd, f->valuestring);
     }
     return run_cmd(cmd, text, n);
 }
@@ -124,9 +126,9 @@ static int tool_speed(const cJSON *args, char *text, size_t n) {
 
 static int tool_add(const cJSON *args, char *text, size_t n) {
     const char *p = str_arg(args, "path");
-    if (bad_token(p)) { snprintf(text, n, "error: path is required and must not contain spaces"); return 1; }
-    char cmd[4096];
-    snprintf(cmd, sizeof cmd, "add %s", p);
+    if (bad_token(p)) { snprintf(text, n, "error: path is required and must not contain tab or newline"); return 1; }
+    char cmd[4096] = "add";
+    if (cli_append_arg(cmd, sizeof cmd, p) != 0) { snprintf(text, n, "error: path too long"); return 1; }
     return run_cmd(cmd, text, n);
 }
 
@@ -158,7 +160,7 @@ static const Tool TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{}}", NULL},
     {"play", "Load files into the playlist and play them (replaces the playlist).",
      "{\"type\":\"object\",\"properties\":{\"files\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
-     "\"description\":\"audio file or .m3u paths; no spaces in paths\"}},\"required\":[\"files\"]}", tool_play},
+     "\"description\":\"audio file or .m3u paths\"}},\"required\":[\"files\"]}", tool_play},
     {"toggle", "Toggle play/pause.", "{\"type\":\"object\",\"properties\":{}}", NULL},
     {"stop", "Stop playback.", "{\"type\":\"object\",\"properties\":{}}", NULL},
     {"next", "Skip to the next track.", "{\"type\":\"object\",\"properties\":{}}", NULL},

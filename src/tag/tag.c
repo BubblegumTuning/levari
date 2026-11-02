@@ -36,14 +36,30 @@ static void copy_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
 
 /* vorbis comments are utf-8 by spec: copy the bytes through as-is,
    only dropping control chars (latin-1 -> utf-8 conversion would
-   double-encode and mangle non-ascii titles) */
+   double-encode and mangle non-ascii titles). whole sequences only:
+   a field truncated at a fixed boundary (255B frame caps) must not end
+   in dangling lead/continuation bytes; invalid utf-8 poisons the
+   library index and MPRIS strings */
 static void copy_utf8(char *dst, size_t dn, const unsigned char *src, int n) {
     size_t j = 0;
-    for (int i = 0; i < n && src[i]; i++) {
+    int i = 0;
+    while (i < n && src[i]) {
         unsigned char c = src[i];
-        if (c < 0x20 || c == 0x7F) continue;
-        if (j + 1 >= dn) break;
-        dst[j++] = (char)c;
+        if (c < 0x20 || c == 0x7F) { i++; continue; }
+        int len = 1;
+        if (c >= 0x80) {
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            if (len > 1) {
+                if (i + len > n) break;         /* cut mid-sequence: drop it */
+                for (int k = 1; k < len; k++)
+                    if ((src[i + k] & 0xC0) != 0x80) { len = 1; break; }
+            }
+        }
+        if (j + (size_t)len >= dn) break;
+        for (int k = 0; k < len; k++) dst[j++] = (char)src[i + k];
+        i += len;
     }
     while (j > 0 && dst[j - 1] == ' ') j--;
     dst[j] = 0;
@@ -69,33 +85,57 @@ static const uint16_t cp1251_hi[128] = {
 0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,0x044E,0x044F,
 };
 
-/* is the payload valid utf-8 containing at least one multibyte sequence? */
-static int utf8_multibyte(const unsigned char *src, int n) {
-    int i = 0, mb = 0;
-    while (i < n && src[i]) {
+/* is the payload valid utf-8 containing at least one multibyte sequence?
+   the final sequence may be truncated at n: fixed-width fields (id3v1's
+   30 bytes, 255B frame caps) cut emoji in half, and rejecting the whole
+   field over that tail re-decodes clean utf-8 as latin-1/cp1251 mojibake.
+   *clamped receives the length through the last COMPLETE sequence and
+   *mb whether any multibyte sequence is present (a truncated tail counts) */
+static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) {
+    size_t i = 0, last = 0;
+    int m = 0;
+    while (i < (size_t)n && src[i]) {
         unsigned c = src[i];
         int len;
-        if (c < 0x80) { i++; continue; }
+        if (c < 0x80) { i++; last = i; continue; }
         if ((c & 0xE0) == 0xC0) len = 2;
         else if ((c & 0xF0) == 0xE0) len = 3;
         else if ((c & 0xF8) == 0xF0) len = 4;
         else return 0;
-        if (i + len > n) return 0;
+        if (i + (size_t)len > (size_t)n) { *clamped = last; *mb = 1; return 1; }
         for (int k = 1; k < len; k++)
             if ((src[i + k] & 0xC0) != 0x80) return 0;
-        mb = 1;
-        i += len;
+        if (len > 1) m = 1;
+        i += (size_t)len;
+        last = i;
     }
-    return mb;
+    *clamped = last;
+    *mb = m;
+    return 1;
 }
 
-/* cyrillic words are runs of high bytes; western latin-1 accents sit
-   isolated among ascii, so two consecutive high bytes mean cp1251 */
+/* cyrillic words are runs of cp1251 letter bytes that stand as their own
+   words. western latin-1 accents sit INSIDE ascii words — doubled or even
+   adjacent accents happen (Hääyö, Grüße, Canções) — so a high-byte run
+   that touches an ascii letter is latin-1, not cp1251. only letter bytes
+   join a run: punctuation (cp1251 « », latin-1 ° ·) separates runs. */
+static int cp1251_letter(unsigned char c) {
+    if (c == 0xA8 || c == 0xB8) return 1;          /* Ё ё */
+    if (c < 0xC0 || c == 0xD7 || c == 0xF7) return 0; /* × ÷ are not letters */
+    return 1;                                      /* А-Я / а-я */
+}
+static int ascii_alpha(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
 static int looks_cp1251(const unsigned char *src, int n) {
-    int run = 0;
-    for (int i = 0; i < n && src[i]; i++) {
-        if (src[i] >= 0x80) { if (++run >= 2) return 1; }
-        else run = 0;
+    for (int i = 0; i < n && src[i]; ) {
+        if (!cp1251_letter(src[i])) { i++; continue; }
+        int start = i;
+        while (i < n && src[i] && cp1251_letter(src[i])) i++;
+        if (i - start < 2) continue;
+        unsigned char left = start ? src[start - 1] : ' ';
+        unsigned char right = (i < n && src[i]) ? src[i] : ' ';
+        if (!ascii_alpha(left) && !ascii_alpha(right)) return 1;
     }
     return 0;
 }
@@ -105,7 +145,12 @@ static int looks_cp1251(const unsigned char *src, int n) {
    classify by shape and decode accordingly; raw copying (the old behavior)
    double-encoded every non-ascii byte into mojibake. */
 static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
-    if (utf8_multibyte(src, n)) { copy_utf8(dst, dn, src, n); return; }
+    size_t clamped = 0;
+    int mb = 0;
+    if (utf8_scan(src, n, &clamped, &mb) && mb) {
+        copy_utf8(dst, dn, src, (int)clamped);
+        return;
+    }
     if (!looks_cp1251(src, n)) { copy_fixed(dst, dn, src, n); return; }
     size_t j = 0;
     for (int i = 0; i < n && src[i]; i++) {
@@ -142,6 +187,10 @@ static size_t utf16_to_utf8(char *dst, size_t dn, const unsigned char *src, size
                 i += 2;
             }
         }
+        if (cp == 0xFEFF) continue;                  /* stray BOM */
+        if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD; /* unpaired surrogate:
+                                                          raw 3-byte output would
+                                                          be invalid utf-8 */
         if (cp < 0x80) {
             if (o + 1 >= dn) break;
             dst[o++] = (char)cp;
@@ -194,7 +243,9 @@ static void text_frame(Tags *t, const char *id, const unsigned char *p, size_t n
             unsigned char sw[512] = {0};
             size_t k = vn < sizeof sw ? vn : sizeof sw;
             for (size_t i = 0; i + 1 < k; i += 2) { sw[i] = v[i + 1]; sw[i + 1] = v[i]; }
-            utf16_to_utf8(dst, 256, sw, k);
+            /* a BOM written into an enc=2 field swaps to FF FE: skip it */
+            size_t bo = (k >= 2 && sw[0] == 0xFF && sw[1] == 0xFE) ? 2 : 0;
+            utf16_to_utf8(dst, 256, sw + bo, k - bo);
             return;
         }
         utf16_to_utf8(dst, 256, v, vn);
@@ -209,8 +260,23 @@ static unsigned be32(const unsigned char *p) {
 }
 
 /* walk ID3v2 frames (ver 2/3/4) from a memory buffer */
-static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, Tags *t) {
+static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t) {
     size_t i = 0;
+    /* extended header (flag 0x40): without skipping it the frame walk
+       starts inside the ext header and loses every frame. v3: 4 plain
+       bytes, the size includes the size field itself. v4: 4 syncsafe
+       bytes, the size excludes it. */
+    if (ver >= 3 && (flags & 0x40)) {
+        if (sz < 4) return;
+        size_t eh;
+        if (ver == 4)
+            eh = ((size_t)buf[0] << 21) | ((size_t)buf[1] << 14) |
+                 ((size_t)buf[2] << 7) | buf[3];
+        else
+            eh = be32(buf);
+        i = ver == 4 ? eh + 4 : eh;
+        if (i > sz) return;
+    }
     int idlen = ver == 2 ? 3 : 4;
     while (i + (size_t)(idlen + (ver == 2 ? 3 : 6)) <= sz) {
         char id[5] = {0};
@@ -405,6 +471,10 @@ static void read_riff(FILE *f, Tags *t) {
            64-bit on both targets (tag.c already uses fseeko above). */
         long long next = ((long long)sz + 1) & ~1LL;
         if (!memcmp(ch, "LIST", 4)) {
+            /* a LIST chunk must carry a 4-byte form type: sz < 4 made the
+               non-INFO branch fseeko back (next - 4 <= 0) and "re-sync"
+               onto its own header by luck — refuse instead */
+            if (sz < 4) return;
             unsigned char lt[4];
             if (fread(lt, 1, 4, f) != 4) return;
             if (!memcmp(lt, "INFO", 4)) {
@@ -417,9 +487,9 @@ static void read_riff(FILE *f, Tags *t) {
                     unsigned char *sb = malloc(ssz);
                     if (!sb) return;
                     if (fread(sb, 1, ssz, f) != ssz) { free(sb); return; }
-                    if (!memcmp(sh, "INAM", 4)) copy_fixed(t->title, sizeof t->title, sb, (int)(ssz < 255 ? ssz : 255));
-                    else if (!memcmp(sh, "IART", 4)) copy_fixed(t->artist, sizeof t->artist, sb, (int)(ssz < 255 ? ssz : 255));
-                    else if (!memcmp(sh, "IPRD", 4)) copy_fixed(t->album, sizeof t->album, sb, (int)(ssz < 255 ? ssz : 255));
+                    if (!memcmp(sh, "INAM", 4)) copy_legacy(t->title, sizeof t->title, sb, (int)(ssz < 255 ? ssz : 255));
+                    else if (!memcmp(sh, "IART", 4)) copy_legacy(t->artist, sizeof t->artist, sb, (int)(ssz < 255 ? ssz : 255));
+                    else if (!memcmp(sh, "IPRD", 4)) copy_legacy(t->album, sizeof t->album, sb, (int)(ssz < 255 ? ssz : 255));
                     else if (!memcmp(sh, "ITRK", 4)) {
                         char b[32] = {0};
                         size_t k = ssz < 31 ? ssz : 31;
@@ -456,12 +526,16 @@ static void read_module(const unsigned char *h, size_t n, Tags *t) {
 }
 
 /* Duration from the first MPEG frame header inside the head buffer:
-   XING/Info frame count (exact for VBR), else VBRI, else a CBR estimate
-   from the file size. Never reads the whole file. Returns seconds,
-   0 = unknown. off = first byte after ID3v2 (0 if none); fsize = size
-   hint from the caller's stat (0 = stat via f when absent). */
+   XING/Info frame count (exact for VBR), else VBRI, else a size-based
+   estimate using the average bitrate measured over every complete frame
+   in the head window (single frame only: that frame's bitrate). Never
+   reads the whole file. Returns seconds, 0 = unknown. off = first byte
+   after ID3v2 within this buffer (0 if none or buffer refilled);
+   skip = file bytes preceding this buffer (0 unless the buffer was
+   re-filled past an oversized ID3v2); fsize = size hint from the
+   caller's stat (0 = stat via f when absent). */
 static int mp3_head_duration(const unsigned char *b, size_t n, size_t off,
-                             long long fsize, FILE *f) {
+                             long long skip, long long fsize, FILE *f) {
     static const int br_v1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
     static const int br_v2[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0};
     static const int sr_base[3] = {44100, 48000, 32000};
@@ -498,8 +572,39 @@ static int mp3_head_duration(const unsigned char *b, size_t n, size_t off,
                 return (int)((long long)frames * spf / rate);
         }
         if (fsize <= 0 && fseeko(f, 0, SEEK_END) == 0) fsize = ftello(f);
-        if (fsize > (long long)i) return (int)((fsize - (long long)i) * 8 / bitrate);
-        return 0;
+        long long audbytes = fsize - skip - (long long)i;
+        if (audbytes <= 0) return 0;
+        /* No Xing/VBRI. A VBR stream without a tag often opens on a tiny
+           silence frame (8 kbps over ~72 kbps average reads ~9x too long),
+           so one frame's bitrate must not drive the estimate: walk every
+           complete frame in the head window (L3 frame length =
+           144000*kbps/rate for MPEG1, 72000*kbps/rate for MPEG2/2.5,
+           plus the pad bit) and extrapolate the window's measured
+           bytes-per-second to the rest of the file. The walk stops at the
+           first non-frame byte; a lone parseable frame just reproduces
+           the old single-bitrate estimate. */
+        long long wb = 0, ws = 0;
+        for (size_t p = i; p + 4 <= n; ) {
+            if (b[p] != 0xFF || (b[p + 1] & 0xE0) != 0xE0) break;
+            int v = (b[p + 1] >> 3) & 3;
+            int l = (b[p + 1] >> 1) & 3;
+            int br = (b[p + 2] >> 4) & 0xF;
+            int sr = (b[p + 2] >> 2) & 3;
+            if (v == 1 || l != 1 || sr == 3 || br == 0 || br == 15) break;
+            int r = sr_base[sr] / (v == 3 ? 1 : v == 2 ? 2 : 4);
+            if (r != rate) break;   /* mixed-rate stream: stop at the seam */
+            int flen = (v == 3 ? 144000 : 72000) * (v == 3 ? br_v1 : br_v2)[br] / r
+                       + ((b[p + 2] >> 1) & 1);
+            if (flen < 4) break;
+            wb += flen;
+            ws += v == 3 ? 1152 : 576;
+            p += (size_t)flen;
+        }
+        if (wb > 0) {
+            long long dur = audbytes * ws / (wb * rate);
+            if (dur > 0 && dur < 86400) return (int)dur;
+        }
+        return (int)(audbytes * 8 / bitrate);
     }
     return 0;
 }
@@ -550,19 +655,32 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
                         ((size_t)b[8] << 7) | b[9];
             if (sz <= (1u << 24)) {
                 if (10 + sz <= n) {
-                    id3v2_frames(b + 10, sz, b[3], t);
+                    id3v2_frames(b + 10, sz, b[3], b[5], t);
                 } else {
                     /* tag larger than the head buffer: one follow-up read */
                     unsigned char *tb = malloc(sz);
                     if (tb && fseek(f, 10, SEEK_SET) == 0 &&
                         fread(tb, 1, sz, f) == sz)
-                        id3v2_frames(tb, sz, b[3], t);
+                        id3v2_frames(tb, sz, b[3], b[5], t);
                     free(tb);
                 }
                 tagend = 10 + sz;
             }
         }
-        dur = mp3_head_duration(b, n, tagend, size_hint, f);
+        /* ID3v2 larger than the head window (big cover art) leaves no
+           audio bytes in it: mp3_head_duration would scan past the
+           buffer end and report 0:00 in the library. Re-fill the SAME
+           buffer at the audio start — still one fixed 128KB read, one
+           extra seek; tagend==0 (no/absurd v2 header) keeps the old
+           whole-buffer scan. */
+        long long skip = 0;
+        if (tagend && tagend + 4 > n &&
+            fseek(f, (off_t)tagend, SEEK_SET) == 0) {
+            skip = (long long)tagend;   /* tag bytes precede the new window */
+            n = fread(b, 1, TAG_HEAD, f);
+            tagend = 0;
+        }
+        dur = mp3_head_duration(b, n, tagend, skip, size_hint, f);
         if (!tags_complete(t)) read_id3v1(f, t);
     } else if (n >= 4 && b[0]=='O' && b[1]=='g' && b[2]=='g' && b[3]=='S') {
         dur = read_ogg(b, n, t);
@@ -574,7 +692,7 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
     } else if (n >= 27 && !memcmp(b, "SNES-SPC700 Sound File Data", 27)) {
         dur = read_spc(b, (long)n, t);
     } else {
-        dur = mp3_head_duration(b, n, 0, size_hint, f);
+        dur = mp3_head_duration(b, n, 0, 0, size_hint, f);
         if (!tags_complete(t)) read_id3v1(f, t);
         if (!t->title[0]) read_module(b, n, t);
     }

@@ -18,8 +18,14 @@ void pl_clear(Playlist *p) {
 
 static int ensure(Playlist *p, int need) {
     if (need <= p->cap) return 0;
-    int cap = p->cap ? p->cap * 2 : 64;
-    while (cap < need) cap *= 2;
+    int cap = p->cap ? p->cap + p->cap / 2 + 1 : 64;
+    while (cap < need) {
+        /* clamp before doubling can wrap the int counter; a Track is ~6 KB
+           so the realloc below fails long before — this just documents it */
+        if (cap > INT_MAX / 2) { cap = INT_MAX; break; }
+        cap += cap / 2 + 1;
+    }
+    if ((size_t)cap > SIZE_MAX / sizeof(Track)) return -1;
     Track *items = realloc(p->items, (size_t)cap * sizeof(Track));
     if (!items) return -1;
     p->items = items;
@@ -83,20 +89,22 @@ static void pl_add_dir(Playlist *p, const char *dir) {
     free(names);
 }
 
-void pl_add(Playlist *p, const char *path) {
+int pl_add(Playlist *p, const char *path) {
     struct stat st;
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
         pl_add_dir(p, path);
-        return;
+        return 0;
     }
-    pl_add_file(p, path);
+    return pl_add_file(p, path);
 }
 
 /* append without the stat-based directory probe: callers that already
    know the path is a file (m3u lines, scanned dir entries). on network
-   shares the per-path stat was the dominant cost of loading big lists */
-void pl_add_file(Playlist *p, const char *path) {
-    if (ensure(p, p->count + 1) != 0) return;
+   shares the per-path stat was the dominant cost of loading big lists.
+   returns 0 when the entry was appended, -1 when the grow failed:
+   callers that touch items[count-1] afterwards must check it */
+int pl_add_file(Playlist *p, const char *path) {
+    if (ensure(p, p->count + 1) != 0) return -1;
     Track *t = &p->items[p->count++];
     if (lv_is_abs(path)) {
         lv_strlcpy(t->path, path, sizeof t->path);
@@ -111,6 +119,7 @@ void pl_add_file(Playlist *p, const char *path) {
     t->duration = 0;
     t->notag = 0;
     t->start_sec = t->end_sec = 0;
+    return 0;
 }
 
 void pl_insert(Playlist *p, int idx, const char *path) {
@@ -140,12 +149,18 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
     lv_strlcpy(dir, m3u, sizeof dir);
     if (!lv_dirname(dir)) lv_strlcpy(dir, ".", sizeof dir);
 
-    /* pre-size from the file size (~96 bytes per entry): multi-MB
-       playlists otherwise churn realloc through every doubling */
+    /* pre-size from the file size (~96 bytes per entry): multi-KB
+       playlists otherwise churn realloc through every doubling. cap it:
+       Track is ~6 KB, so a multi-MB m3u (or a junk huge file sniffed as
+       one) would pre-allocate gigabytes */
     if (fseek(f, 0, SEEK_END) == 0) {
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
-        if (sz > 0) ensure(p, p->count + (int)(sz / 96) + 16);
+        if (sz > 0) {
+            int pre = (int)(sz / 96) + 16;
+            if (pre > 4096) pre = 4096;
+            ensure(p, p->count + pre);
+        }
     }
 
     char line[LV_MAX_PATH + 64];
@@ -164,8 +179,10 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
         char full[LV_MAX_PATH];
         if (lv_is_abs(s)) lv_strlcpy(full, s, sizeof full);
         else lv_path_join(full, sizeof full, dir, s);
-        pl_add_file(p, full);
-        if (pending_dur) p->items[p->count - 1].duration = pending_dur;
+        /* the duration belongs to the row just appended: if the append
+           failed (OOM) p->count-1 would point at an older row — or -1 */
+        if (pl_add_file(p, full) == 0 && pending_dur)
+            p->items[p->count - 1].duration = pending_dur;
         pending_dur = 0;
     }
     fclose(f);
@@ -184,7 +201,10 @@ int pl_save_m3u(Playlist *p, const char *m3u) {
                     t->tags.title[0] ? t->tags.title : "?");
         fprintf(f, "%s\n", t->path);
     }
-    fclose(f);
+    /* a failed --save must not report success: fflush catches buffered
+       write errors (disk full), fclose catches the flush-on-close case */
+    if (fflush(f) != 0 || ferror(f)) { fclose(f); return -1; }
+    if (fclose(f) != 0) return -1;
     return 0;
 }
 
@@ -214,16 +234,22 @@ int pl_load_cue(Playlist *p, const char *cue) {
             else lv_path_join(file, sizeof file, dir, q1 + 1);
             file_first = p->count;
         } else if (!strncmp(s, "TRACK ", 6)) {
-            idx = p->count;
-            pl_add(p, file);
-        } else if (!strncmp(s, "TITLE ", 6) && idx >= 0) {
+            /* no TRACK row before its FILE row: an empty path would add a
+               garbage entry; a failed add must not leave idx dangling past
+               the end of items (later TITLE/PERFORMER/INDEX write into it) */
+            idx = -1;
+            if (file[0]) {
+                int before = p->count;
+                if (pl_add(p, file) == 0 && p->count > before) idx = before;
+            }
+        } else if (!strncmp(s, "TITLE ", 6) && idx >= 0 && idx < p->count) {
             char *q1 = strchr(s, '"');
             if (q1) {
                 char *q2 = strchr(q1 + 1, '"');
                 if (q2) *q2 = 0;
                 lv_strlcpy(p->items[idx].tags.title, q1 + 1, sizeof p->items[idx].tags.title);
             }
-        } else if (!strncmp(s, "PERFORMER ", 10) && idx >= 0) {
+        } else if (!strncmp(s, "PERFORMER ", 10) && idx >= 0 && idx < p->count) {
             char *q1 = strchr(s, '"');
             if (q1) {
                 char *q2 = strchr(q1 + 1, '"');
@@ -234,7 +260,7 @@ int pl_load_cue(Playlist *p, const char *cue) {
             int mm, ss, ff;
             if (sscanf(s + 9, "%d:%d:%d", &mm, &ss, &ff) == 3) {
                 double sec = mm * 60 + ss + ff / 75.0;
-                if (idx >= 0) {
+                if (idx >= 0 && idx < p->count) {
                     /* close the previous track only if it belongs to the
                        same FILE and came from this cue: an INDEX from a
                        new FILE (or a cue loaded onto a populated playlist)

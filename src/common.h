@@ -10,7 +10,7 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.3.0"
+#define LV_VERSION "0.3.2"
 #endif
 
 /* build architecture, shown in the options title bar before the version
@@ -43,6 +43,22 @@ static inline void lv_expand_home(const char *in, char *out, size_t n) {
         snprintf(out, n, "%s%s", home, in + 1);
     else
         lv_strlcpy(out, in, n);
+}
+
+/* drop a trailing incomplete utf-8 sequence: snprintf/strlcpy into a
+   fixed-size buffer can cut an emoji mid-sequence, and the dangling bytes
+   then travel as invalid utf-8 to the daemon client, D-Bus and JSON */
+static inline void lv_utf8_trim(char *s) {
+    size_t len = strlen(s);
+    if (!len) return;
+    size_t i = len;
+    while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) i--;
+    if (!i) { s[0] = 0; return; }              /* continuation-only tail */
+    unsigned char c = (unsigned char)s[i - 1];
+    if (c < 0x80) return;                      /* ends on an ascii byte */
+    int need = (c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 :
+               ((c & 0xF8) == 0xF0 ? 4 : 0));
+    if (!need || len - (i - 1) < (size_t)need) s[i - 1] = 0;
 }
 
 static inline int lv_strcasecmp(const char *a, const char *b) {

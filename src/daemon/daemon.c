@@ -21,6 +21,9 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <time.h>
+#endif
 
 #define VOL_STEP 8
 
@@ -30,22 +33,15 @@ static volatile int srv_quit;
 
 #ifdef _WIN32
 static HANDLE cur_pipe;
+/* srv_stop reads cur_pipe while the server thread assigns and closes it:
+   unsynchronized, CancelIoEx could target a handle value already closed
+   and recycled for another object. the thread clears cur_pipe under this
+   lock *before* CloseHandle, so a handle srv_stop sees is still open. */
+static pthread_mutex_t pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
 #else
 static int listen_fd = -1;
+static char srv_path[512];   /* the path actually bound (random in /tmp fallback) */
 #endif
-
-static void sock_path(char *out, size_t n) {
-    if (cfg.socket_path[0]) { lv_expand_home(cfg.socket_path, out, n); return; }
-#ifdef _WIN32
-    char user[256];
-    lv_user_tag(user, sizeof user);
-    snprintf(out, n, "\\\\.\\pipe\\levari-%s", user);
-#else
-    const char *xdg = getenv("XDG_RUNTIME_DIR");
-    if (xdg && *xdg) snprintf(out, n, "%s/levari-%d.sock", xdg, (int)getuid());
-    else snprintf(out, n, "/tmp/levari-%d.sock", (int)getuid());
-#endif
-}
 
 static void fmt_t(char *b, size_t n, long long sec) {
     if (sec < 0) sec = 0;
@@ -69,9 +65,11 @@ static void status_line(Player *p, char *out, size_t n) {
     int cur = p->cur, count = p->pl->count;
     pthread_mutex_unlock(&p->mtx);
     pl_current_title(p, title, sizeof title);
+    lv_utf8_trim(title);
     snprintf(out, n, "%s %d/%d pos=%s/%s shuffle=%d repeat=%d vol=%d title=%s",
              st, cur + 1, count, ps, ts,
              p->shuffle, p->repeat, p->vol, title);
+    lv_utf8_trim(out);
 }
 
 static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
@@ -93,14 +91,28 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
             Playlist np;
             pl_init(&np);
             /* split on spaces but honor double quotes: strtok(" ") made
-               every path containing a space into several bogus paths */
+               every path containing a space into several bogus paths.
+               inside quotes \" and \\ decode to " and \, so paths that
+               contain both spaces and quotes survive transport */
             for (char *s = rest; *s; ) {
                 char *tok = s;
                 if (*tok == '"') {
                     tok++;
-                    char *q = strchr(tok, '"');
-                    if (q) { *q = 0; s = q + 1; }
-                    else s = tok + strlen(tok);
+                    char *r = tok, *w = tok;
+                    while (*r && *r != '"') {
+                        if (*r == '\\' && (r[1] == '"' || r[1] == '\\')) {
+                            *w++ = r[1];
+                            r += 2;
+                        } else {
+                            *w++ = *r++;
+                        }
+                    }
+                    /* the closing quote must be tested BEFORE the NUL goes
+                       in: with no escapes w lands on it and would erase
+                       the only marker of where the token ended */
+                    int closed = *r == '"';
+                    *w = 0;
+                    s = closed ? r + 1 : r;
                 } else {
                     char *sp = strchr(tok, ' ');
                     if (sp) { *sp = 0; s = sp + 1; }
@@ -152,11 +164,16 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
             pl_post_seek(p, (target * p->rate) / (double)(endf - base));
         lv_strlcpy(resp, "OK", rn);
     } else if (!strcmp(cmd, "vol")) {
-        int v = atoi(line + 3);
-        if (v < 0) v = 0;
-        if (v > 128) v = 128;
-        p->vol = v;
-        lv_strlcpy(resp, "OK", rn);
+        char *v = line + 3;
+        while (*v == ' ') v++;
+        if (!*v) { snprintf(resp, rn, "ERR usage: vol <0-128>"); }
+        else {
+            int x = atoi(v);
+            if (x < 0) x = 0;
+            if (x > 128) x = 128;
+            p->vol = x;
+            lv_strlcpy(resp, "OK", rn);
+        }
     } else if (!strcmp(cmd, "volup") || !strcmp(cmd, "voldown")) {
         int v = p->vol + (!strcmp(cmd, "volup") ? VOL_STEP : -VOL_STEP);
         if (v < 0) v = 0;
@@ -168,36 +185,51 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         else p->vol = p->vol_prev > 0 ? p->vol_prev : 100;
         snprintf(resp, rn, "vol %d", p->vol);
     } else if (!strcmp(cmd, "pan")) {
-        int v = atoi(line + 3);
-        if (v < -32) v = -32;
-        if (v > 32) v = 32;
-        p->pan = v;
-        lv_strlcpy(resp, "OK", rn);
+        char *v = line + 3;
+        while (*v == ' ') v++;
+        if (!*v) { snprintf(resp, rn, "ERR usage: pan <-32..32>"); }
+        else {
+            int x = atoi(v);
+            if (x < -32) x = -32;
+            if (x > 32) x = 32;
+            p->pan = x;
+            lv_strlcpy(resp, "OK", rn);
+        }
     } else if (!strcmp(cmd, "shuffle") || !strcmp(cmd, "repeat")) {
-        int on = strstr(line, "on") != NULL;
-        int off = strstr(line, "off") != NULL;
-        int one = !strcmp(cmd, "repeat") && strstr(line, "one") != NULL;
-        volatile int *flag = !strcmp(cmd, "shuffle") ? &p->shuffle : &p->repeat;
+        /* the on/off/one token is positional: strstr over the whole line
+           matched "on" inside paths and arguments */
+        char tok[16] = "";
+        sscanf(line + strlen(cmd), "%15s", tok);
+        int on = !strcmp(tok, "on");
+        int off = !strcmp(tok, "off");
+        int one = !strcmp(cmd, "repeat") && !strcmp(tok, "one");
+        _Atomic int *flag = !strcmp(cmd, "shuffle") ? &p->shuffle : &p->repeat;
         if (one) *flag = 2;
         else if (on) *flag = 1; else if (off) *flag = 0; else *flag = !*flag;
         if (flag == &p->shuffle && cfg.shuffle_remember > 0) {
-            cfg.shuffle = *flag;
-            cfg_save();
+            cfg_set_shuffle(*flag);
         }
         lv_strlcpy(resp, "OK", rn);
     } else if (!strcmp(cmd, "eq")) {
-        int on = strstr(line, "on") != NULL;
-        int off = strstr(line, "off") != NULL;
+        char tok[16] = "";
+        sscanf(line + strlen(cmd), "%15s", tok);
+        int on = !strcmp(tok, "on");
+        int off = !strcmp(tok, "off");
         if (on) eq_set_enabled(&p->eq, 1);
         else if (off) eq_set_enabled(&p->eq, 0);
         else eq_toggle(&p->eq);
         lv_strlcpy(resp, "OK", rn);
     } else if (!strcmp(cmd, "speed")) {
-        double v = atof(line + 5);
-        if (v < 0.5) v = 0.5;
-        if (v > 2.0) v = 2.0;
-        pl_post(p, CMD_SPEED, (int)(v * 100 + 0.5));
-        lv_strlcpy(resp, "OK", rn);
+        char *v = line + 5;
+        while (*v == ' ') v++;
+        if (!*v) { snprintf(resp, rn, "ERR usage: speed <0.5-2.0>"); }
+        else {
+            double x = atof(v);
+            if (x < 0.5) x = 0.5;
+            if (x > 2.0) x = 2.0;
+            pl_post(p, CMD_SPEED, (int)(x * 100 + 0.5));
+            lv_strlcpy(resp, "OK", rn);
+        }
     } else if (!strcmp(cmd, "pl")) {
         pthread_mutex_lock(&p->mtx);
         int off = 0;
@@ -207,21 +239,48 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
             const char *name;
             if (t->tags.title[0]) name = t->tags.title;
             else { lv_pretty_name(t->path, pretty, sizeof pretty); name = pretty; }
-            off += snprintf(resp + off, rn - off, "%d\t%s\t%s\n", i + 1, name, t->path);
+            /* snprintf returns the would-be length: off could grow past
+               the buffer while the loop bound only re-checks next turn,
+               making the next resp + off arithmetic fragile */
+            int w = snprintf(resp + off, rn - off, "%d\t%s\t%s\n", i + 1, name, t->path);
+            if (w < 0 || (size_t)w >= rn - off) break;
+            off += w;
         }
         pthread_mutex_unlock(&p->mtx);
         if (!off) lv_strlcpy(resp, "(empty)", rn);
+        else lv_utf8_trim(resp);
     } else if (!strcmp(cmd, "add")) {
         char *rest = line + 3;
         while (*rest == ' ' || *rest == '\t') rest++;
         char *end = rest + strlen(rest);
         while (end > rest && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
             *--end = 0;
+        /* the CLI quotes args containing spaces or quotes (same convention
+           as the play tokenizer above); add keeps the rest of the line as
+           ONE path, so strip exactly one surrounding quote pair and undo
+           the \" \\ escapes it may contain */
+        size_t rl = (size_t)(end - rest);
+        if (rl >= 2 && rest[0] == '"' && end[-1] == '"') {
+            end[-1] = 0;
+            rest++;
+            char *r = rest, *w = rest;
+            while (*r) {
+                if (*r == '\\' && (r[1] == '"' || r[1] == '\\')) {
+                    *w++ = r[1];
+                    r += 2;
+                } else {
+                    *w++ = *r++;
+                }
+            }
+            *w = 0;
+        }
         if (*rest) {
+            LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
             pthread_mutex_lock(&p->mtx);
             pl_add(p->pl, rest);
-            lib_fill_playlist(p->pl);
+            lib_fill_playlist_ix(p->pl, &ix);
             pthread_mutex_unlock(&p->mtx);
+            lib_index_free(&ix);
         }
         lv_strlcpy(resp, "OK", rn);
     } else {
@@ -234,7 +293,7 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
 static void *srv_thread(void *arg) {
     (void)arg;
     char path[512];
-    sock_path(path, sizeof path);
+    lv_sock_path(path, sizeof path);
     /* owner-only pipe: with a NULL security descriptor the pipe inherits the
        token's default DACL, which lets other local users open the single
        instance (read-only, but enough to lock the real CLI/MCP out). The
@@ -254,11 +313,26 @@ static void *srv_thread(void *arg) {
                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                     1, 0, 4096, 1000, sap);
         if (h == INVALID_HANDLE_VALUE) { if (psd) LocalFree(psd); return NULL; }
+        pthread_mutex_lock(&pipe_mtx);
         cur_pipe = h;
+        pthread_mutex_unlock(&pipe_mtx);
         if (!ConnectNamedPipe(h, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
-            CloseHandle(h); cur_pipe = INVALID_HANDLE_VALUE;
+            pthread_mutex_lock(&pipe_mtx);
+            cur_pipe = INVALID_HANDLE_VALUE;
+            pthread_mutex_unlock(&pipe_mtx);
+            CloseHandle(h);
             continue;
         }
+        /* CreateNamedPipe's nDefaultTimeOut is advisory (client-side
+           WaitNamedPipe only): a PIPE_WAIT ReadFile blocks forever, so a
+           client that connects and sends nothing parked the daemon thread.
+           MAXDWORD interval + 1000 ms total makes ReadFile return 0 bytes
+           once a second of silence elapses. */
+        COMMTIMEOUTS ct;
+        ct.ReadIntervalTimeout = MAXDWORD;
+        ct.ReadTotalTimeoutMultiplier = 0;
+        ct.ReadTotalTimeoutConstant = 1000;
+        SetCommTimeouts(h, &ct);
         if (!srv_quit) {
             /* read until newline: one ReadFile truncated long commands
                (the client sends up to 8 KB); the pipe's 1000 ms timeout
@@ -284,8 +358,10 @@ static void *srv_thread(void *arg) {
             }
         }
         DisconnectNamedPipe(h);
-        CloseHandle(h);
+        pthread_mutex_lock(&pipe_mtx);
         cur_pipe = INVALID_HANDLE_VALUE;
+        pthread_mutex_unlock(&pipe_mtx);
+        CloseHandle(h);
     }
     if (psd) LocalFree(psd);
     return NULL;
@@ -301,8 +377,13 @@ int srv_start(Player *p) {
 
 void srv_stop(void) {
     srv_quit = 1;
+    /* cancel under the lock: the thread cannot close the handle it just
+       handed us while we hold it, so CancelIoEx never sees a closed or
+       recycled value */
+    pthread_mutex_lock(&pipe_mtx);
     HANDLE cp = cur_pipe;
     if (cp != INVALID_HANDLE_VALUE) CancelIoEx(cp, NULL);
+    pthread_mutex_unlock(&pipe_mtx);
     pthread_join(srv_th, NULL);
 }
 
@@ -353,29 +434,59 @@ static void *srv_thread(void *arg) {
     return NULL;
 }
 
-int srv_start(Player *p) {
-    srv_p = p;
-    srv_quit = 0;
-    char path[512];
-    sock_path(path, sizeof path);
+/* 1 if a live listener at path belongs to this uid. a connect failure
+   (stale socket) or a foreign peer returns 0 and the caller proceeds to
+   unlink+bind. */
+static int self_listener(const char *path) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_UNIX;
     lv_strlcpy(sa.sun_path, path, sizeof sa.sun_path);
-    /* if a live listener owns the path, do not steal it: unlink+bind
-       would leave the first instance playing but unreachable by CLI/MCP */
     int probe = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (probe >= 0) {
-        if (connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0) {
-            close(probe);
+    if (probe < 0) return 0;
+    int self = 0;
+    if (connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0)
+        self = peer_is_self(probe);
+    close(probe);
+    return self;
+}
+
+int srv_start(Player *p) {
+    srv_p = p;
+    srv_quit = 0;
+    char path[512];
+    lv_sock_path(path, sizeof path);
+    int fallback = lv_tmp_fallback();
+    /* if a live self-owned listener answers, do not steal its path:
+       unlink+bind would leave the first instance playing but unreachable
+       by CLI/MCP. a foreign peer is evicted via unlink+bind. */
+    if (fallback) {
+        /* /tmp is world-writable and sticky: another user can pre-bind the
+           deterministic name and unlink of THEIR file then fails with EPERM,
+           so eviction is impossible and the squat disables us. Bind an
+           unpredictable name instead and publish it in our config dir,
+           which no other user can write; the squat becomes useless. */
+        char pub[512];
+        if (lv_sock_pointer(pub, sizeof pub) && self_listener(pub)) {
             fprintf(stderr, "levari: another instance is already running; daemon disabled\n");
             return -1;
         }
-        close(probe);
+        unsigned rnd = 0;
+        FILE *u = fopen("/dev/urandom", "rb");
+        if (u) { if (fread(&rnd, 1, sizeof rnd, u) != sizeof rnd) rnd = 0; fclose(u); }
+        if (!rnd) rnd = (unsigned)time(NULL) ^ ((unsigned)getpid() << 16);
+        snprintf(path, sizeof path, "/tmp/levari-%d-%08x.sock", (int)getuid(), rnd);
+    } else if (self_listener(path)) {
+        fprintf(stderr, "levari: another instance is already running; daemon disabled\n");
+        return -1;
     }
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    lv_strlcpy(sa.sun_path, path, sizeof sa.sun_path);
     listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) return -1;
-    unlink(path);
+    unlink(path);   /* only our own stale socket can sit at this name */
     /* bind with a private umask so the socket is never group/other
        connectable, even briefly before the chmod */
     mode_t old_mask = umask(0077);
@@ -386,6 +497,18 @@ int srv_start(Player *p) {
     }
     chmod(path, 0600);
     if (listen(listen_fd, 4) < 0) { close(listen_fd); listen_fd = -1; return -1; }
+    if (fallback) {
+        char pf[512];
+        lv_sock_ptr_file(pf, sizeof pf);
+        char dir[512];
+        lv_strlcpy(dir, pf, sizeof dir);
+        if (lv_dirname(dir)) mkdir(dir, 0755);
+        FILE *w = pf[0] ? fopen(pf, "w") : NULL;
+        if (w) { fputs(path, w); fclose(w); }
+        else fprintf(stderr, "levari: cannot publish socket path to %s; "
+                             "CLI/MCP cannot reach this instance\n", pf);
+    }
+    lv_strlcpy(srv_path, path, sizeof srv_path);
     pthread_create(&srv_th, NULL, srv_thread, NULL);
     return 0;
 }
@@ -396,9 +519,7 @@ void srv_stop(void) {
     pthread_join(srv_th, NULL);
     close(listen_fd);
     listen_fd = -1;
-    char path[512];
-    sock_path(path, sizeof path);
-    unlink(path);
+    unlink(srv_path);   /* the published path may differ from the default */
 }
 
 #endif
