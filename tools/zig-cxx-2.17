@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# zig c++ pinned to glibc 2.17 (see tools/zig-legacy-toolchain.cmake).
+# Drops CMake's "-Xlinker --dependency-file=..." — zig 0.16's lld
+# segfaults generating it for this cross target (costs only rebuild
+# precision, not correctness).
+args=(); prev=""; filtered=()
+for a in "$@"; do
+    if [ "$prev" = "-Xlinker" ] && [ "${a#--dependency-file=}" != "$a" ]; then
+        args=("${args[@]:0:${#args[@]}-1}")
+        prev=""; continue
+    fi
+    args+=("$a"); prev="$a"
+done
+exec zig c++ -target x86_64-linux-gnu.2.17 "${args[@]}"

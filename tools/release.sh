@@ -43,17 +43,31 @@ package() { # package <target> <arch> <builddir> <binary> [extra files...]
 build build-rel-linux
 package linux x86-64 build-rel-linux levari README.md assets/levari.desktop assets/levari.svg
 
-# legacy x86-64: pin the ISA floor to the original AMD64 baseline (SSE2 only).
-# This host's gcc defaults to -march=x86-64-v3 (AVX2/MOVBE/LZCNT) which SIGILLs
-# on pre-2008 CPUs; the X61s (2007 Merom) is the reference machine.
-build build-rel-linux-legacy -DCMAKE_C_FLAGS="-march=x86-64 -mtune=generic" -DCMAKE_CXX_FLAGS="-march=x86-64 -mtune=generic"
-# The distro crt objects carry an "x86 ISA needed: v3" property note that the
-# linker propagates to the output, so glibc's loader aborts with "CPU ISA level
-# is lower than required" on old CPUs even though our code is baseline
-# ("x86 ISA used: baseline"). Strip the note from the legacy binary; we use no
-# CET IBT/SHSTK features that live in it.
-objcopy --remove-section=.note.gnu.property build-rel-linux-legacy/levari
-package linux-legacy x86-64 build-rel-linux-legacy levari README.md assets/levari.desktop assets/levari.svg
+# legacy x86-64: the "drop it anywhere" build. zig cc pins BOTH floors in one
+# toolchain: ISA floor at the original AMD64 baseline (zig's generic x86_64
+# target; this host's gcc defaults to -march=x86-64-v3 which SIGILLs on
+# pre-2008 CPUs — the X61s/2007 Merom is the reference machine) and glibc
+# floor at 2.17 (RHEL/CentOS 7 era: zig resolves every symbol to its
+# 2.17-vintage form via its bundled per-version import libs). crt objects
+# come from zig, so the old gcc path's objcopy ISA-note surgery is not
+# needed — readelf -n is empty on the output. Needs the floor-built static
+# SDL2 bootstrapped once (see docs/build.md, legacy section).
+export SDL2_LEGACY_PREFIX=${SDL2_LEGACY_PREFIX:-$HOME/sdl2-legacy-x86_64}
+[ -f "$SDL2_LEGACY_PREFIX/lib64/libSDL2.a" ] || {
+    echo "floor-built static SDL2 missing at $SDL2_LEGACY_PREFIX (see docs/build.md, legacy section)" >&2; exit 1; }
+build build-rel-linux-legacy-zig -DCMAKE_TOOLCHAIN_FILE="$root/tools/zig-legacy-toolchain.cmake"
+# floor gates (hard fails — a silent regression here ships a binary that
+# refuses to load or SIGILLs on the legacy target):
+#   glibc: highest GLIBC_* symbol version must be 2.17 (no GLIBCXX_* at
+#   all: libc++/libmodplug are linked statically).
+#   ISA: zero AVX/BMI/movbe mnemonics. lzcnt appears only in dr_flac's
+#   runtime-CPUID-guarded rice decoder (drflac__is_lzcnt_supported) and is
+#   benign there; the gate's discriminators are vpxor/movbe/tzcnt.
+floor=$(objdump -T build-rel-linux-legacy-zig/levari | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+[ "$floor" = "GLIBC_2.17" ] || { echo "legacy glibc floor is $floor, expected GLIBC_2.17" >&2; exit 1; }
+n=$(objdump -d build-rel-linux-legacy-zig/levari | grep -cE '\b(vpxor|movbe|tzcnt)\b')
+[ "$n" = 0 ] || { echo "legacy ISA scan: $n AVX/BMI/movbe refs found" >&2; exit 1; }
+package linux-legacy x86-64 build-rel-linux-legacy-zig levari README.md assets/levari.desktop assets/levari.svg
 
 sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}
 [ -f "$sdl2/sdl2-config.cmake" ] || { echo "SDL2-mingw cmake dir not found: $sdl2 (set SDL2_DIR)" >&2; exit 1; }

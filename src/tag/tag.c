@@ -14,6 +14,22 @@ void tag_init(Tags *t) {
 }
 
 static void copy_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
+    /* windows-1252 tier: the bytes 0x80-0x9F where cp1251 and windows-1252
+       AGREE (smart quotes, dashes, ellipsis, bullet, euro, per-mille, tm).
+       Taggers on Windows wrote these bytes for punctuation in enc=0/id3v1
+       fields — extremely common in real titles ("Don\u2019t Start Now");
+       latin-1 calls them C1 controls, which are never legitimate tag content
+       and render as invisible garbage. The disagreeing bytes (cyrillic
+       letters like 0x80 Ђ, 0x9A Њ, 0x9C ѕ/œ, and the undefined 0x90/0x98)
+       keep the latin-1 C1 reading: the cp1251 classifier already handles
+       them when context says cyrillic, and guessing would move other pins.
+       Mirror of test/tagwords/tagcheck.py W1252 — keep in sync. */
+    static const struct { unsigned char b; unsigned cp; } w1252[] = {
+        {0x82,0x201A},{0x84,0x201E},{0x85,0x2026},{0x86,0x2020},{0x87,0x2021},
+        {0x88,0x20AC},{0x89,0x2030},{0x8B,0x2039},
+        {0x91,0x2018},{0x92,0x2019},{0x93,0x201C},{0x94,0x201D},{0x95,0x2022},
+        {0x96,0x2013},{0x97,0x2014},{0x99,0x2122},{0x9B,0x203A},
+    };
     size_t j = 0;
     for (int i = 0; i < n && src[i]; i++) {
         unsigned char c = src[i];
@@ -23,10 +39,19 @@ static void copy_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
             dst[j++] = (char)c;
             continue;
         }
-        /* latin-1 -> utf-8 */
-        if (j + 2 >= dn) break;
-        dst[j++] = (char)(0xC0 | (c >> 6));
-        dst[j++] = (char)(0x80 | (c & 0x3F));
+        unsigned cp = c;                        /* latin-1 -> utf-8 */
+        for (unsigned k = 0; k < sizeof w1252 / sizeof w1252[0]; k++)
+            if (w1252[k].b == c) { cp = w1252[k].cp; break; }
+        if (cp < 0x800) {
+            if (j + 2 >= dn) break;
+            dst[j++] = (char)(0xC0 | (cp >> 6));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (j + 3 >= dn) break;
+            dst[j++] = (char)(0xE0 | (cp >> 12));
+            dst[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        }
     }
     /* ID3v1 pads its fixed-width fields with spaces; drop the trailing run
        so short tags don't turn into "Artist<24 spaces>" in the title bar */
@@ -93,32 +118,46 @@ static const uint16_t cp1251_hi[128] = {
    *mb whether any multibyte sequence is present (a truncated tail counts) */
 static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) {
     size_t i = 0, last = 0;
-    int m = 0;
+    int m = 0, badpair = 0;
     while (i < (size_t)n && src[i]) {
         unsigned c = src[i];
         int len;
         if (c < 0x80) { i++; last = i; continue; }
+        if (c < 0xC2 || c >= 0xF5) return 0;   /* C0/C1 overlongs and F5+ are not
+                                                  UTF-8 lead bytes: accepting F5-F7
+                                                  ate real cp1251 words (ц=F6 turned
+                                                  "цієї" into one fake 4-byte char) */
         if ((c & 0xE0) == 0xC0) len = 2;
         else if ((c & 0xF0) == 0xE0) len = 3;
         else if ((c & 0xF8) == 0xF0) len = 4;
         else return 0;
         if (i + (size_t)len > (size_t)n) {
-            /* truncated tail: accept ONLY when the lead is followed by at
-               least one real continuation byte and complete content precedes
-               it — that shape is a fixed-width field cutting an emoji (or a
-               3-4 byte char) mid-sequence. A lead-class byte with no
-               continuation bytes behind it is how latin-1/cp1251 accents sit
-               at a field end (é=0xE9, "да"=E4 E0, the E4 closing cp1251
-               "Від"): reject the whole field and let the shape rules read it
-               instead of clamping the text away before the accent. */
+            /* truncated tail: accept when the tail carries >=2 real
+               continuation bytes (a 4-byte char/emoji cut — the 0.3.2
+               clamp case), or when the field ALREADY contains a complete
+               multibyte char and no complete 2-byte pair decoded to a
+               latin-1 symbol. that pair class (U+0080-0x00BF, ×, ÷) is
+               exactly how cp1251 words masquerade ("Від"=C2 B3 E4: a
+               pseudo-pair + trailing lead), while real UTF-8 cyrillic/
+               cjk pairs decode to letters — accept those and clamp the
+               cut. a lone lead-class byte with no continuation behind it
+               and no prior multibyte stays the latin-1/cp1251 field-end
+               shape (é=0xE9, "да"=E4 E0): reject the whole field and let
+               the shape rules read it. */
             size_t k = 1;
             while (i + k < (size_t)n && (src[i + k] & 0xC0) == 0x80) k++;
-            if (k > 1 && last > 0) { *clamped = last; *mb = 1; return 1; }
+            if (last > 0 && (k >= 3 || (m && !badpair))) { *clamped = last; *mb = 1; return 1; }
             return 0;
         }
         for (int k = 1; k < len; k++)
             if ((src[i + k] & 0xC0) != 0x80) return 0;
         if (len > 1) m = 1;
+        if (len == 2) {                          /* decoded class of a complete
+                                                    2-byte pair: latin-1 symbol
+                                                    = cp1251 masquerade evidence */
+            unsigned cp = ((c & 0x1F) << 6) | (src[i + 1] & 0x3F);
+            if (cp <= 0xBF || cp == 0xD7 || cp == 0xF7) badpair = 1;
+        }
         i += (size_t)len;
         last = i;
     }
@@ -140,12 +179,14 @@ static int cp1251_letter(unsigned char c) {
            cp1251_hi: ukrainian і ї є ґ Ґ, belarusian ў і, macedonian/serbian
            ѓ ѕ љ њ џ Ћ Ќ and companions. excluding them made "Від" "Київ"
            "їсти" fall to latin-1 — 0.3.0's crude >=0x80 adjacency read them
-           fine. the latin-1 punctuation that shares the range (°±µ¹½¼¾»
-           № «¬ etc.) stays a non-letter so Hääyö/Grüße/"12½" stay latin-1 */
+           fine. the latin-1 punctuation that shares the range (°±µ¹» ¤¦ etc.)
+           stays a non-letter so Hääyö/Grüße stay latin-1. 0xBD (cp1251 ќ) is
+           deliberately NOT a letter: the position carries latin-1 ½, common
+           in titles ("12½"), and ќ is rare; 0xBC/0xBE stay letters (Ќ/џ) */
         static const unsigned char lo[] = {
             0x80,0x81,0x83,0x8A,0x8C,0x8D,0x8E,0x8F,0x90,0x9A,
             0x9C,0x9D,0x9E,0x9F,0xA1,0xA2,0xA3,0xA5,0xAA,0xAF,
-            0xB2,0xB3,0xB4,0xBA,0xBC,0xBD,0xBE,0xBF,
+            0xB2,0xB3,0xB4,0xBA,0xBC,0xBE,0xBF,
         };
         for (unsigned i = 0; i < sizeof lo; i++)
             if (lo[i] == c) return 1;

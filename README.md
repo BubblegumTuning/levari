@@ -2,13 +2,12 @@
 
 # levari
 
-A tiny, fast Winamp 2.95-style audio player for Linux and Windows,
-written in C11.
-SDL2 UI with software-rendered skinning, mp3/ogg/opus/flac/wav/mod/s3m/
-xm/it/spc decoding (plus aac/m4a/wma via optional libav* backend), CJK
-(JIS X 0208) text,
-playlist, 10-band EQ, spectrum viz, CUE sheets, daemon + CLI control,
-MPRIS, media library, and search.
+A tiny, fast Winamp 2.95-style audio player for Linux, Windows and
+macOS, written in C11. SDL2 UI with software-rendered skinning,
+mp3/ogg/opus/flac/wav/mod/s3m/xm/it/spc (SNES SPC700 rips) decoding
+(plus aac/m4a/wma via optional libav* backend), CJK (JIS X 0208)
+text, playlist, 10-band EQ, spectrum viz, CUE sheets, daemon + CLI
+control, MPRIS, media library, and search.
 
 ## Build
 
@@ -18,7 +17,7 @@ MPRIS, media library, and search.
 
 SDL2 dev headers and a C++ compiler are all it takes on Linux;
 [docs/build.md](docs/build.md) covers the optional features (libav*,
-MPRIS, MCP), Raspberry Pi tuning, and the Windows cross-build.
+MPRIS, MCP), Raspberry Pi tuning, and the Windows and macOS builds.
 
 ## Quick start
 
@@ -28,7 +27,7 @@ MPRIS, MCP), Raspberry Pi tuning, and the Windows cross-build.
 
 ## Docs
 
-- [docs/build.md](docs/build.md) — build requirements, optional features, Linux install, Raspberry Pi, Windows cross-build
+- [docs/build.md](docs/build.md) — build requirements, optional features, Linux install, Raspberry Pi, Windows cross-build, macOS build
 - [docs/ui.md](docs/ui.md) — windows, hotkeys, search, window snapping
 - [docs/buttons.md](docs/buttons.md) — what every button in the interface does
 - [docs/usage.md](docs/usage.md) — CLI flags, daemon commands, MPRIS, media library

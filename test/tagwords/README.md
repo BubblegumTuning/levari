@@ -18,9 +18,17 @@ inside an ascii word), l1 (real western words, latin-1 bytes), cyr
 u8 (real UTF-8 payload in an enc=0 field — sloppy but common, must pass
 through), u8t (valid UTF-8 with a truncated 4-byte tail — the clamp pins),
 v1l/v1c (ID3v1 tail shape, NUL-padded: padding must neutralize the trap),
+u8cut/u8cut2 (utf-8 cut at a char boundary in a fixed-width field),
+v1cut/v1u8 (id3v1's 30 bytes cutting cp1251 / UTF-8 text mid-char),
+bigc/bigl (two-word legacy fields: boundary adjacency rules),
+l1w/v1w (windows-1252 bytes of TEXT: the 0x80-0x9F punctuation where
+cp1251 and windows-1252 AGREE — smart quotes, dashes, ellipsis; the
+latin-1 fallback must read them as punctuation, never as C1 controls),
+au8/au8t/au8cut/au8cut2 (the u8 shapes in a TPE1 frame instead of TIT2:
+the ARTIST field is pinned; probe.c prints title and artist),
 obs (ambiguous byte strings: reported, never asserted).
 
-Current baselines (1117 pinned entries + 25 observe):
+Current baselines (1150 pinned entries + 29 observe):
   v0.3.2 (tagged, pre-fix): 270 pinned failures
       l1m 144   every lead-class byte 0xC0-0xF7 at its trap distance
       l1  107   real words: café-type tails, pão/você/caffè/città/blå/kök...
@@ -48,3 +56,39 @@ Rules:
   lacks). Keep tagcheck.py's mirror table in sync if tag.c's changes.
 - copy_utf8/copy_legacy trim trailing spaces by design; never pin a text
   with a trailing space.
+
+Deep dive (one-shot sweeps, NOT part of the constant gate)
+----------------------------------------------------------
+divegen.py expands top-N frequency words into temporary corpora
+(test-assets/corpus/dive-<lang>.txt, git-ignored) and tagcheck runs them
+with --corpus. Sweep of 2026-11-02: fi/ja 5000 words + ru/uk/fr/de/no
+1000 = 55,879 fixtures; found ~8.5k real failures, all in the UTF-8
+lead-byte/truncation family (plus the Ukrainian "цієї" eaten by a fake
+4-byte lead). Fixed classes are pinned in SECTION 10; the irreducible
+residue (a word whose only multibyte char is cut at a field end — byte-
+identical to the latin-1 accent) is documented there with counts.
+Run:  python3 test/tagwords/divegen.py && for L in fi ja ru uk fr de no; do python3 test/tagwords/tagcheck.py --corpus test-assets/corpus/dive-$L.txt; done
+
+kworb sweep 2026-11-02 (second one-shot, also NOT part of the gate): the
+top-2500 streamed songs' TITLES AND ARTISTS from kworb.net/spotify/songs.html
+(2413 unique titles, 1023 unique artists) expanded into 20,412 fixtures
+including TPE1/id3v1-artist variants. Zero new decode bug classes — the
+UTF-8 path was spotless; it exposed the windows-1252 tier instead: a lone
+smart-quote byte (usually 0x92) in a legacy field decoded as a latin-1 C1
+control (18/2413 titles carry one). The fix pins the 17 cp1251/w1252-agreed
+bytes as l1w/v1w (SECTION 11); the 85 matrix lines for those bytes moved
+l1m->l1w with the contract, the disagreeing bytes keep the C1 reading and
+stay l1m. The tool lived in a scratch dir (one-shot, corpus lists are not
+kept in git); SECTION 11 documents the counts and artist-field proof.
+
+Thanks
+------
+Word lists from Hermit Dave's FrequencyWords project
+(github.com/hermitdave/FrequencyWords, mirrored on our Gitea as
+AI/FrequencyWords; code MIT, content CC-by-sa-4.0 — the lists are NOT
+kept in this repo, they are fetched and cached in the git-ignored
+test-assets/corpus/, sha256-pinned in divegen.py). The large sweeps
+against these lists are what surfaced the lead-byte decoding bugs
+pinned in SECTION 10 — many thanks to the project's creator.
+Real-world song title/artist shapes from kworb.net (top Spotify streams
+tables) drove the 2026-11-02 sweep that produced the windows-1252 tier.

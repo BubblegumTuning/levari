@@ -212,11 +212,21 @@ endif()
 if(UNIX AND NOT APPLE)
     pkg_check_modules(DBUS dbus-1)
     if(DBUS_FOUND)
+        # link the absolute path, not -ldbus-1: the zig-legacy cross link
+        # (tools/zig-legacy-toolchain.cmake) keeps the host's /usr/lib64 off
+        # the search path on purpose, so a bare -l would not resolve there.
+        # Harmless for native builds (same library); the soname recorded in
+        # the binary is still libdbus-1.so.3, whose ABI is stable since 2007,
+        # so old targets satisfy it with their own dbus.
+        find_library(DBUS_LINK NAMES dbus-1 HINTS "${DBUS_LIBRARY_DIRS}")
+        if(NOT DBUS_LINK)
+            set(DBUS_LINK "${DBUS_LIBRARIES}")
+        endif()
         target_sources(levari PRIVATE src/mpris/mpris.c)
         target_compile_definitions(levari PRIVATE HAVE_MPRIS)
         target_include_directories(levari PRIVATE ${DBUS_INCLUDE_DIRS})
         target_link_directories(levari PRIVATE ${DBUS_LIBRARY_DIRS})
-        target_link_libraries(levari ${DBUS_LIBRARIES})
+        target_link_libraries(levari "${DBUS_LINK}")
     endif()
 endif()
 
