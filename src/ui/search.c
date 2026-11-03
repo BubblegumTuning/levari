@@ -81,7 +81,9 @@ static void norm(const char *src, char *dst, size_t dn) {
         if (cp >= 'A' && cp <= 'Z') { dst[o++] = (char)(cp + 32); continue; }
         if (cp >= 0x0410 && cp <= 0x042F) cp += 0x20;
         else if (cp == 0x0401) cp = 0x0451;
-        else if (cp >= 0x0402 && cp <= 0x040F) cp += 0x50;
+        else if (cp >= 0x0400 && cp <= 0x040F) cp += 0x50;   /* Ѐ-Џ (0x0400-0x040F):
+                                                                Ѐ->ј... starts at 0x0400;
+                                                                0x0401 (Ё) folds above */
         /* 0x04C1-0x04CE pair INVERTED: capitals are ODD, smalls EVEN.
            Fold those capitals down +1; the block must stay out of the
            even->odd rule below or its smalls fold into the wrong letter

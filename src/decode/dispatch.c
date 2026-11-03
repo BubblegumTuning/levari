@@ -3,11 +3,13 @@
    different x86 codegen levels; this shim owns the plain public API and
    picks the best tier the CPU supports, once, on first use. A plain
    (tier-less) build never links this file.
-   LEVAR_DECODE=sse2|avx|avx2 forces a tier — debug/verification hook.
-   The ready flag is a benign race: concurrent first calls compute the same
-   table, and a torn read is impossible (every field is chosen before ready
-   is set). */
+    LEVAR_DECODE=sse2|avx|avx2 forces a tier — debug/verification hook; an
+    unknown value warns and falls back to what the CPU/build actually offer.
+    Tier selection runs exactly once under pthread_once, which also publishes
+    the table to all later callers. */
 #include "decode.h"
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,34 +47,52 @@ typedef struct {
       dec_read##SFX, dec_seek##SFX, dec_close##SFX, dec_ffmpeg_probe##SFX }
 
 static DecTier t;
-static int ready;
+static pthread_once_t tier_once = PTHREAD_ONCE_INIT;
 
 static void tier_pick(void) {
     DecTier c = LV_TIER_TABLE(_sse2);
 #ifdef LEVAR_DECODE_HAVE_X86
     const char *force = getenv("LEVAR_DECODE");
+    int got = 0;   /* 2 = avx2, 1 = avx, 0 = sse2: what the CPU/build gave us */
 #ifdef LEVAR_HAVE_AVX2
     if ((!force || strcmp(force, "avx2") == 0)
         && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")
         && __builtin_cpu_supports("bmi") && __builtin_cpu_supports("bmi2")
-        && __builtin_cpu_supports("lzcnt"))
+        && __builtin_cpu_supports("lzcnt")) {
         c = (DecTier)LV_TIER_TABLE(_avx2);
-    else
+        got = 2;
+    } else
 #endif
 #ifdef LEVAR_HAVE_AVX
     if ((!force || strcmp(force, "avx") == 0)
-        && __builtin_cpu_supports("avx") && __builtin_cpu_supports("fma"))
+        && __builtin_cpu_supports("avx") && __builtin_cpu_supports("fma")) {
         c = (DecTier)LV_TIER_TABLE(_avx);
-    else
+        got = 1;
+    } else
 #endif
-        (void)force;
+        (void)0;
+    /* LEVAR_DECODE is a verification hook: never let a typo silently run the
+       sse2 tier — say what was requested and what is actually in use. */
+    if (force) {
+        int want = strcmp(force, "avx2") == 0 ? 2
+                 : strcmp(force, "avx")   == 0 ? 1
+                 : strcmp(force, "sse2")  == 0 ? 0 : -1;
+        if (want < 0)
+            fprintf(stderr, "levari: unknown LEVAR_DECODE '%s'; using %s\n",
+                    force, got == 2 ? "avx2" : got == 1 ? "avx" : "sse2");
+        else if (want != got)
+            fprintf(stderr, "levari: LEVAR_DECODE '%s' not available; using %s\n",
+                    force, got == 2 ? "avx2" : got == 1 ? "avx" : "sse2");
+    }
 #endif
     t = c;
-    ready = 1;
 }
 
+/* pthread_once: exactly one tier_pick, and its happens-before edge makes the
+   table visible to every caller (the old !ready flag was a data race under
+   the C11 model even though the values were benign). */
 static DecTier *tier(void) {
-    if (!ready) tier_pick();
+    pthread_once(&tier_once, tier_pick);
     return &t;
 }
 

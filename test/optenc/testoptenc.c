@@ -86,6 +86,17 @@ int main(void) {
     char buf[8192]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
     chk("config file carries the value", strstr(buf, "tag.legacy_encoding = cp1251") != NULL, 1);
 
+    /* close WITHOUT save: cfg is cp1251 (just persisted); cycle live to utf8,
+       then opt_close must roll tag.c's live default back to cfg (cp1251) so
+       the button re-read on next open and the decoder never disagree. */
+    click(186 + 36, 150 + 7);          /* cp1251 -> utf8, applied live */
+    tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
+    chk("live before close: utf8 forced", strcmp(t.title, "\xcd\xb3") == 0, 1);
+    opt_close();
+    tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
+    chk("close-without-save reverts live default to cfg (cp1251)",
+        strcmp(t.title, "\xd0\x9d\xd1\x96") == 0, 1);
+
     printf(fails ? "FAILURES: %d\n" : "all LEGACY button checks pass\n", fails);
     return fails != 0;
 }

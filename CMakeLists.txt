@@ -109,9 +109,12 @@ endif()
 # tier (SSE2 baseline, AVX+FMA, AVX2); tier_rename.h suffixes every tier's
 # symbols and src/decode/dispatch.c owns the public API, picking the best
 # tier the CPU supports at runtime (LEVAR_DECODE=sse2|avx|avx2 to force).
-# Same source, bit-identical output; only codegen differs. Tiers stay OFF
-# for the legacy x86-64 build: tools/release.sh's ISA floor gate must not
-# see VEX instructions, and old CPUs run the SSE2 tier anyway.
+# Same source, bit-identical output ONLY with -ffp-contract=off: with the
+# default (fast) contraction the compiler folds a multiply+add into one FMA
+# rounding, and the avx/avx2 Vorbis output drifts +/-1 LSB from sse2 (FLAC
+# and WAV are unaffected — no fused ops). Tiers stay OFF for the legacy
+# x86-64 build: tools/release.sh's ISA floor gate must not see VEX
+# instructions, and old CPUs run the SSE2 tier anyway.
 option(LEVAR_SIMD_TIERS "runtime-dispatched AVX/AVX2 decoder tiers" ON)
 set(LEVAR_TIERS "")
 if(LEVAR_SIMD_TIERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
@@ -248,13 +251,15 @@ if(LEVAR_TIERS)
     # -march=x86-64 pins the ISA floor explicitly: some toolchains default
     # above the baseline (this host's gcc ships x86-64-v3), and the sse2
     # tier is what the dispatcher hands to old CPUs — its name must match
-    # its instructions
+    # its instructions. -ffp-contract=off disables FMA contraction so the
+    # three tiers produce bit-identical Vorbis output (the imdct/filterbank
+    # multiply+add is not merged into one rounding step).
     if(WIN32)
-        set(LEVAR_TIER_BASE -march=x86-64 -ffunction-sections -fdata-sections -fstack-protector-strong)
+        set(LEVAR_TIER_BASE -march=x86-64 -ffp-contract=off -ffunction-sections -fdata-sections -fstack-protector-strong)
     elseif(APPLE)
-        set(LEVAR_TIER_BASE -march=x86-64 -ffunction-sections -fdata-sections -fstack-protector-strong)
+        set(LEVAR_TIER_BASE -march=x86-64 -ffp-contract=off -ffunction-sections -fdata-sections -fstack-protector-strong)
     else()
-        set(LEVAR_TIER_BASE -march=x86-64 -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2)
+        set(LEVAR_TIER_BASE -march=x86-64 -ffp-contract=off -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2)
     endif()
     foreach(tier IN LISTS LEVAR_TIERS)
         add_library(dec_${tier} OBJECT src/decode/decode.c third_party/stb_vorbis.c)

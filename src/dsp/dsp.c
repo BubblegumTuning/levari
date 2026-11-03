@@ -14,13 +14,16 @@ void dsp_flush_denormals(void) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _mm_setcsr(_mm_getcsr() | 0x0040u); /* MXCSR DAZ */
 #elif defined(__arm__)
-    /* FZ (FPSCR bit 31) exists from ARMv6E on (ARM1176JZF-S yes); RES0
-       and ignored on anything older, and VFPv2 evaluates doubles in
-       software so ws's double blend is untouched. No DAZ counterpart,
-       but the flushed state reads back as zero, same collapse */
+    /* FZ is FPSCR bit 24 (NOT 31 — bits 27-31 are the QC/V/C/Z/N condition
+       flags, writing them does nothing for denormals). FZ exists from
+       ARMv6 on (the Pi Zero's ARM1176JZF-S has it), and is RES0 and ignored
+       on anything older. Unlike x86, ARM's single FZ bit flushes both the
+       denormal operands (their read-back is zero, so no DAZ counterpart is
+       needed) and the denormal result, collapsing the decay tail to 0.
+       VFPv2 evaluates doubles in software so ws's double blend is untouched. */
     unsigned int f;
     __asm__ __volatile__("vmrs %0, fpscr" : "=r"(f));
-    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(f | (1u << 31)));
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(f | (1u << 24)));
 #elif defined(__aarch64__)
     unsigned long f;
     __asm__ __volatile__("mrs %0, fpcr" : "=r"(f));
@@ -202,9 +205,6 @@ static int ws_search(const int16_t *base, const int16_t *tail, int ov) {
 
 int ws_process(WS *w, const int16_t *in, int frames, int ch, int16_t *out) {
     if (ch > 2) ch = 2;
-    static int16_t tmp[2][4 * WS_FRAME + WS_FRAME];
-    static int16_t mix[2 * WS_SEARCH + WS_FRAME];
-    static int16_t mtail[WS_FRAME / 2];
     const int Hs = WS_FRAME / 2;
     int Ha = (int)(Hs * w->s + 0.5);
     if (Ha < 64) Ha = 64;
@@ -233,15 +233,15 @@ int ws_process(WS *w, const int16_t *in, int frames, int ch, int16_t *out) {
             const int16_t *mb = w->in[0], *mt = w->tail[0];
             if (ch == 2) {
                 for (int j = 0; j < 2 * WS_SEARCH + ov; j++)
-                    mix[j] = (int16_t)(((int)w->in[0][j] + (int)w->in[1][j] + 1) >> 1);
+                    w->mix[j] = (int16_t)(((int)w->in[0][j] + (int)w->in[1][j] + 1) >> 1);
                 for (int j = 0; j < ov; j++)
-                    mtail[j] = (int16_t)(((int)w->tail[0][j] + (int)w->tail[1][j] + 1) >> 1);
-                mb = mix; mt = mtail;
+                    w->mtail[j] = (int16_t)(((int)w->tail[0][j] + (int)w->tail[1][j] + 1) >> 1);
+                mb = w->mix; mt = w->mtail;
             }
             d = ws_search(mb + WS_SEARCH, mt, ov);
         }
         for (int c = 0; c < ch; c++) {
-            int16_t *o = tmp[c] + produced;
+            int16_t *o = w->tmp[c] + produced;
             const int16_t *f = w->in[c] + WS_SEARCH + d;
             if (w->primed) {
                 for (int i = 0; i < ov; i++) {
@@ -258,7 +258,7 @@ int ws_process(WS *w, const int16_t *in, int frames, int ch, int16_t *out) {
             /* each hop emits Hs samples and ov <= Hs, so tail[] covers it */
             int save = ov < produced + Hs ? ov : produced + Hs;
             for (int i = 0; i < save; i++)
-                w->tail[c][i] = tmp[c][produced + Hs - save + i];
+                w->tail[c][i] = w->tmp[c][produced + Hs - save + i];
         }
         w->primed = 1;
         produced += Hs;
@@ -270,6 +270,6 @@ int ws_process(WS *w, const int16_t *in, int frames, int ch, int16_t *out) {
 
     for (int i = 0; i < produced; i++)
         for (int c = 0; c < ch; c++)
-            out[(size_t)i * ch + c] = tmp[c][i];
+            out[(size_t)i * ch + c] = w->tmp[c][i];
     return produced;
 }

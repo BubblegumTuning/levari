@@ -96,7 +96,7 @@ typedef struct {
     int opt_scanning;            /* a library scan thread is running */
     int opt_tags;                /* scan reads tags+duration, not just names */
     SDL_atomic_t opt_scan_done;  /* set by the scan thread when finished */
-    int opt_scan_added, opt_scan_seen;
+    int opt_scan_added, opt_scan_seen, opt_scan_skipped;
     char opt_status[96];         /* one-line scan/clear feedback */
     int menu;            /* right-click titlebar dropdown: 0 closed 1 open */
     int pressed;
@@ -1365,6 +1365,12 @@ static void opt_open(void) {
 }
 
 static void opt_close(void) {
+    /* the encoding button applies live (tag_set_legacy_default on every click)
+       but only SAVE persists it: on a close that was not a save, roll the
+       live default back to the config value the window opened with, so the
+       button (which re-reads cfg on next open) and tag.c never disagree.
+       After a save cfg already equals the clicked value, so this is a no-op. */
+    tag_set_legacy_default(cfg.tag_legacy_enc);
     ui.opt_visible = 0;
     ui.opt_focus = -1;
     ui.opt_caret = 0;
@@ -1411,10 +1417,11 @@ typedef struct { char (*dirs)[LV_MAX_PATH]; int n; int tags; } ScanArg;
 
 static int scan_thread(void *p) {
     ScanArg *a = p;
-    int added = 0, seen = 0;
-    lib_scan_add(a->dirs, a->n, a->tags, &added, &seen, NULL);
+    int added = 0, seen = 0, skipped = 0;
+    lib_scan_add(a->dirs, a->n, a->tags, &added, &seen, &skipped);
     ui.opt_scan_added = added;
     ui.opt_scan_seen = seen;
+    ui.opt_scan_skipped = skipped;
     SDL_AtomicSet(&ui.opt_scan_done, 1);
     free(a->dirs);
     free(a);
@@ -2377,8 +2384,13 @@ int ui_run(Player *p, int show_pl) {
         if (SDL_AtomicGet(&ui.opt_scan_done)) {
             SDL_AtomicSet(&ui.opt_scan_done, 0);
             ui.opt_scanning = 0;
-            snprintf(ui.opt_status, sizeof ui.opt_status,
-                     "added %d (%d seen)", ui.opt_scan_added, ui.opt_scan_seen);
+            if (ui.opt_scan_skipped)
+                snprintf(ui.opt_status, sizeof ui.opt_status,
+                         "added %d (%d seen, %d path(s) too long)",
+                         ui.opt_scan_added, ui.opt_scan_seen, ui.opt_scan_skipped);
+            else
+                snprintf(ui.opt_status, sizeof ui.opt_status,
+                         "added %d (%d seen)", ui.opt_scan_added, ui.opt_scan_seen);
             search_lib_invalidate();
             ui_dirty |= D_OPT;
         }

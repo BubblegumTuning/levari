@@ -88,9 +88,16 @@ sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}
 build build-rel-win -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-toolchain.cmake" -DSDL2_DIR="$sdl2"
 package win x86-64 build-rel-win levari.exe README.md
 
-# pi targets join when their toolchains are ready, e.g.:
-#   build build-rel-pi0 -DCMAKE_TOOLCHAIN_FILE=tools/armv6-toolchain.cmake -DLV_TUNE=arm1176jzf-s
-#   package pi0 arm32 build-rel-pi0 levari README.md
+# Pi Zero 1 / Pi 1 (ARMv6 hard-float). Wired up via tools/armv6-toolchain.cmake;
+# runs when a matching cross compiler is installed, otherwise skipped with a
+# notice (a hard failure here would abort the whole release under set -e).
+# Cortex-a7/a15 Pi 2-4 still need their own toolchain files to join.
+if command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+    build build-rel-pi0 -DCMAKE_TOOLCHAIN_FILE="$root/tools/armv6-toolchain.cmake" -DLV_TUNE=arm1176jzf-s
+    package pi0 arm32 build-rel-pi0 levari README.md
+else
+    echo "== pi0 skipped: arm-linux-gnueabihf-gcc not installed"
+fi
 
 echo
 echo "release artifacts for v$ver (drag everything in $out/ into the release):"

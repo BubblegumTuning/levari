@@ -69,6 +69,8 @@ int main(void) {
     pin(0x0410, 0x0430, "A cyrillic");
     pin(0x042F, 0x044F, "YA cyrillic");
     pin(0x0401, 0x0451, "yo");
+    pin(0x0400, 0x0450, "I grave cap (block start)");
+    pin(0x0450, 0x0450, "I grave small (unmoved)");
     pin(0x0402, 0x0452, "dje");
     pin(0x0406, 0x0456, "byelorussian-i");
     pin(0x040F, 0x045F, "dzhe");

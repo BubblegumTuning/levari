@@ -325,9 +325,17 @@ static void *srv_thread(void *arg) {
         conn.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
         BOOL cok = ConnectNamedPipe(h, &conn);
         DWORD ce = GetLastError();
-        if (!cok && ce == ERROR_IO_PENDING)
-            cok = WaitForSingleObject(conn.hEvent, INFINITE) == WAIT_OBJECT_0;
-        if (!cok && GetLastError() != ERROR_PIPE_CONNECTED && ce != ERROR_PIPE_CONNECTED) {
+        if (!cok && ce == ERROR_IO_PENDING) {
+            if (WaitForSingleObject(conn.hEvent, INFINITE) == WAIT_OBJECT_0) {
+                DWORD ign = 0;
+                /* the event only says "a completion arrived"; GetOverlappedResult
+                   reaps it and reports the true connect status/error. Without it
+                   the overlapped operation is left unreaped. */
+                cok = GetOverlappedResult(h, &conn, &ign, FALSE);
+                if (!cok) ce = GetLastError();
+            }
+        }
+        if (!cok && ce != ERROR_PIPE_CONNECTED) {
             pthread_mutex_lock(&pipe_mtx);
             cur_pipe = INVALID_HANDLE_VALUE;
             pthread_mutex_unlock(&pipe_mtx);
@@ -373,8 +381,21 @@ static void *srv_thread(void *arg) {
                 handle_cmd(srv_p, line, resp, sizeof resp);
                 size_t rl = strlen(resp);
                 resp[rl++] = '\n';
+                /* the pipe is FILE_FLAG_OVERLAPPED: a synchronous WriteFile
+                   (lpOverlapped == NULL) is invalid on an async handle. Drive
+                   the write with its own OVERLAPPED + event, bounded by the
+                   same 5 s budget the read uses. */
+                OVERLAPPED wr = {0};
+                wr.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
                 DWORD w = 0;
-                WriteFile(h, resp, (DWORD)rl, &w, NULL);
+                if (!WriteFile(h, resp, (DWORD)rl, &w, &wr) &&
+                    GetLastError() == ERROR_IO_PENDING) {
+                    if (WaitForSingleObject(wr.hEvent, 5000) == WAIT_OBJECT_0)
+                        GetOverlappedResult(h, &wr, &w, FALSE);
+                    else
+                        CancelIoEx(h, &wr);
+                }
+                if (wr.hEvent) CloseHandle(wr.hEvent);
                 FlushFileBuffers(h);
             }
         }
@@ -535,8 +556,23 @@ int srv_start(Player *p) {
         char dir[512];
         lv_strlcpy(dir, pf, sizeof dir);
         if (lv_dirname(dir)) mkdir(dir, 0755);
-        FILE *w = pf[0] ? fopen(pf, "w") : NULL;
-        if (w) { fputs(path, w); fclose(w); lv_strlcpy(srv_ptr_pub, pf, sizeof srv_ptr_pub); }
+        /* publish atomically: a client resolving the pointer must never read a
+           half-written path. Write a per-pid temp in the same directory, then
+           rename() over the target (atomic within one filesystem). */
+        int wrote = 0;
+        if (pf[0]) {
+            char tmp[600];
+            snprintf(tmp, sizeof tmp, "%s.%ld.tmp", pf, (long)getpid());
+            FILE *w = fopen(tmp, "w");
+            if (w) {
+                fputs(path, w);
+                if (fclose(w) == 0 && chmod(tmp, 0600) == 0 && rename(tmp, pf) == 0)
+                    wrote = 1;
+                else
+                    unlink(tmp);
+            }
+        }
+        if (wrote) lv_strlcpy(srv_ptr_pub, pf, sizeof srv_ptr_pub);
         else fprintf(stderr, "levari: cannot publish socket path to %s; "
                              "CLI/MCP cannot reach this instance\n", pf);
     }

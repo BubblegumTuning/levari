@@ -46,6 +46,12 @@ typedef struct {
     int in_n[2];
     int16_t tail[2][WS_FRAME / 2]; /* last min(ov, Hs) samples; Hs == WS_FRAME/2 */
     int primed;
+    /* per-instance scratch: these were function-static in ws_process, which
+       made the routine non-reentrant and shared state across any future
+       second player; they belong to the WS the caller owns. */
+    int16_t tmp[2][5 * WS_FRAME];
+    int16_t mix[2 * WS_SEARCH + WS_FRAME];
+    int16_t mtail[WS_FRAME / 2];
 } WS;
 
 void ws_init(WS *w, double speed);

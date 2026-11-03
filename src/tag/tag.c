@@ -1,6 +1,7 @@
 #include "tag.h"
 #include "../common.h"
 #include <ctype.h>
+#include <stdatomic.h>
 
 /* One head read per file: on network / spinning-disk storage every open and
    every seek to a new region costs a round-trip, so tag_probe pulls this
@@ -188,6 +189,15 @@ static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) 
         }
         for (int k = 1; k < len; k++)
             if ((src[i + k] & 0xC0) != 0x80) return 0;
+        /* lead byte + well-formed continuations is not enough: reject the
+           overlong, surrogate and out-of-range encodings (the C0/C1 overlong
+           leads and F5+ are already gone above). 0xED is only ever a
+           surrogate; E0/F0 need a floor and F4 a ceiling on the second byte. */
+        unsigned char b1 = src[i + 1];
+        if ((len == 3 && c == 0xE0 && b1 < 0xA0) ||
+            (len == 3 && c == 0xED && b1 >= 0xA0) ||
+            (len == 4 && c == 0xF0 && b1 < 0x90) ||
+            (len == 4 && c == 0xF4 && b1 >= 0x90)) return 0;
         if (len > 1) m = 1;
         if (len >= 3) m3 = 1;                    /* complete 3/4-byte char: UTF-8 evidence */
         if (len == 2) {                          /* classify a complete 2-byte pair:
@@ -218,13 +228,19 @@ static int cp1251_letter(unsigned char c) {
     if (c < 0x80) return 0;
     if (c < 0xC0) {
         /* the cp1251-specific cyrillic letters of the 0x80-0xBF block per
-           cp1251_hi: ukrainian і ї є ґ Ґ, belarusian ў і, macedonian/serbian
-           ѓ ѕ љ њ џ Ћ Ќ and companions. excluding them made "Від" "Київ"
-           "їсти" fall to latin-1 — 0.3.0's crude >=0x80 adjacency read them
-           fine. the latin-1 punctuation that shares the range (°±µ¹» ¤¦ etc.)
-           stays a non-letter so Hääyö/Grüße stay latin-1. 0xBD (cp1251 ќ) is
-           deliberately NOT a letter: the position carries latin-1 ½, common
-           in titles ("12½"), and ќ is rare; 0xBC/0xBE stay letters (Ќ/џ) */
+           cp1251_hi: ukrainian І і (0xB2/0xB3) є (0xBA) ґ (0xA5/0xB4) ї (0xAF/0xBF),
+           belarusian ў (0xA2), serbian/macedonian ј (0xBC) ѕ (0xBE) Ђ-Џ and
+           companions. excluding them made "Від" "Київ" "їсти" fall to latin-1.
+           Several of these bytes are ALSO common latin-1 symbols — 0xB2 ² /
+           0xB3 ³ / 0xAA ª / 0xBA º / 0xBC ¼ / 0xBF ¿ — so a latin-1 title using
+           one of them could in principle be misread as a cp1251 word. It is
+           not: looks_cp1251 and ev_field only claim cyrillic for a run of >=2
+           unglued letter bytes, and a stray ²/³/º/¾ never forms such a run
+           (isolated, or glued to an ascii/digit). Keeping them wins the common
+           case (Ukrainian і/є are everywhere in real tags). 0xBD (cp1251 Ѕ) is
+           deliberately NOT a letter: the position carries latin-1 ½, common in
+           titles ("12½"), and Ѕ is rare. (Names corrected: the old comment
+           mislabeled 0xBC/0xBD/0xBE as Ќ/ќ/џ — per cp1251_hi they are ј/Ѕ/ѕ.) */
         static const unsigned char lo[] = {
             0x80,0x81,0x83,0x8A,0x8C,0x8D,0x8E,0x8F,0x90,0x9A,
             0x9C,0x9D,0x9E,0x9F,0xA1,0xA2,0xA3,0xA5,0xAA,0xAF,
@@ -309,31 +325,56 @@ typedef struct {
     unsigned char b[256];
     int len;
     int slot;
+    int nulsafe; /* embedded NULs are field separators (COMM), not the text end:
+                    ev_field must scan the whole length, not stop at the first NUL */
 } EvField;
 
-typedef struct { EvField f[8]; int n; } LegacyBlock;
+/* A real ID3v2 tag can carry far more than eight legacy text frames (TIT1,
+   TIT2, TPE1-3, TCON, TALB, TRCK, TYER, TDRC, TCOM, COMM...) and every one
+   of them stashes: a small fixed array silently drops the tail, and if the
+   dropped tail is TIT2/TPE1 the title/artist vanish even though the album
+   survived. 24 is well past any tag a tagger writes; lb_stash additionally
+   refuses to spend a slot on a pure-ASCII evidence-only field, which feeds
+   nothing (ev_field scores no evidence from ASCII) and stores nothing. */
+typedef struct { EvField f[24]; int n; } LegacyBlock;
 
 typedef struct {
     int strong, weak, masq, invalid, high_fields;
     int amb_tail, cyr_letters, lat_letters;
 } BlockEv;
 
-static void lb_stash(LegacyBlock *lb, const unsigned char *v, size_t vn, int slot) {
+static void lb_stash(LegacyBlock *lb, const unsigned char *v, size_t vn, int slot, int nulsafe) {
+    /* an evidence-only field carrying no high byte scores nothing (ev_field
+       reads no evidence from ASCII) and is never stored: refuse the slot so
+       it cannot push a real display field out of the array. The high-byte
+       scan uses the same text end ev_field does (first NUL for plain fields,
+       whole length for COMM, whose comment text sits past a NUL). */
+    if (slot == LV_EV) {
+        size_t et = vn;
+        if (!nulsafe) { et = 0; while (et < vn && v[et]) et++; }
+        int high = 0;
+        for (size_t i = 0; i < et; i++) if (v[i] >= 0x80) { high = 1; break; }
+        if (!high) return;
+    }
     if (lb->n >= (int)(sizeof lb->f / sizeof lb->f[0])) return;
     EvField *f = &lb->f[lb->n++];
     f->len = (int)(vn < sizeof f->b - 1 ? vn : sizeof f->b - 1);
     memcpy(f->b, v, (size_t)f->len);
     f->slot = slot;
+    f->nulsafe = nulsafe;
 }
 
 /* classify one field's bytes as block evidence. The utf-8 walk mirrors
    utf8_scan's classification (cyr_pair/masq are its own primitives) but
    counts instead of clamping and keeps walking past invalid bytes; a
    truncated tail NEVER votes — it is ambiguous evidence at best. */
-static void ev_field(const unsigned char *s, int n, BlockEv *e) {
-    int nt = 0;
-    while (nt < n && s[nt]) nt++;             /* NUL ends the text (pad-NUL) */
-    n = nt;
+static void ev_field(const unsigned char *s, int n, BlockEv *e, int nulsafe) {
+    if (!nulsafe) {
+        int nt = 0;
+        while (nt < n && s[nt]) nt++;             /* NUL ends the text (pad-NUL) */
+        n = nt;
+    }                                            /* COMM: NULs are separators; the
+                                                    comment text past them is evidence */
     int i = 0;
     for (; i < n; i++)
         if (s[i] >= 0x80) break;
@@ -356,6 +397,16 @@ static void ev_field(const unsigned char *s, int n, BlockEv *e) {
         for (int k = 1; k < len; k++)
             if ((s[i + k] & 0xC0) != 0x80) { ok = 0; break; }
         if (!ok) { bad = 1; i++; continue; }
+        unsigned char b1 = s[i + 1];             /* same overlong/surrogate/range
+                                                    rejects utf8_scan applies: the
+                                                    classifier must agree, or a
+                                                    block could claim UTF-8 and
+                                                    decode_verdict would trust the
+                                                    invalid field */
+        if ((len == 3 && c == 0xE0 && b1 < 0xA0) ||
+            (len == 3 && c == 0xED && b1 >= 0xA0) ||
+            (len == 4 && c == 0xF0 && b1 < 0x90) ||
+            (len == 4 && c == 0xF4 && b1 >= 0x90)) { bad = 1; i++; continue; }
         if (len >= 3) e->strong++;            /* complete 3/4-byte char */
         else if (!cyr_pair(s, (size_t)i)) e->strong++; /* pair no cp1251 word could spell */
         else {
@@ -370,10 +421,10 @@ static void ev_field(const unsigned char *s, int n, BlockEv *e) {
     /* word-shape counts: unglued runs of >=2 cp1251-letter bytes are
        cyrillic words; high bytes glued into ascii words are latin-1
        accents — looks_cp1251's own rule, counted across the block */
-    for (i = 0; i < n && s[i]; ) {
+    for (i = 0; i < n; ) {
         if (!cp1251_letter(s[i])) { i++; continue; }
         int start = i;
-        while (i < n && s[i] && cp1251_letter(s[i])) i++;
+        while (i < n && cp1251_letter(s[i])) i++;
         unsigned char left = start ? s[start - 1] : ' ';
         unsigned char right = (i < n && s[i]) ? s[i] : ' ';
         if (ascii_alpha(left) || ascii_alpha(right))
@@ -423,24 +474,29 @@ static void decode_verdict(char *dst, size_t dn, const EvField *f, int v) {
 }
 
 /* config override (tag.legacy_encoding): main.c applies it after
-   cfg_load, the options window applies it live. Plain int, read by scan
-   threads without a lock — a torn-free int store can only mean one file
-   decodes with the previous rule. */
-static int legacy_forced = LV_ENC_AUTO;
-void tag_set_legacy_default(int enc) { legacy_forced = enc; }
+   cfg_load, the options window applies it live. Atomic: scan threads read
+   it while the UI thread writes; atomic_load/store remove the data race
+   (a torn int was already impossible on the targets, but the C memory model
+   made the unsynchronised access UB — this closes the gap cleanly, and a
+   plain store still means at most "one file decoded with the previous
+   rule"). */
+static _Atomic int legacy_forced = LV_ENC_AUTO;
+void tag_set_legacy_default(int enc) { atomic_store_explicit(&legacy_forced, enc, memory_order_relaxed); }
 
 static void decode_block(LegacyBlock *lb, Tags *t, int fill_empty_only) {
     int v;
     /* config-forced encoding wins over block evidence (decision step 1):
        forced utf8 == per-field copy_legacy exactly (that reader already
-       prefers utf-8 where valid and falls back to the guesser) */
-    if (legacy_forced == LV_ENC_LATIN1)      v = V_LATIN1;
-    else if (legacy_forced == LV_ENC_CP1251) v = V_CP1251;
-    else if (legacy_forced == LV_ENC_UTF8)   v = V_UNKNOWN;
+       prefers utf-8 where valid and falls back to the guesser). Single
+       atomic_load: one file always decodes under one consistent rule. */
+    int forced = atomic_load_explicit(&legacy_forced, memory_order_relaxed);
+    if (forced == LV_ENC_LATIN1)      v = V_LATIN1;
+    else if (forced == LV_ENC_CP1251) v = V_CP1251;
+    else if (forced == LV_ENC_UTF8)   v = V_UNKNOWN;
     else {
         BlockEv ev = {0};
         for (int i = 0; i < lb->n; i++)
-            ev_field(lb->f[i].b, lb->f[i].len, &ev);
+            ev_field(lb->f[i].b, lb->f[i].len, &ev, lb->f[i].nulsafe);
         v = ev_verdict(&ev);
     }
     for (int i = 0; i < lb->n; i++) {
@@ -536,19 +592,32 @@ static void text_frame(Tags *t, LegacyBlock *lb, const char *id, const unsigned 
     else return;
     if (enc == 0 || enc > 3) {
         /* legacy / invalid marker: the field no longer decides alone —
-           decode_block() applies ONE verdict to the whole tag block */
-        lb_stash(lb, v, vn, slot);
+           decode_block() applies ONE verdict to the whole tag block. COMM is
+           nulsafe: its comment text lives past a NUL separator (language +
+           short description first), and that text is the evidence. */
+        lb_stash(lb, v, vn, slot, !strcmp(id, "COMM"));
         return;
     }
     if (slot == LV_EV) return;   /* trusted enc 1/2/3 frames contribute no evidence */
     char *dst = slot == LV_TITLE ? t->title
               : slot == LV_ARTIST ? t->artist : t->album;
     if (enc == 3) {
-        /* declared UTF-8 per spec: TRUST the marker, never run the
-           legacy guesser (enc=3 used to fall into copy_legacy, so a
-           frame saying "I am UTF-8" still got guessed).  copy_utf8
-           drops cut tails and passes valid sequences straight. */
-        copy_utf8(dst, 256, v, (int)(vn < 255 ? vn : 255));
+        /* declared UTF-8 per spec. TRUST the marker when the bytes really
+           are UTF-8, but a mislabeled frame must not poison the index /
+           MPRIS: copy_utf8 passes invalid bytes straight through (a stray
+           0xE9, a lead byte glued to a pad NUL, cp1251 bytes that look like
+           UTF-8 leads), so validate the value with utf8_scan first. A field
+           that fails is exactly the "tagger wrote 8-bit text but marked it
+           UTF-8" case copy_legacy already handles — fall back to it. The
+           tag.legacy_encoding override (legacy_forced) is still the escape
+           hatch above text_frame for wholly-wrong guesses. */
+        int m = (int)(vn < 255 ? vn : 255);
+        size_t clamped = 0;
+        int mb = 0;
+        if (utf8_scan(v, m, &clamped, &mb))
+            copy_utf8(dst, 256, v, (int)clamped);
+        else
+            copy_legacy(dst, 256, v, m);
     } else if (enc == 2) {
         /* UTF-16BE per spec. The old code fed enc=2 to the LE decoder
            unswapped: a spec-conformant frame decoded as 䠀攀氀氀漀-style
@@ -625,11 +694,11 @@ static void read_id3v1(FILE *f, Tags *t) {
     if (fread(r, 1, 128, f) != 128) return;
     if (memcmp(r, "TAG", 3) != 0) return;
     LegacyBlock lb = {0};
-    lb_stash(&lb, r + 3, 30, LV_TITLE);
-    lb_stash(&lb, r + 33, 30, LV_ARTIST);
-    lb_stash(&lb, r + 63, 30, LV_ALBUM);
-    lb_stash(&lb, r + 93, 4, LV_EV);       /* year */
-    lb_stash(&lb, r + 97, 30, LV_EV);      /* comment (v1.1 track lives here) */
+    lb_stash(&lb, r + 3, 30, LV_TITLE, 0);
+    lb_stash(&lb, r + 33, 30, LV_ARTIST, 0);
+    lb_stash(&lb, r + 63, 30, LV_ALBUM, 0);
+    lb_stash(&lb, r + 93, 4, LV_EV, 0);       /* year */
+    lb_stash(&lb, r + 97, 30, LV_EV, 0);      /* comment (v1.1 track lives here) */
     decode_block(&lb, t, 1);
     /* v1.1: comment[28]==0 && comment[29]!=0 -> track number. the comment
        field starts at r[97] (title 3..32, artist 33..62, album 63..92,
@@ -807,9 +876,9 @@ static void read_riff(FILE *f, Tags *t) {
                     unsigned char *sb = malloc(ssz);
                     if (!sb) break;
                     if (fread(sb, 1, ssz, f) != ssz) { free(sb); break; }
-                    if (!memcmp(sh, "INAM", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_TITLE);
-                    else if (!memcmp(sh, "IART", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_ARTIST);
-                    else if (!memcmp(sh, "IPRD", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_ALBUM);
+                    if (!memcmp(sh, "INAM", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_TITLE, 0);
+                    else if (!memcmp(sh, "IART", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_ARTIST, 0);
+                    else if (!memcmp(sh, "IPRD", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_ALBUM, 0);
                     else if (!memcmp(sh, "ITRK", 4)) {
                         char b[32] = {0};
                         size_t k = ssz < 31 ? ssz : 31;

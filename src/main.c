@@ -22,6 +22,22 @@ static int is_cli_cmd(const char *s) {
     return 0;
 }
 
+/* a bare help request as the first argument. Without this "help" falls
+   through to the file/playlist handling and a GUI opens for a file that
+   does not exist — the user sees a hung window, not usage. */
+static int is_help(const char *s) {
+    return !strcmp(s, "help") || !strcmp(s, "-h") || !strcmp(s, "--help");
+}
+
+static void print_usage(void) {
+    printf("usage: levari [--nopl] [--eq] [--vis] [--save out.m3u] [--selftest N] [files...]\n"
+           "   or: levari help\n"
+           "   or: levari library <subcommand> ...\n"
+           "   or: levari <command> [arg]  -- control a running instance:\n"
+           "         play pause resume toggle stop next prev seek vol volup voldown\n"
+           "         mute pan speed status pl add shuffle repeat eq\n");
+}
+
 static int probe(const char *path) {
     Decoder *d = dec_open(path);
     if (!d) { printf("%-24s FAIL open\n", path); return 1; }
@@ -53,7 +69,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     /* GUI-subsystem exe (no console window on double-click): when invoked as
        a CLI verb, re-attach to the parent console so output is visible */
-    if (argc > 1 && (is_cli_cmd(argv[1]) || !strcmp(argv[1], "library"))) {
+    if (argc > 1 && (is_cli_cmd(argv[1]) || !strcmp(argv[1], "library") || is_help(argv[1]))) {
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
             freopen("CONOUT$", "w", stdout);
             freopen("CONOUT$", "w", stderr);
@@ -65,6 +81,7 @@ int main(int argc, char **argv) {
 #endif
     cfg_load();
     tag_set_legacy_default(cfg.tag_legacy_enc);
+    if (argc > 1 && is_help(argv[1])) { print_usage(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "library"))
         return lib_cmd(argc - 1, argv + 1);
     if (argc > 1 && is_cli_cmd(argv[1]))
@@ -97,7 +114,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--save") && i + 1 < argc) save_to = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: levari [--nopl] [--save out.m3u] [files...]\n");
+            print_usage();
             return 0;
         }
         else if (is_m3u(argv[i])) pl_load_m3u(&playlist, argv[i]);
