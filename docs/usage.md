@@ -96,6 +96,13 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
                                   whenever a title is long enough to marquee,
                                   so it scrolls while paused/stopped/unfocused
                                   (options window ADV page, `10FPS` toggle)
+    tag.legacy_encoding = auto    codepage for tag fields with no declared
+                                  encoding: auto | latin1 | cp1251 | utf8.
+                                  auto decides per tag block from byte
+                                  evidence; the forced values override that
+                                  per field. Changing it re-decodes nothing
+                                  already indexed: CLEAR + SCAN to re-read
+                                  (options window ADV page, `LEGACY` button)
 
 A leading `~` in any path value expands to the home directory. In the
 options window the library dirs field takes several directories as one

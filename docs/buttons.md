@@ -117,6 +117,7 @@ all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
 |---|---|
 | `LARGE` | Allow ingest of files over 256 MB (green = on). Off by default: files over the cap are refused by the decoder with a message, protecting against OOM from the whole-file slurp decoders (MP3 seek table, module/Ogg-FLAC buffers). Toggling applies immediately (still press `SAVE` to persist); tag scanning is never capped. |
 | `10FPS` | Keep repainting the main window at 10 fps whenever the title is long enough to marquee (green = on). Off by default: the marquee only scrolls while playing. On, it also scrolls while paused, stopped, or unfocused — at the cost of a steady 10 fps repaint. Toggling applies immediately (still press `SAVE` to persist). |
+| `LEGACY` | 4-state **cycle button** (not a checkbox): the label shows the current setting — `AUTO`, `LATIN-1`, `CP1251` or `UTF-8`; each click cycles to the next. It forces the codepage for tag fields that carry no declared encoding (id3v2 `enc=0`/invalid marker, ID3v1, RIFF INFO): `AUTO` (default) decides per tag block from byte evidence (see `tag.legacy_encoding` in usage.md), the three forced values decode every such field through that reader. Applying takes effect immediately for future tag reads (no restart); rows already in the library index keep their old values — press `CLEAR` then `SCAN` to re-read. Press `SAVE` to persist. Hovering the button shows the same note. |
 
 ## Search window
 

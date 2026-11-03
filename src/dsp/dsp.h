@@ -13,11 +13,18 @@ typedef struct {
     float preamp_db;   /* -20..+12 */
     float band_db[EQ_BANDS];
     Biquad bq[EQ_BANDS][2];
+    unsigned band_mask; /* bits: bands whose coefficients are not identity */
     double rate;
     /* guards gains/coefficients: the UI thread mutates while the player
        thread runs eq_process */
     pthread_mutex_t mtx;
 } EQ;
+
+/* flush-to-zero + denormals-are-zero for the calling thread: the biquad
+   state fed with silence decays into subnormal floats and CPUs execute
+   those ops orders of magnitude slower; call once at player-thread entry
+   (the EQ is that thread's only float consumer) */
+void dsp_flush_denormals(void);
 
 void eq_init(EQ *e, double rate);
 void eq_set_rate(EQ *e, double rate);  /* keep gains, redesign for new rate */

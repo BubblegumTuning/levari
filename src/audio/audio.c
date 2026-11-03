@@ -92,8 +92,11 @@ static int try_pulse(int rate, int channels) {
     pas_ba.prebuf   = bps * 3 / 40;  /* start playing after 75 ms */
     pas_ba.minreq   = 0;             /* server default */
     pas_ba.fragsize = 0;             /* playback: server-chosen */
-    int err = 0;
-    pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, &pas_ba, &err);
+    /* error out-param NULL (legal): the failure signal we act on is the
+       NULL return, err was never read — and feeding the local's address
+       to a call whose result lands in a static only trains cppcheck's
+       danglingLifetime heuristic to scream here forever */
+    pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, &pas_ba, NULL);
     if (!pas) return -1;
     backend = 2;
     return 0;
@@ -156,7 +159,17 @@ int ao_write(const int16_t *buf, int frames) {
     if (backend == 4) {
         SDL_QueueAudio(sdl_dev, buf, (Uint32)((size_t)frames * cur_ch * 2));
         size_t maxq = (size_t)cur_rate * cur_ch * 2 * 3 / 20; /* ~150ms */
-        while (SDL_GetQueuedAudioSize(sdl_dev) > maxq) SDL_Delay(10);
+        /* the queue drains at real time, so the excess bytes above maxq
+           ARE the sleep we need: one computed delay per chunk instead of
+           a 10 ms poll (100 wake-ups/second all playback long) */
+        size_t bps = (size_t)cur_rate * cur_ch * 2;
+        while (bps) {
+            size_t q = SDL_GetQueuedAudioSize(sdl_dev);
+            if (q <= maxq) break;
+            size_t excess = q - maxq;
+            Uint32 ms = (Uint32)(excess * 1000 / bps);
+            SDL_Delay(ms ? ms : 1);
+        }
         return frames;
     }
     if (backend == 1) {
@@ -206,8 +219,7 @@ void ao_flush(void) {
     } else if (backend == 2) {
         /* libpulse-simple has no flush: recreate the stream */
         p_pa_simple_free(pas);
-        int err = 0;
-        pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, &pas_ba, &err);
+        pas = p_pa_simple_new(NULL, "levari", PA_STREAM_PLAYBACK, NULL, "levari", &pas_ss, NULL, &pas_ba, NULL);
         if (!pas) backend = 3;
     }
 }

@@ -1,8 +1,9 @@
-/* tagwords probe: print each fixture's decoded title AND artist as raw hex
-   bytes (a-prefixed corpus modes target the artist field via TPE1/id3v1).
+/* tagwords probe: print each fixture's decoded title, artist AND album as
+   raw hex bytes (a-prefixed corpus modes target the artist field via
+   TPE1/id3v1; mf/vmf modes assert per field).
    Compile against the tag.c under test:
      gcc -std=gnu11 -I<src/tag> probe.c <tag.c> -o probe
-   argv[1..] are fixture paths. Output: PATH<TAB>hex(title)<TAB>hex(artist). */
+   argv[1..] are fixture paths. Output: PATH<TAB>hex(title)<TAB>hex(artist)<TAB>hex(album). */
 #include <stdio.h>
 #include "tag.h"
 
@@ -19,6 +20,8 @@ int main(int argc, char **argv) {
         puthex(t.title);
         putchar('\t');
         puthex(t.artist);
+        putchar('\t');
+        puthex(t.album);
         putchar('\n');
     }
     return 0;

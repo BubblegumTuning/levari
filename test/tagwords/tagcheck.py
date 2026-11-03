@@ -22,6 +22,18 @@ Modes:
   u8cut / u8cut2  TIT2: utf-8 of TEXT minus its final char, then that char's
         lead byte (u8cut) or lead+1 continuation (u8cut2) — a fixed-width
         field cut at the char boundary (expected: TEXT minus final char)
+  u8nul   TIT2: as u8cut2 but followed by 4 NUL bytes INSIDE the frame
+        (a cut mid-field with padding after it; expected: TEXT minus final
+        char — the scan must stop at the NUL, not validate against padding)
+  v1nul   ID3v1 30-byte title: real UTF-8 of TEXT with the final char cut
+        at lead+continuation, NUL-padded to 30 (expected: TEXT minus final
+        char — same pad-NUL class in the fixed-width v1 field)
+  enc2    ID3v2.3 TIT2, enc=2 (UTF-16BE per spec, no BOM), utf-16-be bytes
+        of TEXT (expected: TEXT — regression pin for the 2026-11-03 fix:
+        enc=2 used to be fed to the LE decoder unswapped)
+  enc3    ID3v2.3 TIT2, enc=3, REAL UTF-8 of TEXT (expected: TEXT — the
+        marker is trusted, the legacy guesser never runs; strict means a
+        MISLABELED enc=3 frame is passed as-is, cost accepted)
   v1cut ID3v1 30-byte title: cp1251 of TEXT cut at byte 30 (expected: TEXT
         minus the trailing partial char)
   v1u8  ID3v1 30-byte title: real UTF-8 of TEXT cut at byte 30 (expected:
@@ -33,6 +45,16 @@ Modes:
         the latin-1 fallback must read them as punctuation, never C1 controls)
   au8 / au8t / au8cut / au8cut2  same shapes as u8/u8t/u8cut/u8cut2 but in
         the TPE1 frame — compared against the decoded ARTIST field
+  mf    id3v2.3 multi-frame block (pins the 2026-11-03 per-block reader):
+        spec 'ID:ENC:VAL|ID:ENC:VAL...' then '=>' then expectations
+        'ID=TEXT|ID=TEXT...' (ID in TIT2/TPE1/TALB). VAL bytes: ENC 0 encodes
+        literal chars as latin-1 and \\xNN as raw bytes; ENC 1/2/3 encode the
+        literal text as utf-16le/utf-16be/utf-8 (no escapes). Expectation
+        TEXT is utf-8 of literal chars plus \\xNN raw bytes. Unlisted fields
+        are not asserted. '|' cannot appear inside a value.
+  vmf   id3v1 multi-field block: spec 'ID:VAL|...' (enc 0, each field
+        NUL-padded to 30), same '=>' expectation form as mf
+  obsmf same spec as mf; all three decoded fields shown, never asserted
   v1l / v1c  ID3v1 tail (30-byte title, NUL-padded), latin-1 / cp1251
   obs   decode printed, never asserted
 id3v1-mode expectations are rstripped: copy_fixed trims the trailing space
@@ -111,6 +133,48 @@ def ext_hdr_v23():  # size 6 EXCLUDES its own 4 bytes (spec): skip = 4+6 = 10
 def ext_hdr_v24():  # syncsafe size 10 INCLUDES itself (spec): skip = 10
     return ss(10) + b'\x00\x01\x00\x00\x00\x00'
 
+SLOT = {'TIT2': 0, 'TPE1': 1, 'TALB': 2}
+
+def parse_rawval(v, latin1):
+    """value with \\xNN raw-byte escapes; literal chars -> latin-1 (enc 0)"""
+    out = bytearray(); i = 0
+    while i < len(v):
+        if v[i] == '\\' and i + 4 <= len(v) and v[i+1] == 'x':
+            out.append(int(v[i+2:i+4], 16)); i += 4; continue
+        if latin1:
+            if ord(v[i]) > 0xFF:
+                raise SystemExit('char U+%04X in enc-0 value: use \\xNN' % ord(v[i]))
+            out.append(ord(v[i]))
+        else:
+            out += v[i].encode('utf-8')
+        i += 1
+    return bytes(out)
+
+def parse_frames(spec, vmf=False):
+    """'ID:ENC:VAL|...' (mf) / 'ID:VAL|...' (vmf) -> [(id, enc, bytes)]"""
+    out = []
+    for part in spec.split('|'):
+        if not part: continue
+        if vmf:
+            fid, _, val = part.partition(':'); enc = 0
+        else:
+            fid, es, val = part.split(':', 2); enc = int(es)
+        if enc == 1:   payload = val.encode('utf-16-le')
+        elif enc == 2: payload = val.encode('utf-16-be')
+        elif enc == 3: payload = val.encode('utf-8')
+        else:          payload = parse_rawval(val, latin1=True)
+        out.append((fid, enc, payload))
+    return out
+
+def parse_expect(s):
+    """'ID=TEXT|...' -> {slot: expected bytes}"""
+    out = {}
+    for part in s.split('|'):
+        if not part: continue
+        fid, _, val = part.partition('=')
+        out[SLOT[fid]] = parse_rawval(val, latin1=False)
+    return out
+
 def fixture(mode, text):
     exp = text.encode('utf-8')
     if mode == 'ext23':
@@ -145,6 +209,20 @@ def fixture(mode, text):
         prev = text[:-1].encode('utf-8')
         tail = text[-1:].encode('utf-8')[:2 if mode == 'u8cut2' else 1]
         return (tag23(frame(b'TIT2', b'\x00' + prev + tail)), prev)
+    if mode == 'u8nul':
+        prev = text[:-1].encode('utf-8')
+        tail = text[-1:].encode('utf-8')[:2]
+        return (tag23(frame(b'TIT2', b'\x00' + prev + tail + b'\x00' * 4)), prev)
+    if mode == 'v1nul':
+        prev = text[:-1].encode('utf-8')
+        tail = text[-1:].encode('utf-8')[:2]
+        title = (prev + tail + b'\x00' * 30)[:30]
+        v1 = b'TAG' + title + b'\x00' * (30 + 30) + b'1999' + b'\x00' * 31
+        return (b'\xff\xfb\x90\x64' * 64 + v1, prev)
+    if mode == 'enc2':
+        return (tag23(frame(b'TIT2', b'\x02' + text.encode('utf-16-be'))), exp)
+    if mode == 'enc3':
+        return (tag23(frame(b'TIT2', b'\x03' + text.encode('utf-8'))), exp)
     if mode in ('v1cut', 'v1u8'):
         fn = (lambda ch: enc_cyr(ch)) if mode == 'v1cut' else (lambda ch: ch.encode('utf-8'))
         acc_text = ''
@@ -166,6 +244,17 @@ def fixture(mode, text):
         title = b + b'\x00' * (30 - len(b))
         v1 = b'TAG' + title + b'\x00' * (30 + 30) + b'1999' + b'\x00' * 31
         return (b'\xff\xfb\x90\x64' * 64 + v1, text.rstrip(' ').encode('utf-8'))
+    if mode in ('mf', 'obsmf'):
+        spec, _, exps = text.partition('=>')
+        blob = tag23(b''.join(frame(fid.encode('ascii'), bytes([enc]) + val)
+                              for fid, enc, val in parse_frames(spec)))
+        return (blob, parse_expect(exps) if mode == 'mf' else {})
+    if mode == 'vmf':
+        spec, _, exps = text.partition('=>')
+        vals = {fid: val for fid, enc, val in parse_frames(spec, vmf=True)}
+        pad = lambda fid: (vals.get(fid, b'') + b'\x00' * 30)[:30]
+        v1 = b'TAG' + pad('TIT2') + pad('TPE1') + pad('TALB') + b'1999' + b'\x00' * 31
+        return (b'\xff\xfb\x90\x64' * 64 + v1, parse_expect(exps))
     if mode == 'obs':
         try:
             blob = tag23(frame(b'TIT2', b'\x00' + enc_cyr(text)))
@@ -194,9 +283,9 @@ def main():
         line = raw.rstrip('\n')
         if not line or line.startswith('#'): continue
         mode, _, text = line.partition('\t')
-        if mode not in ('l1','l1m','l1w','cyr','u8','u8t','u8cut','u8cut2','v1cut','v1u8',
+        if mode not in ('l1','l1m','l1w','cyr','u8','u8t','u8cut','u8cut2','u8nul','v1nul','enc2','enc3','v1cut','v1u8',
                         'bigc','bigl','v1l','v1c','v1w','ext23','ext24',
-                        'au8','au8t','au8cut','au8cut2','obs'):
+                        'au8','au8t','au8cut','au8cut2','mf','vmf','obsmf','obs'):
             sys.exit('line %d: unknown mode %r' % (lineno, mode))
         path = os.path.join(tmp, 'f%05d' % lineno)
         blob, exp = fixture(mode, text)
@@ -212,22 +301,32 @@ def main():
     got = {}
     for chunk in sout:
         for line in chunk.splitlines():
-            p, th, ah = line.split('\t')
-            got[p] = (bytes.fromhex(th), bytes.fromhex(ah))
+            p, th, ah, lh = line.split('\t')
+            got[p] = (bytes.fromhex(th), bytes.fromhex(ah), bytes.fromhex(lh))
 
     fails, observes, bymode = [], [], {}
     for mode, text, path, exp in entries:
-        pair = got.get(path)
-        if pair is None: fails.append((mode, text, b'<no result>', exp)); continue
-        act = pair[1] if mode.startswith('au') else pair[0]
-        st = 'PASS' if act == exp else 'FAIL'
+        tri = got.get(path)
+        if tri is None:
+            fails.append((mode, text, b'<no result>', b'')); continue
+        # uniform expectation: {slot: expected bytes}; empty dict = observe-only
+        if mode in ('mf', 'vmf', 'obsmf'): expd = exp
+        elif mode == 'obs':               expd = {}
+        else:                             expd = {1 if mode.startswith('au') else 0: exp}
+        bad = None
+        for slot in sorted(expd):
+            if tri[slot] != expd[slot]:
+                bad = (tri[slot], expd[slot]); break
+        shown = ' | '.join(tri[k].decode('utf-8', 'replace') for k in range(3)) \
+                if mode in ('mf', 'vmf', 'obsmf') else tri[1 if mode.startswith('au') else 0].decode('utf-8', 'replace')
+        st = 'PASS' if bad is None else 'FAIL'
         bymode.setdefault(mode, [0, 0])
         bymode[mode][st == 'PASS'] += 1
-        if mode == 'obs':
-            observes.append((text, act.decode('utf-8', 'replace')))
-        elif st == 'FAIL':
-            fails.append((mode, text, act, exp))
-        print('%s %-5s %r -> %r' % (st, mode, text, act.decode('utf-8', 'replace')))
+        if not expd:
+            observes.append((text, shown))
+        elif bad is not None:
+            fails.append((mode, text, bad[0], bad[1]))
+        print('%s %-5s %r -> %r' % (st, mode, text, shown))
 
     print('\n== per-mode pass/fail ==')
     for m in sorted(bymode):

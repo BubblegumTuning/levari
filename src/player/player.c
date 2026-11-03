@@ -174,6 +174,9 @@ static void apply_pan(int16_t *buf, int frames, int ch, int pan) {
 static void *player_thread(void *arg) {
     Player *p = arg;
     static int16_t buf[CHUNK * 2];
+    dsp_flush_denormals(); /* eq_process runs here; silence decays its
+                              state into denormals and the whole thread
+                              crawls without FTZ/DAZ */
     while (!p->quit) {
         /* take cmd + its payload atomically: a plain read-then-clear can
            swallow a command posted in between, or pair one poster's arg
@@ -282,8 +285,13 @@ static void *player_thread(void *arg) {
                 continue;
             }
         } else {
-            struct timespec ts = {0, 20 * 1000 * 1000};
-            nanosleep(&ts, NULL);
+            /* paused/stopped: sleep until a command or quit instead of a
+               20 ms poll (50 wake-ups per second forever drained power
+               on battery boards for nothing) */
+            pthread_mutex_lock(&p->mtx);
+            while (!p->quit && p->cmd == CMD_NONE)
+                pthread_cond_wait(&p->wake, &p->mtx);
+            pthread_mutex_unlock(&p->mtx);
         }
     }
     close_dec(p);
@@ -302,6 +310,7 @@ void pl_player_init(Player *p, Playlist *pl) {
     p->track_start = p->track_end = 0;
     pthread_mutex_init(&p->mtx, NULL);
     pthread_mutex_init(&p->viz_mtx, NULL);
+    pthread_cond_init(&p->wake, NULL);
     eq_init(&p->eq, 44100);
     rng_state = (uint64_t)time(NULL) ^ ((uint64_t)(unsigned)getpid() << 32) ^ 0x9E3779B97F4A7C15ull;
     if (!rng_state) rng_state = 0xA5A5A5A5u;
@@ -312,7 +321,13 @@ void pl_player_start(Player *p) {
 }
 
 void pl_player_stop(Player *p) {
+    /* quit under the lock + broadcast: the thread may be parked in
+       pthread_cond_wait, and a bare store would leave it sleeping
+       forever (the wait predicate re-reads quit under the same mutex) */
+    pthread_mutex_lock(&p->mtx);
     p->quit = 1;
+    pthread_cond_broadcast(&p->wake);
+    pthread_mutex_unlock(&p->mtx);
     pthread_join(p->th, NULL);
 }
 
@@ -320,6 +335,7 @@ void pl_post(Player *p, int cmd, int arg) {
     pthread_mutex_lock(&p->mtx);
     p->cmd_arg = arg;
     p->cmd = cmd;
+    pthread_cond_signal(&p->wake);
     pthread_mutex_unlock(&p->mtx);
 }
 
@@ -337,6 +353,7 @@ void pl_post_seek(Player *p, double frac) {
         long long frame = base + (long long)(frac * (double)(endf - base));
         p->seek_frame = frame;
         p->cmd = CMD_SEEK;
+        pthread_cond_signal(&p->wake);
     }
     pthread_mutex_unlock(&p->mtx);
 }

@@ -5,6 +5,7 @@
 #include "../skin/cjk_font.h"
 #include "../viz/viz.h"
 #include "../config/config.h"
+#include "../tag/tag.h"
 #include "../library/library.h"
 #include "../mpris/mpris.h"
 #include <stdio.h>
@@ -23,7 +24,7 @@ enum {
     PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_X, FB_ADDDIR, FB_X,
     EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X,
     OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
-    OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS,
+    OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC,
     OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA,
     B_NONE
 };
@@ -90,6 +91,7 @@ typedef struct {
     int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
+    int opt_enc;                 /* LEGACY button cycle: 0 auto, 1 latin1, 2 cp1251, 3 utf8 (cfg value = opt_enc - 1) */
     int opt_adv;                 /* options window on the ADVANCED tab */
     int opt_scanning;            /* a library scan thread is running */
     int opt_tags;                /* scan reads tags+duration, not just names */
@@ -1306,6 +1308,7 @@ static Rect opt_tab_adv_rect(void)   { Rect r = { 102, 4, 26, 14 }; return r; }
 static Rect opt_large_rect(void)     { Rect r = { 186, 56, 48, 14 }; return r; }
 /* 10FPS toggle (ADV page): same column, below the LARGE block */
 static Rect opt_fps_rect(void)       { Rect r = { 186, 114, 48, 14 }; return r; }
+static Rect opt_enc_rect(void)       { Rect r = { 186, 150, 72, 14 }; return r; }
 static Rect opt_scan_rect(void)  { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBDIRS].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_chk_rect(void)   { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP + OPT_SCAN_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBDIRS].y, OPT_CHK_W, OPT_FLD_H }; return r; }
 
@@ -1347,6 +1350,8 @@ static void opt_open(void) {
     ui.opt_fade = cfg.fade_stop > 0;
     ui.opt_large = cfg.allow_large > 0;
     ui.opt_f10 = cfg.ui_always10 > 0;
+    ui.opt_enc = cfg.tag_legacy_enc + 1;   /* LV_ENC_AUTO(-1) -> cycle 0 */
+    if (ui.opt_enc < 0 || ui.opt_enc > 3) ui.opt_enc = 0;
     ui.opt_adv = 0;
     ui.opt_hover = -1;
     ui.opt_focus = -1;
@@ -1396,6 +1401,8 @@ static void opt_save(void) {
     ui.pl->fade_stop = ui.opt_fade; /* apply without waiting for a restart */
     cfg.allow_large = ui.opt_large; /* decode.c reads cfg live: no restart */
     cfg.ui_always10 = ui.opt_f10;   /* scheduler reads cfg live: no restart */
+    cfg.tag_legacy_enc = ui.opt_enc - 1;  /* tag.c reads it live: decoding applies now,
+                                             already-indexed rows keep old readings until re-scan */
     cfg_unlock();
     cfg_save();
 }
@@ -1561,6 +1568,16 @@ static void draw_opt(void) {
         skin_button(s, &r2, ui.pressed == OPTB_TFPS, ui.opt_f10);
         font_puts(s, r2.x + (r2.w - font_w("10FPS")) / 2, r2.y + 3, "10FPS",
                   ui.opt_f10 ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
+        /* 4-state cycle button (NOT a checkbox): label shows the current
+           override for legacy 8-bit tag fields */
+        font_puts(s, 10, 146, "LEGACY: tag fields", col(s, 220, 220, 220));
+        font_puts(s, 10, 160, "with no declared encoding", col(s, 220, 220, 220));
+        Rect r3 = opt_enc_rect();
+        skin_button(s, &r3, ui.pressed == OPTB_TENC, 0);
+        static const char *ENCL[4] = { "AUTO", "LATIN-1", "CP1251", "UTF-8" };
+        const char *el = ENCL[ui.opt_enc & 3];
+        font_puts(s, r3.x + (r3.w - font_w(el)) / 2, r3.y + 3, el,
+                  ui.opt_enc ? col(s, 0, 224, 255) : col(s, 220, 220, 220));
     }
 
     Rect sv = opt_save_rect(), cl = opt_close_rect();
@@ -1593,6 +1610,20 @@ static void draw_opt(void) {
         font_puts(s, tb.x + 6, tb.y + 5, "dirs are scanned recursively", col(s, 220, 220, 220));
         font_puts(s, tb.x + 6, tb.y + 17, "separate multiple dirs with ';'", col(s, 220, 220, 220));
     }
+    if (ui.opt_hover == OPTB_TENC) {
+        Rect r3 = opt_enc_rect();
+        SDL_Rect tb = { r3.x, r3.y + r3.h + 4, 230, 42 };
+        if (tb.x + tb.w > OPT_W) tb.x = OPT_W - tb.w;
+        SDL_FillRect(s, &tb, col(s, 40, 40, 40));
+        SDL_Rect t = { tb.x, tb.y, tb.w, 1 }, b = { tb.x, tb.y + tb.h - 1, tb.w, 1 };
+        SDL_Rect l = { tb.x, tb.y, 1, tb.h }, r = { tb.x + tb.w - 1, tb.y, 1, tb.h };
+        Uint32 bc = col(s, 140, 140, 140);
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        font_puts(s, tb.x + 6, tb.y + 5, "encoding for fields with no marker", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 17, "AUTO = decide from block evidence", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 29, "index needs CLEAR + SCAN to re-read", col(s, 220, 220, 220));
+    }
 }
 
 static void handle_opt_mouse(SDL_Event *e) {
@@ -1611,6 +1642,8 @@ static void handle_opt_mouse(SDL_Event *e) {
             if (in_rect(&tg, x, y)) { ui.pressed = OPTB_TLARGE; return; }
             Rect tf = opt_fps_rect();
             if (in_rect(&tf, x, y)) { ui.pressed = OPTB_TFPS; return; }
+            Rect te = opt_enc_rect();
+            if (in_rect(&te, x, y)) { ui.pressed = OPTB_TENC; return; }
             if (y < 22) { ui.drag = 11; drag_begin(ui.wopt); ui.opt_focus = -1; }
             return;
         }
@@ -1641,12 +1674,16 @@ static void handle_opt_mouse(SDL_Event *e) {
             Rect xc = close_rect(OPT_W);
             Rect sv = opt_save_rect(), cl = opt_close_rect();
             Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect(), tg0 = opt_large_rect();
-            Rect tf0 = opt_fps_rect();
+            Rect tf0 = opt_fps_rect(), te0 = opt_enc_rect();
             if (ui.pressed == OPTB_X && in_rect(&xc, x, y)) opt_close();
             else if (ui.pressed == OPTB_TABB && in_rect(&tb, x, y)) { ui.opt_adv = 0; ui.opt_focus = -1; }
             else if (ui.pressed == OPTB_TABA && in_rect(&ta, x, y)) { ui.opt_adv = 1; ui.opt_focus = -1; }
             else if (ui.pressed == OPTB_TLARGE && in_rect(&tg0, x, y)) ui.opt_large = !ui.opt_large;
             else if (ui.pressed == OPTB_TFPS && in_rect(&tf0, x, y)) ui.opt_f10 = !ui.opt_f10;
+            else if (ui.pressed == OPTB_TENC && in_rect(&te0, x, y)) {
+                ui.opt_enc = (ui.opt_enc + 1) % 4;
+                tag_set_legacy_default(ui.opt_enc - 1); /* live effect; SAVE persists */
+            }
             else if (ui.pressed == OPTB_SAVE && in_rect(&sv, x, y)) opt_save();
             else if (ui.pressed == OPTB_CLOSE && in_rect(&cl, x, y)) opt_close();
             else if (ui.pressed >= OPTB_TPL && ui.pressed <= OPTB_TFADE) {
@@ -1677,9 +1714,14 @@ static void handle_opt_mouse(SDL_Event *e) {
     } else if (e->type == SDL_MOUSEMOTION && ui.drag == 11) {
         drag_move_snap(ui.wopt);
     } else if (e->type == SDL_MOUSEMOTION) {
-        Rect f = opt_field_rect(OPTF_LIBDIRS);
-        ui.opt_hover = (!ui.opt_adv && x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
-                       ? OPTF_LIBDIRS : -1;
+        if (ui.opt_adv) {
+            Rect te = opt_enc_rect();
+            ui.opt_hover = in_rect(&te, x, y) ? OPTB_TENC : -1;
+        } else {
+            Rect f = opt_field_rect(OPTF_LIBDIRS);
+            ui.opt_hover = (x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
+                           ? OPTF_LIBDIRS : -1;
+        }
     }
 }
 
@@ -2228,7 +2270,11 @@ int ui_run(Player *p, int show_pl) {
         SDL_Event e;
         int wait = next ? (int)(next > SDL_GetTicks() ? next - SDL_GetTicks() : 0)
                         : -1;   /* no tick scheduled: sleep until an event */
-        if (ui_deadline_ms && wait > 1000) wait = 1000;
+        /* a set deadline must also bound the UNTIMED wait: with wait=-1
+           the loop sleeps forever whenever nothing scheduled a redraw
+           (stopped/undecodable playlist), and the break above is never
+           reached — selftest runs outlived their deadline by minutes */
+        if (ui_deadline_ms && (wait < 0 || wait > 1000)) wait = 1000;
         if (SDL_WaitEventTimeout(&e, wait)) switch (e.type) {
         case SDL_QUIT: running = 0; break;
         case SDL_WINDOWEVENT:

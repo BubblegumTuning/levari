@@ -1,3 +1,6 @@
+#ifdef LEVAR_DECODE_SUFFIX
+#include "tier_rename.h"
+#endif
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_EX_IMPLEMENTATION
 #include "../../third_party/minimp3.h"

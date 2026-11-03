@@ -45,6 +45,7 @@ typedef struct {
     pthread_mutex_t viz_mtx; /* viz_buf/n/seq: player writes, UI reads */
     int ao_open;
     pthread_mutex_t mtx; /* guards playlist mutations vs player thread */
+    pthread_cond_t wake; /* player idles here; pl_post/pl_post_seek/stop signal under mtx */
     _Atomic int quit;
     pthread_t th;
 } Player;

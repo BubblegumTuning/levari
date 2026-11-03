@@ -135,6 +135,17 @@ static int cyr_pair(const unsigned char *src, size_t i) {
 }
 
 static int utf8_scan(const unsigned char *src, int n, size_t *clamped, int *mb) {
+    /* NUL terminates the text everywhere else in tag.c (copy loops,
+       looks_cp1251): a field padded past its NUL (id3v1's fixed 30-byte
+       title, NUL-padded frames) must run the cut-tail logic against the
+       TEXT length, not the padding.  Otherwise a char cut mid-field fails
+       the complete-sequence continuation check ON A PAD NUL, the whole
+       field is rejected, and it falls to the 8-bit readers as mojibake
+       (and the tail branch could otherwise scan continuation counts
+       toward the pad). */
+    int nt = 0;
+    while (nt < n && src[nt]) nt++;
+    n = nt;
     size_t i = 0, last = 0;
     int m = 0, m3 = 0, noncyr = 0, masq = 0;
     while (i < (size_t)n && src[i]) {
@@ -246,14 +257,7 @@ static int looks_cp1251(const unsigned char *src, int n) {
    russian taggers wrote cp1251 and sloppy ones wrote utf-8 outright.
    classify by shape and decode accordingly; raw copying (the old behavior)
    double-encoded every non-ascii byte into mojibake. */
-static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
-    size_t clamped = 0;
-    int mb = 0;
-    if (utf8_scan(src, n, &clamped, &mb) && mb) {
-        copy_utf8(dst, dn, src, (int)clamped);
-        return;
-    }
-    if (!looks_cp1251(src, n)) { copy_fixed(dst, dn, src, n); return; }
+static void copy_cp1251(char *dst, size_t dn, const unsigned char *src, int n) {
     size_t j = 0;
     for (int i = 0; i < n && src[i]; i++) {
         unsigned char c = src[i];
@@ -275,6 +279,178 @@ static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
     }
     while (j > 0 && dst[j - 1] == ' ') j--;
     dst[j] = 0;
+}
+
+static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
+    size_t clamped = 0;
+    int mb = 0;
+    if (utf8_scan(src, n, &clamped, &mb) && mb) {
+        copy_utf8(dst, dn, src, (int)clamped);
+        return;
+    }
+    if (!looks_cp1251(src, n)) { copy_fixed(dst, dn, src, n); return; }
+    copy_cp1251(dst, dn, src, n);
+}
+
+/* ---- per-block legacy encoding evidence (one verdict per tag BLOCK) ----
+   A legacy 8-bit field decides alone today (copy_legacy), but fields of
+   one tag block usually share one tagger and one codepage: 'Я' + 'Привет'
+   is cyrillic even though the 'Я' field alone looks like latin-1 'ß'.
+   So one block = the legacy enc=0/invalid frames of one id3v2 tag, ONE
+   id3v1 record, or one RIFF INFO list — separately, because a v1 written
+   by tool A and a v2 written by tool B must never decide each other.
+   Trusted enc=1/2/3 frames contribute no evidence and never enter a block.
+   Single-field files keep bit-identical behavior by construction: fewer
+   than two high-byte fields -> verdict UNKNOWN -> copy_legacy exactly. */
+
+enum { LV_TITLE, LV_ARTIST, LV_ALBUM, LV_EV };  /* LV_EV: scoring only */
+
+typedef struct {
+    unsigned char b[256];
+    int len;
+    int slot;
+} EvField;
+
+typedef struct { EvField f[8]; int n; } LegacyBlock;
+
+typedef struct {
+    int strong, weak, masq, invalid, high_fields;
+    int amb_tail, cyr_letters, lat_letters;
+} BlockEv;
+
+static void lb_stash(LegacyBlock *lb, const unsigned char *v, size_t vn, int slot) {
+    if (lb->n >= (int)(sizeof lb->f / sizeof lb->f[0])) return;
+    EvField *f = &lb->f[lb->n++];
+    f->len = (int)(vn < sizeof f->b - 1 ? vn : sizeof f->b - 1);
+    memcpy(f->b, v, (size_t)f->len);
+    f->slot = slot;
+}
+
+/* classify one field's bytes as block evidence. The utf-8 walk mirrors
+   utf8_scan's classification (cyr_pair/masq are its own primitives) but
+   counts instead of clamping and keeps walking past invalid bytes; a
+   truncated tail NEVER votes — it is ambiguous evidence at best. */
+static void ev_field(const unsigned char *s, int n, BlockEv *e) {
+    int nt = 0;
+    while (nt < n && s[nt]) nt++;             /* NUL ends the text (pad-NUL) */
+    n = nt;
+    int i = 0;
+    for (; i < n; i++)
+        if (s[i] >= 0x80) break;
+    if (i >= n) return;                       /* pure ascii: no evidence */
+    e->high_fields++;
+    int bad = 0;
+    for (i = 0; i < n; ) {
+        unsigned c = s[i];
+        if (c < 0x80) { i++; continue; }
+        if (c < 0xC2 || c >= 0xF5) { bad = 1; i++; continue; }
+        int len = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : 4;
+        if (i + len > n) {                    /* cut at field end */
+            int k = 1;
+            while (i + k < n && (s[i + k] & 0xC0) == 0x80) k++;
+            if (k >= 3) e->strong++;          /* emoji-class cut: unambiguous */
+            else e->amb_tail = 1;
+            break;
+        }
+        int ok = 1;
+        for (int k = 1; k < len; k++)
+            if ((s[i + k] & 0xC0) != 0x80) { ok = 0; break; }
+        if (!ok) { bad = 1; i++; continue; }
+        if (len >= 3) e->strong++;            /* complete 3/4-byte char */
+        else if (!cyr_pair(s, (size_t)i)) e->strong++; /* pair no cp1251 word could spell */
+        else {
+            unsigned cp = ((c & 0x1F) << 6) | (s[i + 1] & 0x3F);
+            if (cp <= 0xBF || cp == 0xD7 || cp == 0xF7) e->masq++;
+            else e->weak++;   /* cyrillic-plausible pair: real UTF-8
+                                 cyrillic looks exactly like this too */
+        }
+        i += len;
+    }
+    if (bad) e->invalid++;
+    /* word-shape counts: unglued runs of >=2 cp1251-letter bytes are
+       cyrillic words; high bytes glued into ascii words are latin-1
+       accents — looks_cp1251's own rule, counted across the block */
+    for (i = 0; i < n && s[i]; ) {
+        if (!cp1251_letter(s[i])) { i++; continue; }
+        int start = i;
+        while (i < n && s[i] && cp1251_letter(s[i])) i++;
+        unsigned char left = start ? s[start - 1] : ' ';
+        unsigned char right = (i < n && s[i]) ? s[i] : ' ';
+        if (ascii_alpha(left) || ascii_alpha(right))
+            e->lat_letters += i - start;
+        else if (i - start >= 2)
+            e->cyr_letters += i - start;
+    }
+}
+
+/* UNKNOWN and the contradict case decode every field with today's
+   per-field copy_legacy: bit-identical to the a525af3-era decoder */
+enum { V_UNKNOWN, V_UTF8, V_CP1251, V_LATIN1, V_PERFIELD };
+
+static int ev_verdict(const BlockEv *e) {
+    if (e->high_fields < 2) return V_UNKNOWN; /* single-field files: today exactly */
+    if (!e->invalid) {
+        if (e->strong || (e->weak && !e->masq)) return V_UTF8;
+        return V_UNKNOWN;   /* ascii/ambiguous only: no block claim */
+    }
+    if (e->strong) return V_UNKNOWN;          /* invalid bytes vs strong UTF-8:
+                                                 contradiction -> per-field */
+    if (e->cyr_letters > e->lat_letters) return V_CP1251;
+    if (e->lat_letters > e->cyr_letters) return V_LATIN1;
+    return V_PERFIELD;      /* tie: per-field looks_cp1251 picks the table */
+}
+
+static void decode_verdict(char *dst, size_t dn, const EvField *f, int v) {
+    switch (v) {
+    case V_UTF8: {
+        size_t clamped = 0;
+        int mb = 0;
+        if (utf8_scan(f->b, f->len, &clamped, &mb))
+            copy_utf8(dst, dn, f->b, (int)clamped);
+        else
+            copy_utf8(dst, dn, f->b, f->len); /* block claimed utf-8: trust it;
+                                                 copy_utf8 still drops cut tails */
+        break;
+    }
+    case V_CP1251: copy_cp1251(dst, dn, f->b, f->len); break;
+    case V_LATIN1: copy_fixed(dst, dn, f->b, f->len); break;
+    case V_PERFIELD:
+        if (looks_cp1251(f->b, f->len)) copy_cp1251(dst, dn, f->b, f->len);
+        else copy_fixed(dst, dn, f->b, f->len);
+        break;
+    default: copy_legacy(dst, dn, f->b, f->len); break;
+    }
+}
+
+/* config override (tag.legacy_encoding): main.c applies it after
+   cfg_load, the options window applies it live. Plain int, read by scan
+   threads without a lock — a torn-free int store can only mean one file
+   decodes with the previous rule. */
+static int legacy_forced = LV_ENC_AUTO;
+void tag_set_legacy_default(int enc) { legacy_forced = enc; }
+
+static void decode_block(LegacyBlock *lb, Tags *t, int fill_empty_only) {
+    int v;
+    /* config-forced encoding wins over block evidence (decision step 1):
+       forced utf8 == per-field copy_legacy exactly (that reader already
+       prefers utf-8 where valid and falls back to the guesser) */
+    if (legacy_forced == LV_ENC_LATIN1)      v = V_LATIN1;
+    else if (legacy_forced == LV_ENC_CP1251) v = V_CP1251;
+    else if (legacy_forced == LV_ENC_UTF8)   v = V_UNKNOWN;
+    else {
+        BlockEv ev = {0};
+        for (int i = 0; i < lb->n; i++)
+            ev_field(lb->f[i].b, lb->f[i].len, &ev);
+        v = ev_verdict(&ev);
+    }
+    for (int i = 0; i < lb->n; i++) {
+        EvField *f = &lb->f[i];
+        char *dst = f->slot == LV_TITLE ? t->title
+                  : f->slot == LV_ARTIST ? t->artist
+                  : f->slot == LV_ALBUM ? t->album : NULL;
+        if (!dst || (fill_empty_only && dst[0])) continue;
+        decode_verdict(dst, sizeof t->title, f, v);
+    }
 }
 
 static size_t utf16_to_utf8(char *dst, size_t dn, const unsigned char *src, size_t sn) {
@@ -317,42 +493,78 @@ static size_t utf16_to_utf8(char *dst, size_t dn, const unsigned char *src, size
     return o;
 }
 
-static void text_frame(Tags *t, const char *id, const unsigned char *p, size_t n) {
+/* UTF-16BE -> swap bytes into little-endian scratch and reuse the LE
+   decoder; zero-init so a truncated odd-length field has no
+   uninitialized tail byte. A BOM written INSIDE an enc=2 field (or a
+   spec-BOM already stripped by the caller) arrives swapped as FF FE
+   after the swap: skip it there. */
+static size_t utf16be_to_utf8(char *dst, size_t dn, const unsigned char *v, size_t vn) {
+    unsigned char sw[512] = {0};
+    size_t k = vn < sizeof sw ? vn : sizeof sw;
+    for (size_t i = 0; i + 1 < k; i += 2) { sw[i] = v[i + 1]; sw[i + 1] = v[i]; }
+    size_t bo = (k >= 2 && sw[0] == 0xFF && sw[1] == 0xFE) ? 2 : 0;
+    return utf16_to_utf8(dst, dn, sw + bo, k - bo);
+}
+
+static void text_frame(Tags *t, LegacyBlock *lb, const char *id, const unsigned char *p, size_t n) {
     if (n < 1) return;
     unsigned enc = p[0];
     const unsigned char *v = p + 1;
     size_t vn = n - 1;
-    char *dst = NULL;
-    if (!strcmp(id, "TIT2") || !strcmp(id, "TT2")) dst = t->title;
-    else if (!strcmp(id, "TPE1") || !strcmp(id, "TP1")) dst = t->artist;
-    else if (!strcmp(id, "TALB") || !strcmp(id, "TAL")) dst = t->album;
+    int slot = -1;
+    if (!strcmp(id, "TIT2") || !strcmp(id, "TT2")) slot = LV_TITLE;
+    else if (!strcmp(id, "TPE1") || !strcmp(id, "TP1")) slot = LV_ARTIST;
+    else if (!strcmp(id, "TALB") || !strcmp(id, "TAL")) slot = LV_ALBUM;
     else if (!strcmp(id, "TRCK") || !strcmp(id, "TRK")) {
         char buf[32] = {0};
-        if (enc == 1 || enc == 2) utf16_to_utf8(buf, sizeof buf, v, vn);
+        if (enc == 2) utf16be_to_utf8(buf, sizeof buf, v, vn);
+        else if (enc == 1) utf16_to_utf8(buf, sizeof buf, v, vn);
         else { size_t k = vn < 31 ? vn : 31; memcpy(buf, v, k); }
         t->track = atoi(buf);
         return;
     }
+    else if (!strcmp(id, "TPE2") || !strcmp(id, "TP2") ||
+             !strcmp(id, "TCON") || !strcmp(id, "TCO") ||
+             !strcmp(id, "TYER") || !strcmp(id, "TDRC") ||
+             !strcmp(id, "TCOM") || !strcmp(id, "TCM") ||
+             !strcmp(id, "TIT1") || !strcmp(id, "TT1") ||
+             !strcmp(id, "COMM"))
+        slot = LV_EV;    /* evidence-only slots (album artist, genre, year,
+                            composer, content group, comment): they score
+                            the block but are never stored — Tags/tag.h
+                            unchanged */
     else return;
-    if (enc == 1 || enc == 2) {
-        if (enc == 1 && vn >= 2 && v[0] == 0xFF && v[1] == 0xFE) { v += 2; vn -= 2; }
-        else if (enc == 1 && vn >= 2 && v[0] == 0xFE && v[1] == 0xFF) {
-            /* big endian: skip the BOM (the LE branch above does too —
-             * without this the swapped FE FF becomes U+FEFF in the text),
-             * swap into scratch; zero-init so a truncated odd-length
-             * field has no uninitialized tail byte */
+    if (enc == 0 || enc > 3) {
+        /* legacy / invalid marker: the field no longer decides alone —
+           decode_block() applies ONE verdict to the whole tag block */
+        lb_stash(lb, v, vn, slot);
+        return;
+    }
+    if (slot == LV_EV) return;   /* trusted enc 1/2/3 frames contribute no evidence */
+    char *dst = slot == LV_TITLE ? t->title
+              : slot == LV_ARTIST ? t->artist : t->album;
+    if (enc == 3) {
+        /* declared UTF-8 per spec: TRUST the marker, never run the
+           legacy guesser (enc=3 used to fall into copy_legacy, so a
+           frame saying "I am UTF-8" still got guessed).  copy_utf8
+           drops cut tails and passes valid sequences straight. */
+        copy_utf8(dst, 256, v, (int)(vn < 255 ? vn : 255));
+    } else if (enc == 2) {
+        /* UTF-16BE per spec. The old code fed enc=2 to the LE decoder
+           unswapped: a spec-conformant frame decoded as 䠀攀氀氀漀-style
+           mojibake, and a spec BOM leaked as U+FEFF. */
+        if (vn >= 2 && v[0] == 0xFE && v[1] == 0xFF) { v += 2; vn -= 2; }
+        utf16be_to_utf8(dst, 256, v, vn);
+    } else {
+        if (vn >= 2 && v[0] == 0xFF && v[1] == 0xFE) { v += 2; vn -= 2; }
+        else if (vn >= 2 && v[0] == 0xFE && v[1] == 0xFF) {
+            /* FE FF BOM under enc=1 (little-endian): mislabeled by the
+               tagger — honor the BOM and read big-endian anyway */
             v += 2; vn -= 2;
-            unsigned char sw[512] = {0};
-            size_t k = vn < sizeof sw ? vn : sizeof sw;
-            for (size_t i = 0; i + 1 < k; i += 2) { sw[i] = v[i + 1]; sw[i + 1] = v[i]; }
-            /* a BOM written into an enc=2 field swaps to FF FE: skip it */
-            size_t bo = (k >= 2 && sw[0] == 0xFF && sw[1] == 0xFE) ? 2 : 0;
-            utf16_to_utf8(dst, 256, sw + bo, k - bo);
+            utf16be_to_utf8(dst, 256, v, vn);
             return;
         }
         utf16_to_utf8(dst, 256, v, vn);
-    } else {
-        copy_legacy(dst, 256, v, (int)(vn < 255 ? vn : 255));
     }
 }
 
@@ -361,8 +573,9 @@ static unsigned be32(const unsigned char *p) {
            ((unsigned)p[2] << 8) | p[3];
 }
 
-/* walk ID3v2 frames (ver 2/3/4) from a memory buffer */
-static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t) {
+/* walk ID3v2 frames (ver 2/3/4) from a memory buffer; legacy text frames
+   are stashed into lb, decoded as one block by the caller */
+static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t, LegacyBlock *lb) {
     size_t i = 0;
     /* extended header (flag 0x40): without skipping it the frame walk
        starts inside the ext header and loses every frame. v3: 4 plain
@@ -397,26 +610,27 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags
             i += 10;
         }
         if (fsz == 0 || i + fsz > sz) break;
-        if (id[0] == 'T') text_frame(t, id, buf + i, fsz);
+        if (id[0] == 'T' || !memcmp(id, "COMM", 4)) text_frame(t, lb, id, buf + i, fsz);
         i += fsz;
     }
 }
 
 /* ID3v1 fills only what the head parse left empty: ID3v2 wins when both
-   exist (the old code let the v1 tail overwrite the v2 values) */
-static void fill_fixed(char *dst, size_t dn, const unsigned char *src, int n) {
-    if (dst[0]) return;
-    copy_legacy(dst, dn, src, n);
-}
-
+   exist (the old code let the v1 tail overwrite the v2 values). The v1
+   record is ONE block: its five text fields score together and share one
+   verdict (fill_empty_only keeps the v2-wins rule). */
 static void read_id3v1(FILE *f, Tags *t) {
     if (fseek(f, -128, SEEK_END) != 0) return;
     unsigned char r[128];
     if (fread(r, 1, 128, f) != 128) return;
     if (memcmp(r, "TAG", 3) != 0) return;
-    fill_fixed(t->title, sizeof t->title, r + 3, 30);
-    fill_fixed(t->artist, sizeof t->artist, r + 33, 30);
-    fill_fixed(t->album, sizeof t->album, r + 63, 30);
+    LegacyBlock lb = {0};
+    lb_stash(&lb, r + 3, 30, LV_TITLE);
+    lb_stash(&lb, r + 33, 30, LV_ARTIST);
+    lb_stash(&lb, r + 63, 30, LV_ALBUM);
+    lb_stash(&lb, r + 93, 4, LV_EV);       /* year */
+    lb_stash(&lb, r + 97, 30, LV_EV);      /* comment (v1.1 track lives here) */
+    decode_block(&lb, t, 1);
     /* v1.1: comment[28]==0 && comment[29]!=0 -> track number. the comment
        field starts at r[97] (title 3..32, artist 33..62, album 63..92,
        year 93..96) — the old 93-based offset read four bytes early. */
@@ -580,18 +794,22 @@ static void read_riff(FILE *f, Tags *t) {
             unsigned char lt[4];
             if (fread(lt, 1, 4, f) != 4) return;
             if (!memcmp(lt, "INFO", 4)) {
+                /* INFO carries no encoding marker: its text chunks join
+                   one block exactly like legacy v2 frames (INAM/IART/IPRD
+                   stored, decode happens after the walk) */
                 off_t end = ftello(f) + (off_t)sz - 4;
+                LegacyBlock lb = {0};
                 while (ftello(f) + 8 <= end) {
                     unsigned char sh[8];
-                    if (fread(sh, 1, 8, f) != 8) return;
+                    if (fread(sh, 1, 8, f) != 8) break;
                     unsigned ssz = sh[4] | (sh[5] << 8) | (sh[6] << 16) | ((unsigned)sh[7] << 24);
-                    if (ssz > 65536) return;
+                    if (ssz > 65536) break;
                     unsigned char *sb = malloc(ssz);
-                    if (!sb) return;
-                    if (fread(sb, 1, ssz, f) != ssz) { free(sb); return; }
-                    if (!memcmp(sh, "INAM", 4)) copy_legacy(t->title, sizeof t->title, sb, (int)(ssz < 255 ? ssz : 255));
-                    else if (!memcmp(sh, "IART", 4)) copy_legacy(t->artist, sizeof t->artist, sb, (int)(ssz < 255 ? ssz : 255));
-                    else if (!memcmp(sh, "IPRD", 4)) copy_legacy(t->album, sizeof t->album, sb, (int)(ssz < 255 ? ssz : 255));
+                    if (!sb) break;
+                    if (fread(sb, 1, ssz, f) != ssz) { free(sb); break; }
+                    if (!memcmp(sh, "INAM", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_TITLE);
+                    else if (!memcmp(sh, "IART", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_ARTIST);
+                    else if (!memcmp(sh, "IPRD", 4)) lb_stash(&lb, sb, ssz < 255 ? ssz : 255, LV_ALBUM);
                     else if (!memcmp(sh, "ITRK", 4)) {
                         char b[32] = {0};
                         size_t k = ssz < 31 ? ssz : 31;
@@ -601,6 +819,7 @@ static void read_riff(FILE *f, Tags *t) {
                     free(sb);
                     if (ssz & 1) fgetc(f);
                 }
+                decode_block(&lb, t, 0);
                 return;
             } else {
                 fseeko(f, (off_t)(next - 4), SEEK_CUR);
@@ -756,16 +975,18 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
             size_t sz = ((size_t)b[6] << 21) | ((size_t)b[7] << 14) |
                         ((size_t)b[8] << 7) | b[9];
             if (sz <= (1u << 24)) {
+                LegacyBlock lb = {0};
                 if (10 + sz <= n) {
-                    id3v2_frames(b + 10, sz, b[3], b[5], t);
+                    id3v2_frames(b + 10, sz, b[3], b[5], t, &lb);
                 } else {
                     /* tag larger than the head buffer: one follow-up read */
                     unsigned char *tb = malloc(sz);
                     if (tb && fseek(f, 10, SEEK_SET) == 0 &&
                         fread(tb, 1, sz, f) == sz)
-                        id3v2_frames(tb, sz, b[3], b[5], t);
+                        id3v2_frames(tb, sz, b[3], b[5], t, &lb);
                     free(tb);
                 }
+                decode_block(&lb, t, 0);   /* one verdict for the whole v2 block */
                 tagend = 10 + sz;
             }
         }

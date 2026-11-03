@@ -24,6 +24,9 @@ typedef struct {
                               repainting the main window at 10 fps whenever
                               a title is long enough to marquee, so it keeps
                               scrolling while paused/stopped/unfocused */
+    int  tag_legacy_enc;   /* tag.legacy_encoding: LV_ENC_* from tag.h —
+                              -1 auto (default, per-block evidence),
+                              0 latin-1, 1 cp1251, 2 utf-8 */
 } Config;
 
 extern Config cfg;

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "../tag/tag.h"
 #ifdef _WIN32
 #include "../compat/win32.h"
 #else
@@ -76,6 +77,11 @@ static void set_key(const char *k, char *v) {
         int o = onoff(v); if (o >= 0) cfg.allow_large = o;
     } else if (!strcmp(k, "ui.always_10fps")) {
         int o = onoff(v); if (o >= 0) cfg.ui_always10 = o;
+    } else if (!strcmp(k, "tag.legacy_encoding")) {
+        if      (!lv_strcasecmp(v, "auto"))   cfg.tag_legacy_enc = LV_ENC_AUTO;
+        else if (!lv_strcasecmp(v, "latin1")) cfg.tag_legacy_enc = LV_ENC_LATIN1;
+        else if (!lv_strcasecmp(v, "cp1251")) cfg.tag_legacy_enc = LV_ENC_CP1251;
+        else if (!lv_strcasecmp(v, "utf8"))   cfg.tag_legacy_enc = LV_ENC_UTF8;
     }
 }
 
@@ -84,6 +90,7 @@ void cfg_load(void) {
     cfg.ui_pl = cfg.ui_eq = cfg.ui_vis = cfg.ui_search = -1;
     cfg.shuffle_remember = cfg.shuffle = -1;
     cfg.fade_stop = 1; /* fade-out on stop is on unless configured off */
+    cfg.tag_legacy_enc = LV_ENC_AUTO;
     char path[LV_MAX_PATH];
     cfg_path(path, sizeof path);
     FILE *f = fopen(path, "r");
@@ -105,6 +112,10 @@ void cfg_load(void) {
 }
 
 static const char *onoff_s(int v) { return v > 0 ? "on" : "off"; }
+static const char *legacy_enc_s(int e) {
+    return e == LV_ENC_LATIN1 ? "latin1" : e == LV_ENC_CP1251 ? "cp1251"
+         : e == LV_ENC_UTF8   ? "utf8"   : "auto";
+}
 
 /* cfg_save runs on the UI thread (options save, scan) AND the daemon
    thread (shuffle_remember): serialize it, and swap the file atomically
@@ -141,6 +152,7 @@ static int cfg_save_locked(void) {
     fprintf(f, "player.fade_stop = %s\n", onoff_s(cfg.fade_stop));
     fprintf(f, "decode.allow_large = %s\n", onoff_s(cfg.allow_large));
     fprintf(f, "ui.always_10fps = %s\n", onoff_s(cfg.ui_always10));
+    fprintf(f, "tag.legacy_encoding = %s\n", legacy_enc_s(cfg.tag_legacy_enc));
     fclose(f);
     /* mingw's rename refuses to replace an existing file: retry once
        after unlinking the target (small race, better than losing saves) */

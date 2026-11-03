@@ -55,7 +55,7 @@ package linux x86-64 build-rel-linux levari README.md assets/levari.desktop asse
 export SDL2_LEGACY_PREFIX=${SDL2_LEGACY_PREFIX:-$HOME/sdl2-legacy-x86_64}
 [ -f "$SDL2_LEGACY_PREFIX/lib64/libSDL2.a" ] || {
     echo "floor-built static SDL2 missing at $SDL2_LEGACY_PREFIX (see docs/build.md, legacy section)" >&2; exit 1; }
-build build-rel-linux-legacy-zig -DCMAKE_TOOLCHAIN_FILE="$root/tools/zig-legacy-toolchain.cmake"
+build build-rel-linux-legacy-zig -DCMAKE_TOOLCHAIN_FILE="$root/tools/zig-legacy-toolchain.cmake" -DLEVAR_SIMD_TIERS=OFF
 # floor gates (hard fails — a silent regression here ships a binary that
 # refuses to load or SIGILLs on the legacy target):
 #   glibc: highest GLIBC_* symbol version must be 2.17 (no GLIBCXX_* at
@@ -70,7 +70,16 @@ build build-rel-linux-legacy-zig -DCMAKE_TOOLCHAIN_FILE="$root/tools/zig-legacy-
 #   under set -euo pipefail that would kill the script before packaging.
 floor=$(objdump -T build-rel-linux-legacy-zig/levari | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
 [ "$floor" = "GLIBC_2.17" ] || { echo "legacy glibc floor is $floor, expected GLIBC_2.17" >&2; exit 1; }
-n=$(objdump -d build-rel-linux-legacy-zig/levari | grep -cE $'\tv[a-z0-9]+([ \t]|$)|\b(movbe|tzcnt|pshufb|pblendvb|palignr|lddqu|movntdqa|ptest|roundps|pminud|pminsb|packusdw|pcmpgtq|popcnt|crc32|andn|bextr|blsr|mulx)\b' || true)
+# QUOTING PITFALL: the $'...' covers ONLY the tab-umbrella half.  bash
+# turns \b inside $'...' into a BACKSPACE character, so wrapping the
+# word-boundary half would silently match NOTHING (verified both ways:
+# the corrected split pattern hits 8063 on the host v3-native build and
+# 0 on the legacy zig build; the fully-$'...' pattern hit 0 on both —
+# a dead scalar gate).  No tzcnt/rep-bsf false positive exists on the
+# zig binary (measured 0).  The two pattern segments are ADJACENT quoted
+# words (no space between them) — one space would hand grep the second
+# word as a FILE argument.
+n=$(objdump -d build-rel-linux-legacy-zig/levari | grep -cE $'\tv[a-z0-9]+([ \t]|$)|''\b(movbe|tzcnt|pshufb|pblendvb|palignr|lddqu|movntdqa|ptest|roundps|pminud|pminsb|packusdw|pcmpgtq|popcnt|crc32|andn|bextr|blsr|mulx)\b' || true)
 [ "$n" = 0 ] || { echo "legacy ISA scan: $n AVX/SSE3+ refs found" >&2; exit 1; }
 package linux-legacy x86-64 build-rel-linux-legacy-zig levari README.md assets/levari.desktop assets/levari.svg
 

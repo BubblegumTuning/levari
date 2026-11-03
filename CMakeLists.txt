@@ -105,7 +105,42 @@ else()
     target_compile_options(snes_spc PRIVATE -Os -flto -fPIE ${VEND_HARD} ${VEND_WARN})
 endif()
 
-add_executable(levari
+# x86-64 decoder codegen tiers: decode.c + stb_vorbis.c compiled once per
+# tier (SSE2 baseline, AVX+FMA, AVX2); tier_rename.h suffixes every tier's
+# symbols and src/decode/dispatch.c owns the public API, picking the best
+# tier the CPU supports at runtime (LEVAR_DECODE=sse2|avx|avx2 to force).
+# Same source, bit-identical output; only codegen differs. Tiers stay OFF
+# for the legacy x86-64 build: tools/release.sh's ISA floor gate must not
+# see VEX instructions, and old CPUs run the SSE2 tier anyway.
+option(LEVAR_SIMD_TIERS "runtime-dispatched AVX/AVX2 decoder tiers" ON)
+set(LEVAR_TIERS "")
+if(LEVAR_SIMD_TIERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+        AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    include(CheckCCompilerFlag)
+    # every tier compiles with LEVAR_TIER_BASE's -march=x86-64, and not
+    # every compiler that reports "Clang" accepts it: zig cc is clang at
+    # heart but spells CPU selection -mcpu, so it rejects the flag and
+    # every tier then fails at BUILD time (a misconfigured legacy dir
+    # used to die exactly that way). probe the floor flag too and fall
+    # back to the tier-less shape (plain decode.c, no dispatch) when it
+    # does not compile
+    check_c_compiler_flag("-march=x86-64" LEVAR_CC_MARCH)
+    if(LEVAR_CC_MARCH)
+        set(LEVAR_TIERS sse2)
+        check_c_compiler_flag("-mavx -mfma" LEVAR_CC_AVX)
+        check_c_compiler_flag("-mavx2 -mfma -mbmi -mbmi2 -mlzcnt" LEVAR_CC_AVX2)
+        if(LEVAR_CC_AVX)
+            list(APPEND LEVAR_TIERS avx)
+        endif()
+        if(LEVAR_CC_AVX2)
+            list(APPEND LEVAR_TIERS avx2)
+        endif()
+    else()
+        message(STATUS "LEVAR_SIMD_TIERS: requested but off — compiler rejects -march=x86-64 (zig cc)")
+    endif()
+endif()
+
+set(LEVARI_SRC
     src/main.c
     src/ui/ui.c
     src/ui/textedit.c
@@ -125,6 +160,11 @@ add_executable(levari
     src/config/config.c
     third_party/stb_vorbis.c
 )
+if(LEVAR_TIERS)
+    list(REMOVE_ITEM LEVARI_SRC src/decode/decode.c third_party/stb_vorbis.c)
+    list(APPEND LEVARI_SRC src/decode/dispatch.c)
+endif()
+add_executable(levari ${LEVARI_SRC})
 
 if(WIN32)
     # link the SDL2 import lib directly rather than the SDL2::SDL2 target
@@ -193,8 +233,62 @@ if(LV_TUNE AND NOT WIN32)
     endif()
 endif()
 
-# decoders dominate CPU: let this TU optimize for speed, not size
-set_source_files_properties(src/decode/decode.c PROPERTIES COMPILE_OPTIONS "-O3")
+# decoders dominate CPU: let these TUs optimize for speed, not size.
+# stb_vorbis belongs here as much as decode.c: the tier comment below
+# already assumes the -O3 source property covers both, and without it
+# stb_vorbis ran -Os in plain builds and NO -O at all in the tier OBJECT
+# libs (object libs do not inherit levari's -Os) — 20-25% slower ogg
+set_source_files_properties(src/decode/decode.c third_party/stb_vorbis.c
+    PROPERTIES COMPILE_OPTIONS "-O3")
+
+if(LEVAR_TIERS)
+    # mirror the per-platform hardening flags of the levari target (minus
+    # -Os/-flto: the tier code is reached through function pointers, size
+    # and cross-TU LTO buy nothing; -O3 already comes via the source prop).
+    # -march=x86-64 pins the ISA floor explicitly: some toolchains default
+    # above the baseline (this host's gcc ships x86-64-v3), and the sse2
+    # tier is what the dispatcher hands to old CPUs — its name must match
+    # its instructions
+    if(WIN32)
+        set(LEVAR_TIER_BASE -march=x86-64 -ffunction-sections -fdata-sections -fstack-protector-strong)
+    elseif(APPLE)
+        set(LEVAR_TIER_BASE -march=x86-64 -ffunction-sections -fdata-sections -fstack-protector-strong)
+    else()
+        set(LEVAR_TIER_BASE -march=x86-64 -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2)
+    endif()
+    foreach(tier IN LISTS LEVAR_TIERS)
+        add_library(dec_${tier} OBJECT src/decode/decode.c third_party/stb_vorbis.c)
+        # MODPLUG_BUILD: on Windows modplug.h otherwise declares the DLL-import
+        # form (__imp_ModPlug_*) and the static modplug archive does not match
+        target_compile_definitions(dec_${tier} PRIVATE LEVAR_DECODE_SUFFIX=_${tier})
+        if(WIN32)
+            target_compile_definitions(dec_${tier} PRIVATE MODPLUG_BUILD)
+        endif()
+        set(tierflags "")
+        if(tier STREQUAL "avx")
+            set(tierflags -mavx -mfma -DDRFLAC_API=static -DDRFLAC_PRIVATE=static -DDRWAV_API=static -DDRWAV_PRIVATE=static)
+        elseif(tier STREQUAL "avx2")
+            # v3-class set, not bare AVX2: FMA is free throughput in the
+            # imdct/filterbank loops and BMI/LZCNT pay off in the bitstream
+            # walkers (measured: bare -mavx2 loses ~7% to this set). Every
+            # AVX2-capable CPU worth a tier (Haswell/Excavator and newer)
+            # has them all, and the dispatcher gates on every bit we use
+            set(tierflags -mavx2 -mfma -mbmi -mbmi2 -mlzcnt -DDRFLAC_API=static -DDRFLAC_PRIVATE=static -DDRWAV_API=static -DDRWAV_PRIVATE=static)
+        endif()
+        target_compile_options(dec_${tier} PRIVATE
+            -include ${CMAKE_CURRENT_SOURCE_DIR}/src/decode/tier_rename.h
+            ${LEVAR_TIER_BASE} ${tierflags})
+        # target_sources (not target_link_libraries): levari's link line uses
+        # the plain signature above, and keyword/plain mixing is an error
+        target_sources(levari PRIVATE $<TARGET_OBJECTS:dec_${tier}>)
+        if(tier STREQUAL "avx")
+            target_compile_definitions(levari PRIVATE LEVAR_HAVE_AVX)
+        elseif(tier STREQUAL "avx2")
+            target_compile_definitions(levari PRIVATE LEVAR_HAVE_AVX2)
+        endif()
+    endforeach()
+    target_compile_definitions(levari PRIVATE LEVAR_DECODE_HAVE_X86)
+endif()
 
 # optional libav* backend for aac/wma and other exotic formats:
 # dev headers only at build time; the libraries are dlopen'd at runtime,
@@ -204,6 +298,10 @@ if(NOT WIN32)
     if(AV_FOUND)
         target_compile_definitions(levari PRIVATE HAVE_FFMPEG)
         target_include_directories(levari PRIVATE ${AV_INCLUDE_DIRS})
+        foreach(tier IN LISTS LEVAR_TIERS)
+            target_compile_definitions(dec_${tier} PRIVATE HAVE_FFMPEG)
+            target_include_directories(dec_${tier} PRIVATE ${AV_INCLUDE_DIRS})
+        endforeach()
     endif()
 endif()
 

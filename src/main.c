@@ -64,6 +64,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     cfg_load();
+    tag_set_legacy_default(cfg.tag_legacy_enc);
     if (argc > 1 && !strcmp(argv[1], "library"))
         return lib_cmd(argc - 1, argv + 1);
     if (argc > 1 && is_cli_cmd(argv[1]))

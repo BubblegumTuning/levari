@@ -1223,6 +1223,31 @@ cyr	Ні да
 obs	Ні
 cyr	цієї
 obs	Café°
+# 2026-11-03 pad-NUL fix: utf8_scan ran the cut-tail/complete-sequence
+# logic past the NUL into a field's padding, so a char cut BEFORE the pad
+# failed the continuation check on a pad NUL and the whole field fell to
+# the 8-bit readers — mojibake in every version. n=strnlen at entry; the
+# cut class now trims clean with padding behind it.
+u8nul	abc日
+u8nul	ab😀
+u8nul	«Привет»日
+v1nul	abc日
+v1nul	ありがとう
+# 2026-11-03 encoding-marker fixes: enc=2 (UTF-16BE per spec) was fed to
+# the LE decoder unswapped (Hello Привет -> 䠀攀氀氀漀 mojibake, spec BOM
+# leaked U+FEFF); enc=3 (UTF-8) fell into copy_legacy and got GUESSED.
+# Now: enc=2 swaps through utf16be_to_utf8 (BOM-tolerant), enc=3 is
+# TRUSTED via copy_utf8 (strict: a mislabeled enc=3 frame is passed
+# as-is; config override + per-block evidence are the planned escapes).
+enc2	Hello Привет
+enc2	Grüße
+enc2	Mötley Crüe
+enc2	ab😀
+enc2	«Привет»
+enc3	Café°
+enc3	«Привет»
+enc3	日本語
+enc3	Beyoncé
 l1	Agua ½é
 l1	voilÃ
 l1	mitÃ
@@ -1262,3 +1287,23 @@ au8t	Beyoncé
 # on the identical title path below — artist path proven equivalent).
 l1	BeyoncÃ
 l1	BallinÂ
+
+# == SECTION 12: 2026-11-03 per-block legacy reader (Part 2). One encoding
+# verdict per tag BLOCK (legacy v2 frames / one v1 record / one RIFF INFO —
+# separately). Decision order: <2 high-byte fields -> today's per-field read
+# (every single-field row above stays bit-identical BY CONSTRUCTION);
+# nothing invalid + strong UTF-8 evidence (or weak-without-masquerade) ->
+# UTF-8 block; invalid + strong -> contradiction -> per-field today;
+# invalid + no strong -> LEGACY with cp1251 iff unglued cp1251-letter runs
+# outnumber ascii-glued high-byte runs (tie -> per-field looks_cp1251).
+# mf = multi-frame id3v2 spec 'ID:ENC:VAL|...=>ID=TEXT|...', vmf = id3v1
+# multi-field, obsmf = spec only, never asserted. ==
+mf	TIT2:0:Caf\xE9\xB0|TPE1:0:Beyonc\xe9 Knowles=>TIT2=Café°|TPE1=Beyoncé Knowles
+obsmf	TIT2:0:Caf\xE9\xB0|TPE1:0:Beyonc\xe9
+mf	TIT2:0:Caf\xE9\xB0|TALB:0:\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E=>TIT2=Caf|TALB=日本語
+mf	TIT2:0:\xCD\xB3|TALB:0:\xCA\xE8\xBF\xE2=>TIT2=Ні|TALB=Київ
+mf	TIT2:0:\xDF|TALB:0:\xCF\xF0\xE8\xE2\xE5\xF2=>TIT2=Я|TALB=Привет
+mf	TIT2:0:Agua \xBE\xE9|TPE1:0:Beyonc\xe9 Knowles|TALB:0:Gr\xFC\xDFe=>TIT2=Agua ¾é|TPE1=Beyoncé Knowles|TALB=Grüße
+mf	TIT2:0:\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E|TPE1:0:Bad\xFFTag=>TIT2=日本語|TPE1=BadÿTag
+vmf	TIT2:\xCD\xB3|TALB:\xCA\xE8\xBF\xE2=>TIT2=Ні|TALB=Київ
+vmf	TIT2:Caf\xe9=>TIT2=Café
