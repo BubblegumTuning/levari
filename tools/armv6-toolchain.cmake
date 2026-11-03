@@ -27,19 +27,30 @@ set(CMAKE_SYSTEM_PROCESSOR armv6l)
 # are NOT carried over there — branching on them again would flip the
 # else branch, re-warn and repoint the find roots mid-configure. The
 # compiler, flags and system name are already forwarded from the main
-# project by then, so leave a scratch project alone.
-if(CMAKE_BINARY_DIR MATCHES "CMakeScratch")
+# project by then, so leave a scratch project alone. Scratch project
+# dirs changed shape in CMake 3.24 (CMakeFiles/CMakeScratch/TryCompile-*);
+# older CMake (the project floor is 3.16) uses CMakeFiles/TryCompile-*,
+# so match BOTH names — 'TryCompile' is contained in either form,
+# 'CMakeScratch' only in the new one.
+if(CMAKE_BINARY_DIR MATCHES "TryCompile|CMakeScratch")
     return()
 endif()
 
 
-# -march=armv6 is pinned here and -mcpu=<tune> comes from LV_TUNE: a
+# -march=armv6zk is pinned here and -mcpu=<tune> comes from LV_TUNE: a
 # non-ARMv6 tune (e.g. someone reuses this file with -DLV_TUNE=cortex-a7)
 # is a contradictory request the compiler only grumbles about. refuse it.
+# armv6zk, not plain armv6: gcc's own table puts arm1176jzf-s in the
+# ARMv6KZ family, and `-march=armv6` beside `-mcpu=arm1176jzf-s` draws
+# 'conflicts with -march=armv6+fp' warnings (verified with Debian gcc
+# 14.2 arm-linux-gnueabihf). -marm is REQUIRED for the hard-float ABI:
+# armv6's thumb is Thumb-1 and gcc refuses Thumb-1 hard-float outright
+# ('sorry, unimplemented') — while Debian's armhf cross defaults to
+# -mthumb. (verified: int main compiles clean with this exact set)
 if(DEFINED LV_TUNE AND NOT LV_TUNE STREQUAL "" AND NOT LV_TUNE MATCHES "^arm1176")
     message(FATAL_ERROR
         "armv6-toolchain: LV_TUNE='${LV_TUNE}' is not an ARMv6 core. "
-        "this file pins -march=armv6; use arm1176jzf-s (Pi Zero 1 / Pi 1) "
+        "this file pins -march=armv6zk; use arm1176jzf-s (Pi Zero 1 / Pi 1) "
         "or a matching toolchain file for newer boards.")
 endif()
 
@@ -95,5 +106,5 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-set(CMAKE_C_FLAGS_INIT "-march=armv6 -mfpu=vfp -mfloat-abi=hard")
-set(CMAKE_CXX_FLAGS_INIT "-march=armv6 -mfpu=vfp -mfloat-abi=hard")
+set(CMAKE_C_FLAGS_INIT "-march=armv6zk -marm -mfpu=vfp -mfloat-abi=hard")
+set(CMAKE_CXX_FLAGS_INIT "-march=armv6zk -marm -mfpu=vfp -mfloat-abi=hard")

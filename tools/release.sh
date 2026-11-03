@@ -113,27 +113,53 @@ if [ -z "$pi0skip" ]; then
     if [ -n "${LV_PI0_SYSROOT:-}" ]; then pi0cmake+=(-DLV_PI0_SYSROOT="$LV_PI0_SYSROOT"); fi
     if [ -n "${SDL2_PI0_DIR:-}" ]; then pi0cmake+=(-DSDL2_DIR="$SDL2_PI0_DIR"); fi
     build build-rel-pi0 "${pi0cmake[@]}"
-    # ISA floor gate for the ARM1176JZF-S: no NEON, no VFPv3 vdiv/vsqrt
-    # (VFPv2 does add/mul/fma in hardware — see the ARM note in src/dsp/
-    # dsp.c). objdump ARM syntax tells: q registers and vld1..4/vst1..4
-    # are NEON. EXPECT this scan to FIRE on distro arm-linux-gnueabihf
-    # userland — Debian/Ubuntu armhf is compiled for ARMv7 (NEON memcpy in
-    # libc etc.): that is the forcing function, the fix is LV_PI0_SYSROOT,
-    # never relaxing the gate. A firing gate — or an objdump that cannot
-    # disassemble the binary at all, ins=0 — SKIPS pi0 packaging; a hard
-    # fail here would abort the whole release under set -e. NOTE the
-    # '|| true': on a clean scan grep -c prints 0 AND exits 1.
+    # ISA floor gate for the ARM1176JZF-S (Pi Zero 1 / Pi 1): the board is
+    # ARMv6Z + VFPv3-D16. Doubles, vmla and vdiv/vsqrt are HARDWARE there
+    # (vdiv/vsqrt date back to VFPv1, and the ARM1176 has VFPv3 regardless
+    # — a correct ARMv6 build of dsp.c/player.c CONTAINS them: the gate
+    # must NOT flag them; see the ARM note in src/dsp/dsp.c). What must
+    # never appear: NEON (q registers, vld1..4/vst1..4, vdup, vshl, vtbl,
+    # vmov.i*/vmov.f16 — plain vmov.f32/f64 are VFPv1 moves and must NOT
+    # be flagged), the full-VFPv3 register bank d16-d31, and Thumb-2
+    # (movw/movt plus .w/.n encoding suffixes — the ARM1176 has
+    # no Thumb-2 at all; this is the pattern that catches distro
+    # crt/libgcc statically linked into the binary as ARMv7 thumb2).
+    # Known residual: NEON vmov.f32/f64 against d0-d15 is indistinguish-
+    # able from VFP moves and not flagged; the -march pin is the floor,
+    # this scan is the backstop.
+    # The HOST objdump cannot disassemble an ARM binary at all (0 ins —
+    # packaging would skip on every build): always use the cross binutils,
+    # sysroot bin/ first, then PATH. EXPECT the scan to FIRE on distro
+    # arm-linux-gnueabihf userland — Debian/Ubuntu armhf is compiled for
+    # ARMv7 (NEON memcpy in libc etc.): that is the forcing function, the
+    # fix is LV_PI0_SYSROOT, never relaxing the gate. A firing gate — or a
+    # missing/failed cross objdump — SKIPS pi0 packaging; a hard fail here
+    # would abort the whole release under set -e. NOTE the '|| true': on a
+    # clean scan grep -c prints 0 AND exits 1.
+    pi0objdump=arm-linux-gnueabihf-objdump
+    if [ -n "${LV_PI0_SYSROOT:-}" ] &&
+       [ -x "$LV_PI0_SYSROOT/bin/arm-linux-gnueabihf-objdump" ]; then
+        pi0objdump="$LV_PI0_SYSROOT/bin/arm-linux-gnueabihf-objdump"
+    fi
     dis=build-rel-pi0/pi0-isa-scan.txt
-    ins=0 n=0
-    if objdump -d build-rel-pi0/levari > "$dis" 2>/dev/null; then
+    ins=0 n=0 scanned=0
+    if { command -v "$pi0objdump" >/dev/null 2>&1 || [ -x "$pi0objdump" ]; } &&
+       "$pi0objdump" -d build-rel-pi0/levari > "$dis" 2>/dev/null; then
+        scanned=1
         ins=$(grep -cE '^[[:space:]]+[0-9a-f]+:' "$dis" || true)
-        n=$(grep -cE '\bq(1[0-5]|[0-9])\b|\bv(ld|st)[1-4]\b|\b(vdiv|vsqrt)\b' "$dis" || true)
+        # NOTE the operand guards on d/q: objdump prints small addresses as
+        # bare hex labels (d18:, d24 <sym+...>) which otherwise read as
+        # d16-d31 register refs; a register token is always followed by
+        # ',', '-', '}' or ']', a bare label by ':' or '<'.
+        n=$(grep -cE '\bq(1[0-5]|[0-9])(,|-|}|\])|\bv(ld|st)[1-4]\b|\b(vdup|vshl|vtbl)\b|\bvmov\.(i[0-9]+|f16)|\bd(1[6-9]|2[0-9]|3[01])(,|-|}|\])|\b(movw|movt)\b|\.[wn]\b' "$dis" || true)
     fi
     rm -f "$dis"
-    if [ "$ins" = 0 ]; then
+    if [ "$scanned" = 0 ]; then
+        echo "== pi0 ISA scan: cross objdump ($pi0objdump) missing or cannot disassemble build-rel-pi0/levari; pi0 packaging skipped"
+    elif [ "$ins" = 0 ]; then
         echo "== pi0 ISA scan: objdump found no code in build-rel-pi0/levari; pi0 packaging skipped"
     elif [ "$n" != 0 ]; then
-        echo "== pi0 ISA scan: $n NEON/VFPv3 refs (distro armhf userland is ARMv7; pass LV_PI0_SYSROOT for a shippable pi0); pi0 packaging skipped"
+        echo "== pi0 ISA scan: $n ARMv7/NEON refs (distro armhf userland is ARMv7; pass LV_PI0_SYSROOT for a shippable pi0); pi0 packaging skipped"
     else
         package pi0 arm32 build-rel-pi0 levari README.md
     fi

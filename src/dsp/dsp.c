@@ -20,10 +20,14 @@ void dsp_flush_denormals(void) {
        on anything older. Unlike x86, ARM's single FZ bit flushes both the
        denormal operands (their read-back is zero, so no DAZ counterpart is
        needed) and the denormal result, collapsing the decay tail to 0.
-       (Corrected: the old "VFPv2 evaluates doubles in software" claim was
-       wrong — ARM1176JZF-S' VFPv2 does doubles in hardware; only vdiv/
-       vsqrt are VFPv3+. ws's double blend therefore runs on the VFP and
-       gets flushed like everything else, which is the intent.) */
+       (Corrected twice: the old "VFPv2 evaluates doubles in software" claim
+       was wrong, AND the correction that followed called this core VFPv2.
+       ARM1176JZF-S implements VFPv3-D16: doubles, vmla and even vdiv/vsqrt
+       (which date back to VFPv1) are hardware instructions on this board —
+       a correct ARMv6 build of this file CONTAINS vdiv/vsqrt and the pi0
+       ISA gate must not flag them. What the core lacks is the d16-d31
+       register bank and NEON. ws's double blend therefore runs on the VFP
+       and gets flushed like everything else, which is the intent.) */
     unsigned int f;
     __asm__ __volatile__("vmrs %0, fpscr" : "=r"(f));
     __asm__ __volatile__("vmsr fpscr, %0" : : "r"(f | (1u << 24)));

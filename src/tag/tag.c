@@ -316,9 +316,18 @@ static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
    id3v1 record, or one RIFF INFO list — separately, because a v1 written
    by tool A and a v2 written by tool B must never decide each other.
    Trusted enc=1/2/3 frames contribute no evidence and never enter a block.
-   Single-field files keep bit-identical behavior by construction: fewer
-   than two high-byte fields -> verdict UNKNOWN -> copy_legacy exactly
-   (counts scale stored x2 / evidence x1, so the gate is < 4 units). */
+   STORED fields decide first (tier 1, stored unanimity): classify every
+   high-byte stored field (FINAL value only — an overwritten duplicate
+   never votes) by the table per-field copy_legacy would pick for it; when
+   they all agree and at least one carries evidence, the block is pinned to
+   that table — two mislabelled COMMs can never turn 'Größe' into
+   'GrьЯe'. Disagreement or an evidence-less block falls to tier 2: the
+   merged counter rule (2188f3e-era), where the capped evidence frames can
+   tip an ambiguous block (a lone 0xDF title + one Cyrillic comment = Я,
+   the push-5 contract) but a claim still needs >= 2 high-byte fields.
+   Single-field files keep bit-identical behavior by construction: one
+   high-byte field is trivially unanimous, and pinning the block to the
+   table copy_legacy picks for that field reproduces copy_legacy exactly. */
 
 /* Only three fields are ever STORED — everything else (album artist,
    genre, year, composer, content group, comment) is evidence only, so it
@@ -350,7 +359,10 @@ typedef struct {
                                         still decodes (wiping an earlier value,
                                         exactly the old stash-then-decode-every-
                                         field behavior), an unseen slot does not */
-    BlockEv ev;                      /* accumulated: stored x2, evidence x1 */
+    BlockEv eev;                     /* accumulated from EVIDENCE frames only;
+                                        stored-field evidence is computed in
+                                        lb_finish from the final stored values
+                                        so overwritten duplicates never vote */
     unsigned char per_id[EV_N];      /* evidence frames counted per id */
     int total;                       /* evidence frames counted, capped */
 } LegacyBlock;
@@ -425,31 +437,30 @@ static void ev_field(const unsigned char *s, int n, BlockEv *e, int nulsafe) {
     }
 }
 
-/* merge one field's evidence into the block: stored fields count double,
-   evidence frames single — a pile of mislabelled COMMs must never outvote
-   the title it sits next to. All counts scale together except the
-   high_fields gate, which therefore requires two FULL-WEIGHT high-byte
-   fields: evidence alone can never claim a verdict. */
-static void ev_merge(BlockEv *dst, const BlockEv *s, int w) {
-    dst->strong += s->strong * w;      dst->weak += s->weak * w;
-    dst->masq += s->masq * w;          dst->invalid += s->invalid * w;
-    dst->high_fields += s->high_fields * w;
+/* merge one evidence frame's classification into the block counters.
+   No weighting: stored-field evidence lives in its own BlockEv and is
+   computed in lb_finish, so the stored-vs-evidence priority is decided
+   by ev_verdict's two-tier structure, not by scales. */
+static void ev_merge(BlockEv *dst, const BlockEv *s) {
+    dst->strong += s->strong;        dst->weak += s->weak;
+    dst->masq += s->masq;            dst->invalid += s->invalid;
+    dst->high_fields += s->high_fields;
     dst->amb_tail |= s->amb_tail;
-    dst->cyr_letters += s->cyr_letters * w;
-    dst->lat_letters += s->lat_letters * w;
+    dst->cyr_letters += s->cyr_letters;
+    dst->lat_letters += s->lat_letters;
 }
 
 /* store one legacy field into its dedicated slot (last duplicate wins,
    exactly the old decode-all-stashed-copies behavior). Raw bytes only —
-   decoding happens once in lb_finish, under the block verdict. */
+   decoding happens once in lb_finish, under the block verdict, and the
+   verdict reads ONLY the final value of each slot: an overwritten
+   duplicate frame contributes no evidence (5 Cyrillic TIT2s followed by
+   a Latin-1 'Café' decide on 'Café' alone). */
 static void lb_store(LegacyBlock *lb, const unsigned char *v, size_t vn, int slot) {
     int m = (int)(vn < sizeof lb->b[0] - 1 ? vn : sizeof lb->b[0] - 1);
     lb->have[slot] = 1;
     lb->n[slot] = (short)m;
     memcpy(lb->b[slot], v, (size_t)m);
-    BlockEv tmp = {0};
-    ev_field(lb->b[slot], m, &tmp, 0);
-    ev_merge(&lb->ev, &tmp, 2);
 }
 
 /* score one evidence frame (album artist, genre, year, composer, content
@@ -470,27 +481,52 @@ static void lb_evidence(LegacyBlock *lb, const unsigned char *v, size_t vn, int 
     lb->total++;
     BlockEv tmp = {0};
     ev_field(v, (int)et, &tmp, nulsafe);
-    ev_merge(&lb->ev, &tmp, 1);
+    ev_merge(&lb->eev, &tmp);
 }
 
 /* UNKNOWN and the contradict case decode every field with today's
    per-field copy_legacy: bit-identical to the a525af3-era decoder */
 enum { V_UNKNOWN, V_UTF8, V_CP1251, V_LATIN1, V_PERFIELD };
 
-static int ev_verdict(const BlockEv *e) {
-    /* scaled units (stored=2, evidence=1): < 4 means fewer than two
-       high-byte fields, so single-field files land on V_UNKNOWN and
-       decode exactly as today */
-    if (e->high_fields < 4) return V_UNKNOWN;
+/* the verdict implied by the MERGED counters (stored + evidence frames):
+   exactly the 2188f3e-era block rule. It runs only when the stored fields
+   are not unanimous per-field (see lb_finish), so it can tip ambiguous or
+   contradictory blocks but never outvote agreeing stored fields. */
+static int core_verdict(const BlockEv *e) {
     if (!e->invalid) {
         if (e->strong || (e->weak && !e->masq)) return V_UTF8;
         return V_UNKNOWN;   /* ascii/ambiguous only: no block claim */
     }
-    if (e->strong) return V_UNKNOWN;          /* invalid bytes vs strong UTF-8:
-                                                 contradiction -> per-field */
+    if (e->strong) return V_UNKNOWN;          /* invalid vs strong: contradiction */
     if (e->cyr_letters > e->lat_letters) return V_CP1251;
     if (e->lat_letters > e->cyr_letters) return V_LATIN1;
     return V_PERFIELD;      /* tie: per-field looks_cp1251 picks the table */
+}
+
+/* tier 2 (tier 1 — stored unanimity — lives in lb_finish): merge the
+   capped evidence frames and apply the block rule. A claim needs >= 2
+   high-byte fields in total (stored or evidence), so a lone 0xDF title
+   + one Cyrillic comment lands on cp1251 (the push-5 contract), but
+   evidence alone against pure-ASCII storage can never claim anything
+   observable. */
+static int ev_verdict(const BlockEv *s, const BlockEv *c) {
+    BlockEv sum = *s;
+    ev_merge(&sum, c);
+    if (sum.high_fields < 2) return V_UNKNOWN;
+    return core_verdict(&sum);
+}
+
+/* which table per-field copy_legacy would pick for one field:
+   0 = utf-8, 1 = cp1251, 2 = latin-1. This is the oracle behind the
+   stored-unanimity tier: if every high-byte stored field makes copy_legacy
+   pick the SAME table, pinning the block to that verdict reproduces
+   copy_legacy's output byte-for-byte by construction. */
+static int pv_table(const unsigned char *b, int n) {
+    size_t cl;
+    int mb = 0;
+    if (utf8_scan(b, n, &cl, &mb) && mb) return 0;
+    if (looks_cp1251(b, n)) return 1;
+    return 2;
 }
 
 static void decode_verdict(char *dst, size_t dn, const unsigned char *b, int len, int v) {
@@ -526,8 +562,9 @@ static _Atomic int legacy_forced = LV_ENC_AUTO;
 void tag_set_legacy_default(int enc) { atomic_store_explicit(&legacy_forced, enc, memory_order_relaxed); }
 
 /* the block's single verdict, then decode of the three stored fields.
-   Evidence was already counted into lb->ev while the frames were walked,
-   so the forced path simply ignores the counters. */
+   Evidence frames were counted into lb->eev while the frames were walked;
+   the stored fields' own evidence is classified here, from the FINAL
+   stored values only. The forced path simply ignores the counters. */
 static void lb_finish(LegacyBlock *lb, Tags *t, int fill_empty_only) {
     int v;
     /* config-forced encoding wins over block evidence (decision step 1):
@@ -538,7 +575,32 @@ static void lb_finish(LegacyBlock *lb, Tags *t, int fill_empty_only) {
     if (forced == LV_ENC_LATIN1)      v = V_LATIN1;
     else if (forced == LV_ENC_CP1251) v = V_CP1251;
     else if (forced == LV_ENC_UTF8)   v = V_UNKNOWN;
-    else v = ev_verdict(&lb->ev);
+    else {
+        /* tier 1 — stored unanimity: classify every high-byte stored field
+           by the table per-field copy_legacy would pick for it. If they
+           all pick the SAME table and at least one of them actually
+           carries evidence (a utf-8 claim or a non-zero word-shape count),
+           pin the block to that verdict — bit-identical to per-field
+           decoding by construction. Disagreement or evidence-less
+           unanimity falls through to tier 2 (merged counters). */
+        BlockEv sev = {0};
+        int pv = -1, pv_ev = 0;
+        for (int i = 0; i < LF_COUNT; i++) {
+            if (!lb->have[i]) continue;
+            BlockEv fe = {0};
+            ev_field(lb->b[i], lb->n[i], &fe, 0);
+            if (!fe.high_fields) continue;      /* ASCII fields have no voice */
+            ev_merge(&sev, &fe);
+            int t = pv_table(lb->b[i], lb->n[i]);
+            if (pv < 0) pv = t;
+            else if (pv != t) pv = -2;
+            if (t == 0 || fe.cyr_letters || fe.lat_letters) pv_ev++;
+        }
+        if (pv >= 0 && pv_ev)
+            v = pv == 0 ? V_UTF8 : pv == 1 ? V_CP1251 : V_LATIN1;
+        else
+            v = ev_verdict(&sev, &lb->eev);     /* tier 2 */
+    }
     for (int i = 0; i < LF_COUNT; i++) {
         char *dst = i == LF_TITLE ? t->title
                   : i == LF_ARTIST ? t->artist : t->album;

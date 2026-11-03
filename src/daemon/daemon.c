@@ -296,11 +296,20 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
    so the caller can bound the wait; destroying the pipe unblocks a
    stuck flush (it completes with an error). the arg block is heap-owned
    because the thread can still be running after the caller's scope
-   ends; the caller always reaps it after closing the pipe handle. */
+   ends; the caller always reaps it after closing the pipe handle.
+   The thread owns a DUPLICATED pipe handle, never the caller's h: with
+   a small remaining budget the caller reaches DisconnectNamedPipe +
+   CloseHandle(h) while the thread may not even have entered
+   FlushFileBuffers yet — a closed handle VALUE can be recycled by any
+   other thread's open and the flush would then run against the wrong
+   object. With its own duplicate, the pipe object stays valid under it
+   (references outlive closes), the teardown still unblocks it, and the
+   thread closes its own copy on the way out. */
 typedef struct { HANDLE h; HANDLE ev; } PipeFlush;
 static DWORD WINAPI pipe_flush_thr(void *arg) {
     PipeFlush *pf = (PipeFlush *)arg;
     FlushFileBuffers(pf->h);
+    CloseHandle(pf->h);
     SetEvent(pf->ev);
     free(pf);
     return 0;
@@ -450,9 +459,23 @@ static void *srv_thread(void *arg) {
                         fev = pf ? CreateEventA(NULL, TRUE, FALSE, NULL) : NULL;
                         if (!fev) free(pf);
                         else {
-                            pf->h = h; pf->ev = fev;
-                            fth = CreateThread(NULL, 0, pipe_flush_thr, pf, 0, NULL);
-                            if (!fth) { CloseHandle(fev); free(pf); }
+                            /* the thread gets its own reference (see
+                               pipe_flush_thr): CloseHandle(h) below can
+                               then never race the flush over a recycled
+                               handle value, at any budget size */
+                            pf->ev = fev;
+                            if (!DuplicateHandle(GetCurrentProcess(), h,
+                                                 GetCurrentProcess(), &pf->h,
+                                                 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                                pf->h = NULL;
+                            }
+                            fth = pf->h ? CreateThread(NULL, 0, pipe_flush_thr,
+                                                       pf, 0, NULL) : NULL;
+                            if (!fth) {
+                                if (pf->h) CloseHandle(pf->h);
+                                CloseHandle(fev);
+                                free(pf);
+                            }
                         }
                         if (fth) {
                             if (WaitForSingleObject(fev, left) == WAIT_OBJECT_0) {

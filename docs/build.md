@@ -103,8 +103,15 @@ Cross-building the pi0 target (release.sh's pi block, via
 skips the target with a notice. CAUTION: the distro cross userland is
 compiled for ARMv7 — its crt/libc/SDL2 contain NEON/VFPv3 and the
 result may SIGILL on a real Pi Zero. release.sh therefore runs an ISA
-floor scan on the binary (q registers, vld1..4/vst1..4, vdiv/vsqrt);
-when it fires the pi0 zip is NOT packaged. A shippable pi0 needs
+floor scan on the binary with the CROSS objdump
+(`arm-linux-gnueabihf-objdump`, or `<sysroot>/bin/` first when
+`LV_PI0_SYSROOT` is set — the host objdump cannot disassemble ARM code
+at all): the gate flags NEON (q registers, vld1..4/vst1..4, vdup, vshl,
+vmov.<type>, vtbl), the full-VFPv3 register bank d16-d31, and Thumb-2
+(movw/movt, .w/.n encoding suffixes — the ARM1176JZF-S is ARMv6Z +
+VFPv3-D16 without Thumb-2; vdiv/vsqrt are hardware on this board and
+are NOT flagged). When it fires the pi0 zip is NOT packaged. A shippable
+pi0 needs
 `LV_PI0_SYSROOT=<path>` with a raspbian-style ARMv6 hardfp sysroot
 (headers/libs/crt — and compilers if the tree ships them under
 `bin/`). The pi0 zip has never been run on real Pi Zero hardware here.

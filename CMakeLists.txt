@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.2 LANGUAGES C)
+project(levari VERSION 0.3.3 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -220,7 +220,7 @@ endif()
 # CPU tuning for ARM boards: -DLV_TUNE=arm1176jzf-s (Pi Zero 1 / Pi 1),
 # cortex-a7 (Pi 2) or cortex-a72 (Pi 4). On 32-bit armv7 the NEON flags
 # also switch minimp3 to its SIMD mp3 decoder; the armv6 boards (Pi Zero 1,
-# Pi 1: ARM1176, VFPv2, no NEON) get plain VFP instead, so minimp3 keeps
+# Pi 1: ARM1176, VFPv3-D16, no NEON) get plain VFP instead, so minimp3 keeps
 # its scalar path and the binary runs on them (NEON flags would SIGILL).
 set(LV_TUNE "" CACHE STRING "-mcpu target, e.g. arm1176jzf-s (Pi Zero) / cortex-a7 (Pi 2) / cortex-a72 (Pi 4)")
 if(LV_TUNE AND NOT WIN32)

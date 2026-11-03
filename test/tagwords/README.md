@@ -33,7 +33,7 @@ TAL and the COM comment frame), bulk (same as mf with 'ID*N' repetition
 suffixes for the evidence-cap stress pins),
 obs (ambiguous byte strings: reported, never asserted).
 
-Current baselines (1187 pinned entries + 32 observe, 2026-11-03):
+Current baselines (1191 pinned entries + 32 observe, 2026-11-03):
   v0.3.2 (tagged, pre-fix): 270 pinned failures
       l1m 144   every lead-class byte 0xC0-0xF7 at its trap distance
       l1  107   real words: café-type tails, pão/você/caffè/città/blå/kök...

@@ -1312,27 +1312,28 @@ vmf	TIT2:Caf\xe9=>TIT2=Café
 # Title/artist/album own dedicated storage slots — frames can no longer be
 # dropped. Evidence ids (TPE2/TCON/TYER/TDRC/TCOM/TIT1/COMM, v2.2 aliases
 # share the bucket, v2.2 COM joins via its own walk gate) are COUNTED only,
-# never stored: 4 per id, 16 total, half weight vs stored fields (stored x2,
-# evidence x1; the high-byte gate needs 4 scaled units, so a block claim
-# requires two full-weight high-byte fields and evidence alone can never
-# claim). 'ID*N' repeats a frame — the caps are proven against the real
-# walk. Line 1: 30 non-ASCII TCON ahead of TIT2/TPE1 (the old f[24] pool
-# dropped both). Line 2: the same shape at 1000 frames — bounded work and
-# memory (bulk). Line 3: duplicate TIT2, last one wins (a525af3 contract).
-# Line 4: a later EMPTY TIT2 wipes the earlier value — the old stash-then-
-# decode-every-field behavior, locked in; do not silently "improve" it.
-# Line 5: 25 Cyrillic COMMs next to a Latin-1 title — cap (4) x half weight
-# keeps cyr_letters == lat_letters (8:8) -> tie -> per-field -> Latin-1. A
-# scratch build with the cap at 8 flips exactly this line red (cyr 16 > 8),
-# a scratch build with full-weight evidence flips exactly this line red too
-# (16 > 8): both numbers are load-bearing, verified 2026-11-03. Line 6: the
-# same block tipped the other way by the cap-allowed COMMs (Cyrillic artist
-# adds cyr) -> CP1251 claim -> the title takes the Cyrillic reading (GrьЯe)
-# — block claims cut both ways, pinned on purpose. Line 7: the same tip
-# through the id3v2.2 gate: a 4-char frame-id compare can never match the
-# 3-char COM, so without the explicit gate name this fixture decodes
-# per-field. Line 8: single stored field + COM = 3 scaled high-byte units <
-# 4 -> no block claim -> per-field: evidence alone can never claim. ==
+# never stored: 4 per id, 16 total — past the caps the walk skips frames,
+# so a thousand-frame tag is bounded work. Their counters feed the block
+# rule ONLY when the stored fields are not unanimous per-field (tier 2,
+# see SECTION 14); a tier-2 claim still needs >= 2 high-byte fields, so
+# evidence alone can never claim. 'ID*N' repeats a frame — the caps are
+# proven against the real walk. Line 1: 30 non-ASCII TCON ahead of
+# TIT2/TPE1 (the old f[24] pool dropped both). Line 2: the same shape at
+# 1000 frames — bounded work and memory (bulk). Line 3: duplicate TIT2,
+# last one wins (a525af3 contract). Line 4: a later EMPTY TIT2 wipes the
+# earlier value — the old stash-then-decode-every-field behavior, locked
+# in; do not silently "improve" it. Line 5: 25 Cyrillic COMMs next to
+# Latin-1 title+artist — the stored fields agree on latin-1 per-field, so
+# tier 1 pins the block and the COMM pile never gets a vote (the caps
+# still bound the scan cost). Line 6: stored fields DISAGREE (Latin-1
+# title vs Cyrillic artist) -> tier 2: the cap-allowed COMMs add cyr ->
+# CP1251 claim -> the title takes the Cyrillic reading (GrьЯe) — block
+# claims cut both ways, pinned on purpose. Line 7: the same tip through
+# the id3v2.2 gate: a 4-char frame-id compare can never match the 3-char
+# COM, so without the explicit gate name this fixture decodes per-field.
+# Line 8: single stored field + COM: the field is trivially unanimous and
+# carries its own evidence -> tier 1 pins latin-1; the lone COM could not
+# claim in tier 2 either (1 high-byte field < 2). ==
 mf	TCON*30:0:\xE4\xEE\xEC|TIT2:0:\xCF\xF0\xE8\xE2\xE5\xF2|TPE1:0:\xCC\xE8\xF0=>TIT2=Привет|TPE1=Мир
 bulk	TCON*1000:0:\xE4\xEE\xEC|TIT2:0:\xCF\xF0\xE8\xE2\xE5\xF2|TPE1:0:\xCC\xE8\xF0=>TIT2=Привет|TPE1=Мир
 mf	TIT2:0:First|TIT2:0:Second=>TIT2=Second
@@ -1341,3 +1342,22 @@ mf	COMM*25:0:\xE4\xE0 -|TIT2:0:Gr\xFC\xDFe|TPE1:0:caf\xe9 na\xEFve=>TIT2=Grüße
 mf	COMM*4:0:\xE4\xE0 -|TIT2:0:Gr\xFC\xDFe|TPE1:0:\xE4\xE0 -=>TIT2=GrьЯe|TPE1=да -
 mf22	COM:0:rus\x00\xE4\xE0 -|TT2:0:Gr\xFC\xDFe|TP1:0:\xE4\xE0 -=>TT2=GrьЯe|TP1=да -
 mf22	COM:0:rus\x00\xE4\xE0 -|TT2:0:Gr\xFC\xDFe=>TT2=Grüße
+
+# == SECTION 14: 2026-11-03 review follow-up — stored fields decide first
+# (tier 1, stored unanimity), evidence frames only tip ambiguous blocks.
+# Redesign b2b2653's half-weight + 4-unit gate failed both directions, and
+# the three flipping lines below are RED on that build, green on the new
+# one. Line 1: Beyoncé + two Cyrillic COMMs — outvote (Beyoncй) must die:
+# Beyoncé alone is per-field latin-1 with evidence, so tier 1 pins it.
+# Line 2: the push-5 contract regressed under the 4-unit gate (one 0xDF
+# title + one 0.5-weight COMM = 3 units < 4 -> per-field -> 'ß'): tier 1
+# finds the title carries NO evidence (ambiguous), tier 2 merges it with
+# the single comment (2 high-byte fields) -> cp1251 -> 'Я'. Line 3:
+# duplicate stored frames vote only at their FINAL value: five Cyrillic
+# TIT2s overwritten by Latin-1 'Café' decide on 'Café' (was 'Cafй').
+# Line 4 is the master report example (Größe + two COMMs) — green on
+# both builds, kept as the guard for the fixed class. ==
+mf	COMM*2:0:\xE4\xE0 -|TPE1:0:Beyonc\xE9=>TPE1=Beyoncé
+mf	COMM:0:\xE4\xE0 -|TIT2:0:\xDF=>TIT2=Я
+mf	TIT2*5:0:\xCF\xF0\xE8\xE2\xE5\xF2|TIT2:0:Caf\xE9=>TIT2=Café
+mf	COMM*2:0:\xE4\xE0 -|TIT2:0:Gr\xFC\xDFe=>TIT2=Grüße
