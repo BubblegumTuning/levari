@@ -20,7 +20,10 @@ void dsp_flush_denormals(void) {
        on anything older. Unlike x86, ARM's single FZ bit flushes both the
        denormal operands (their read-back is zero, so no DAZ counterpart is
        needed) and the denormal result, collapsing the decay tail to 0.
-       VFPv2 evaluates doubles in software so ws's double blend is untouched. */
+       (Corrected: the old "VFPv2 evaluates doubles in software" claim was
+       wrong — ARM1176JZF-S' VFPv2 does doubles in hardware; only vdiv/
+       vsqrt are VFPv3+. ws's double blend therefore runs on the VFP and
+       gets flushed like everything else, which is the intent.) */
     unsigned int f;
     __asm__ __volatile__("vmrs %0, fpscr" : "=r"(f));
     __asm__ __volatile__("vmsr fpscr, %0" : : "r"(f | (1u << 24)));

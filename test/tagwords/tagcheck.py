@@ -51,7 +51,13 @@ Modes:
         literal chars as latin-1 and \\xNN as raw bytes; ENC 1/2/3 encode the
         literal text as utf-16le/utf-16be/utf-8 (no escapes). Expectation
         TEXT is utf-8 of literal chars plus \\xNN raw bytes. Unlisted fields
-        are not asserted. '|' cannot appear inside a value.
+        are not asserted. '|' cannot appear inside a value. A segment id may
+        carry a '*N' suffix ('TCON*30') to repeat that frame N times.
+  mf22  same spec as mf, emitted as ID3v2.2 (3-char ids 'TT2'/'TP1'/'TAL',
+        3-byte frame sizes): exercises the v2.2 walk gate and the 'COM'
+        comment frame, which 4-char id comparisons can never match.
+  bulk  same spec and expectations as mf (repetition suffix expected):
+        the per-mode line distinguishes the block-overflow stress pins
   vmf   id3v1 multi-field block: spec 'ID:VAL|...' (enc 0, each field
         NUL-padded to 30), same '=>' expectation form as mf
   obsmf same spec as mf; all three decoded fields shown, never asserted
@@ -127,6 +133,9 @@ def enc_w1252(s):
 def ss(n): return bytes([(n >> 21) & 0x7f, (n >> 14) & 0x7f, (n >> 7) & 0x7f, n & 0x7f])
 def frame(fid, payload): return fid + struct.pack('>I', len(payload)) + b'\x00\x00' + payload
 def tag23(payload): return b'ID3\x03\x00\x00' + ss(len(payload)) + payload
+def frame22(fid, payload):  # id3v2.2: 3-char id + 3-byte plain-BE size, no flags
+    return fid + bytes([(len(payload) >> 16) & 0xff, (len(payload) >> 8) & 0xff, len(payload) & 0xff]) + payload
+def tag22(payload): return b'ID3\x02\x00\x00' + ss(len(payload)) + payload
 
 def ext_hdr_v23():  # size 6 EXCLUDES its own 4 bytes (spec): skip = 4+6 = 10
     return b'\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00'
@@ -134,6 +143,7 @@ def ext_hdr_v24():  # syncsafe size 10 INCLUDES itself (spec): skip = 10
     return ss(10) + b'\x00\x01\x00\x00\x00\x00'
 
 SLOT = {'TIT2': 0, 'TPE1': 1, 'TALB': 2}
+SLOT22 = {'TT2': 0, 'TP1': 1, 'TAL': 2}
 
 def parse_rawval(v, latin1):
     """value with \\xNN raw-byte escapes; literal chars -> latin-1 (enc 0)"""
@@ -151,7 +161,9 @@ def parse_rawval(v, latin1):
     return bytes(out)
 
 def parse_frames(spec, vmf=False):
-    """'ID:ENC:VAL|...' (mf) / 'ID:VAL|...' (vmf) -> [(id, enc, bytes)]"""
+    """'ID:ENC:VAL|...' (mf) / 'ID:VAL|...' (vmf) -> [(id, enc, bytes)].
+    An 'ID*N' suffix repeats the frame N times (block-overflow caps are
+    proven against the real walk, not against hand-typed frame lists)."""
     out = []
     for part in spec.split('|'):
         if not part: continue
@@ -159,20 +171,23 @@ def parse_frames(spec, vmf=False):
             fid, _, val = part.partition(':'); enc = 0
         else:
             fid, es, val = part.split(':', 2); enc = int(es)
+        fid, _, rep = fid.partition('*')
         if enc == 1:   payload = val.encode('utf-16-le')
         elif enc == 2: payload = val.encode('utf-16-be')
         elif enc == 3: payload = val.encode('utf-8')
         else:          payload = parse_rawval(val, latin1=True)
-        out.append((fid, enc, payload))
+        for _ in range(int(rep) if rep else 1):
+            out.append((fid, enc, payload))
     return out
 
-def parse_expect(s):
+def parse_expect(s, id3v2=True):
     """'ID=TEXT|...' -> {slot: expected bytes}"""
+    slots = SLOT if id3v2 else SLOT22
     out = {}
     for part in s.split('|'):
         if not part: continue
         fid, _, val = part.partition('=')
-        out[SLOT[fid]] = parse_rawval(val, latin1=False)
+        out[slots[fid]] = parse_rawval(val, latin1=False)
     return out
 
 def fixture(mode, text):
@@ -244,11 +259,16 @@ def fixture(mode, text):
         title = b + b'\x00' * (30 - len(b))
         v1 = b'TAG' + title + b'\x00' * (30 + 30) + b'1999' + b'\x00' * 31
         return (b'\xff\xfb\x90\x64' * 64 + v1, text.rstrip(' ').encode('utf-8'))
-    if mode in ('mf', 'obsmf'):
+    if mode in ('mf', 'bulk', 'obsmf'):
         spec, _, exps = text.partition('=>')
         blob = tag23(b''.join(frame(fid.encode('ascii'), bytes([enc]) + val)
                               for fid, enc, val in parse_frames(spec)))
-        return (blob, parse_expect(exps) if mode == 'mf' else {})
+        return (blob, parse_expect(exps) if mode != 'obsmf' else {})
+    if mode == 'mf22':
+        spec, _, exps = text.partition('=>')
+        blob = tag22(b''.join(frame22(fid.encode('ascii'), bytes([enc]) + val)
+                              for fid, enc, val in parse_frames(spec)))
+        return (blob, parse_expect(exps, id3v2=False))
     if mode == 'vmf':
         spec, _, exps = text.partition('=>')
         vals = {fid: val for fid, enc, val in parse_frames(spec, vmf=True)}
@@ -285,7 +305,7 @@ def main():
         mode, _, text = line.partition('\t')
         if mode not in ('l1','l1m','l1w','cyr','u8','u8t','u8cut','u8cut2','u8nul','v1nul','enc2','enc3','v1cut','v1u8',
                         'bigc','bigl','v1l','v1c','v1w','ext23','ext24',
-                        'au8','au8t','au8cut','au8cut2','mf','vmf','obsmf','obs'):
+                        'au8','au8t','au8cut','au8cut2','mf','vmf','obsmf','mf22','bulk','obs'):
             sys.exit('line %d: unknown mode %r' % (lineno, mode))
         path = os.path.join(tmp, 'f%05d' % lineno)
         blob, exp = fixture(mode, text)
@@ -310,7 +330,7 @@ def main():
         if tri is None:
             fails.append((mode, text, b'<no result>', b'')); continue
         # uniform expectation: {slot: expected bytes}; empty dict = observe-only
-        if mode in ('mf', 'vmf', 'obsmf'): expd = exp
+        if mode in ('mf', 'vmf', 'obsmf', 'bulk', 'mf22'): expd = exp
         elif mode == 'obs':               expd = {}
         else:                             expd = {1 if mode.startswith('au') else 0: exp}
         bad = None
@@ -318,7 +338,7 @@ def main():
             if tri[slot] != expd[slot]:
                 bad = (tri[slot], expd[slot]); break
         shown = ' | '.join(tri[k].decode('utf-8', 'replace') for k in range(3)) \
-                if mode in ('mf', 'vmf', 'obsmf') else tri[1 if mode.startswith('au') else 0].decode('utf-8', 'replace')
+                if mode in ('mf', 'vmf', 'obsmf', 'bulk', 'mf22') else tri[1 if mode.startswith('au') else 0].decode('utf-8', 'replace')
         st = 'PASS' if bad is None else 'FAIL'
         bymode.setdefault(mode, [0, 0])
         bymode[mode][st == 'PASS'] += 1

@@ -3,8 +3,10 @@
    different x86 codegen levels; this shim owns the plain public API and
    picks the best tier the CPU supports, once, on first use. A plain
    (tier-less) build never links this file.
-    LEVAR_DECODE=sse2|avx|avx2 forces a tier — debug/verification hook; an
-    unknown value warns and falls back to what the CPU/build actually offer.
+    LEVAR_DECODE=sse2|avx|avx2 forces a tier — debug/verification hook: a
+    forced tier runs only when it is built AND the CPU supports it; any
+    other value (unknown or unavailable) matches no selector and lands on
+    the SSE2 floor, with the warning naming what is actually in use.
     Tier selection runs exactly once under pthread_once, which also publishes
     the table to all later callers. */
 #include "decode.h"

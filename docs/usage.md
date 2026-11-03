@@ -21,6 +21,8 @@ Flags:
                        player state (used for automated checks)
     --dump <prefix>    save window screenshots <prefix>-main.bmp etc. on exit
     -h, --help         short usage line
+    help               same as -h (bare word: without it "help" would be
+                       treated as a file to open and the GUI would start)
 
 ## Daemon + remote control
 

@@ -88,15 +88,57 @@ sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}
 build build-rel-win -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-toolchain.cmake" -DSDL2_DIR="$sdl2"
 package win x86-64 build-rel-win levari.exe README.md
 
-# Pi Zero 1 / Pi 1 (ARMv6 hard-float). Wired up via tools/armv6-toolchain.cmake;
-# runs when a matching cross compiler is installed, otherwise skipped with a
-# notice (a hard failure here would abort the whole release under set -e).
+# Pi Zero 1 / Pi 1 (ARMv6 hard-float). Wired up via tools/armv6-toolchain.cmake.
+# Needs the whole cross stack — gcc AND g++ AND ARM-built SDL2 (distro tree
+# under /usr/arm-linux-gnueabihf/lib, or SDL2_PI0_DIR pointing at an SDL2
+# cmake package dir). A missing piece SKIPS the target with a notice —
+# discovering it mid-cmake would abort the whole release under set -e.
 # Cortex-a7/a15 Pi 2-4 still need their own toolchain files to join.
-if command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
-    build build-rel-pi0 -DCMAKE_TOOLCHAIN_FILE="$root/tools/armv6-toolchain.cmake" -DLV_TUNE=arm1176jzf-s
-    package pi0 arm32 build-rel-pi0 levari README.md
+pi0skip=""
+command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1 || \
+    pi0skip="arm-linux-gnueabihf-gcc not installed"
+command -v arm-linux-gnueabihf-g++ >/dev/null 2>&1 || \
+    pi0skip="$pi0skip${pi0skip:+; }arm-linux-gnueabihf-g++ not installed"
+if [ -z "$pi0skip" ]; then
+    if [ -n "${SDL2_PI0_DIR:-}" ]; then
+        [ -f "$SDL2_PI0_DIR/sdl2-config.cmake" ] || \
+            pi0skip="SDL2_PI0_DIR cmake dir not found: $SDL2_PI0_DIR"
+    else
+        ls /usr/arm-linux-gnueabihf/lib/libSDL2* >/dev/null 2>&1 || \
+            pi0skip="$pi0skip${pi0skip:+; }ARM SDL2 (no /usr/arm-linux-gnueabihf/lib/libSDL2*, set SDL2_PI0_DIR)"
+    fi
+fi
+if [ -z "$pi0skip" ]; then
+    pi0cmake=(-DCMAKE_TOOLCHAIN_FILE="$root/tools/armv6-toolchain.cmake" -DLV_TUNE=arm1176jzf-s)
+    if [ -n "${LV_PI0_SYSROOT:-}" ]; then pi0cmake+=(-DLV_PI0_SYSROOT="$LV_PI0_SYSROOT"); fi
+    if [ -n "${SDL2_PI0_DIR:-}" ]; then pi0cmake+=(-DSDL2_DIR="$SDL2_PI0_DIR"); fi
+    build build-rel-pi0 "${pi0cmake[@]}"
+    # ISA floor gate for the ARM1176JZF-S: no NEON, no VFPv3 vdiv/vsqrt
+    # (VFPv2 does add/mul/fma in hardware — see the ARM note in src/dsp/
+    # dsp.c). objdump ARM syntax tells: q registers and vld1..4/vst1..4
+    # are NEON. EXPECT this scan to FIRE on distro arm-linux-gnueabihf
+    # userland — Debian/Ubuntu armhf is compiled for ARMv7 (NEON memcpy in
+    # libc etc.): that is the forcing function, the fix is LV_PI0_SYSROOT,
+    # never relaxing the gate. A firing gate — or an objdump that cannot
+    # disassemble the binary at all, ins=0 — SKIPS pi0 packaging; a hard
+    # fail here would abort the whole release under set -e. NOTE the
+    # '|| true': on a clean scan grep -c prints 0 AND exits 1.
+    dis=build-rel-pi0/pi0-isa-scan.txt
+    ins=0 n=0
+    if objdump -d build-rel-pi0/levari > "$dis" 2>/dev/null; then
+        ins=$(grep -cE '^[[:space:]]+[0-9a-f]+:' "$dis" || true)
+        n=$(grep -cE '\bq(1[0-5]|[0-9])\b|\bv(ld|st)[1-4]\b|\b(vdiv|vsqrt)\b' "$dis" || true)
+    fi
+    rm -f "$dis"
+    if [ "$ins" = 0 ]; then
+        echo "== pi0 ISA scan: objdump found no code in build-rel-pi0/levari; pi0 packaging skipped"
+    elif [ "$n" != 0 ]; then
+        echo "== pi0 ISA scan: $n NEON/VFPv3 refs (distro armhf userland is ARMv7; pass LV_PI0_SYSROOT for a shippable pi0); pi0 packaging skipped"
+    else
+        package pi0 arm32 build-rel-pi0 levari README.md
+    fi
 else
-    echo "== pi0 skipped: arm-linux-gnueabihf-gcc not installed"
+    echo "== pi0 skipped: $pi0skip"
 fi
 
 echo

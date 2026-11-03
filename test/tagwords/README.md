@@ -27,9 +27,13 @@ documented 0x88→euro exception; the latin-1 fallback must read them as
 punctuation, never as C1 controls),
 au8/au8t/au8cut/au8cut2 (the u8 shapes in a TPE1 frame instead of TIT2:
 the ARTIST field is pinned; probe.c prints title and artist),
+mf/vmf/obsmf (multi-frame block specs, SECTION 12: one encoding verdict
+per tag block), mf22 (same spec emitted as ID3v2.2: 3-char ids TT2/TP1/
+TAL and the COM comment frame), bulk (same as mf with 'ID*N' repetition
+suffixes for the evidence-cap stress pins),
 obs (ambiguous byte strings: reported, never asserted).
 
-Current baselines (1150 pinned entries + 29 observe):
+Current baselines (1187 pinned entries + 32 observe, 2026-11-03):
   v0.3.2 (tagged, pre-fix): 270 pinned failures
       l1m 144   every lead-class byte 0xC0-0xF7 at its trap distance
       l1  107   real words: café-type tails, pão/você/caffè/città/blå/kök...

@@ -96,6 +96,19 @@ decoder stays on its scalar path, which still decodes in real time at
 1 GHz; NEON flags on those boards would SIGILL. On aarch64 NEON is
 used automatically with or without `LV_TUNE`.
 
+Cross-building the pi0 target (release.sh's pi block, via
+`tools/armv6-toolchain.cmake`) needs `arm-linux-gnueabihf-gcc` AND
+`-g++` AND ARM-built SDL2 (distro `/usr/arm-linux-gnueabihf/lib`, or
+`SDL2_PI0_DIR` pointing at an SDL2 cmake package dir); a missing piece
+skips the target with a notice. CAUTION: the distro cross userland is
+compiled for ARMv7 — its crt/libc/SDL2 contain NEON/VFPv3 and the
+result may SIGILL on a real Pi Zero. release.sh therefore runs an ISA
+floor scan on the binary (q registers, vld1..4/vst1..4, vdiv/vsqrt);
+when it fires the pi0 zip is NOT packaged. A shippable pi0 needs
+`LV_PI0_SYSROOT=<path>` with a raspbian-style ARMv6 hardfp sysroot
+(headers/libs/crt — and compilers if the tree ships them under
+`bin/`). The pi0 zip has never been run on real Pi Zero hardware here.
+
 ## Release packaging
 
     tools/release.sh
@@ -108,8 +121,9 @@ section above, default prefix `~/sdl2-legacy-x86_64`; MinGW win;
 (arch tokens match the in-app `LV_ARCH` display: `x86-64`, `arm32`,
 `arm64`, `x86`)
 (version read from CMakeLists.txt) — one folder with every artifact,
-ready to drag into a GitHub release upload. Pi zips join the set once
-their cross toolchains are set up (see the pi block in the script).
+ready to drag into a GitHub release upload. The pi0 target joins when
+its cross prerequisites are installed and only packages if its ISA floor
+scan passes (see the ARM section and the pi block in the script).
 
 ## Windows build
 

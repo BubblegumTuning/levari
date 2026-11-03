@@ -291,6 +291,21 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
 
 #ifdef _WIN32
 
+/* FlushFileBuffers on a pipe blocks until the client drains the out
+   buffer — forever if the client never reads. run it on a helper thread
+   so the caller can bound the wait; destroying the pipe unblocks a
+   stuck flush (it completes with an error). the arg block is heap-owned
+   because the thread can still be running after the caller's scope
+   ends; the caller always reaps it after closing the pipe handle. */
+typedef struct { HANDLE h; HANDLE ev; } PipeFlush;
+static DWORD WINAPI pipe_flush_thr(void *arg) {
+    PipeFlush *pf = (PipeFlush *)arg;
+    FlushFileBuffers(pf->h);
+    SetEvent(pf->ev);
+    free(pf);
+    return 0;
+}
+
 static void *srv_thread(void *arg) {
     (void)arg;
     char path[512];
@@ -348,6 +363,9 @@ static void *srv_thread(void *arg) {
            dribbling bytes just under 1 s apart kept this serial loop
            busy byte-by-byte. 5 s total: an idle, dribbling or stalled
            client is dropped and the loop re-accepts. */
+        /* pending bounded-flush thread/event, or NULL: declared out here so
+           the reap after CloseHandle(h) can see it (see write path below) */
+        HANDLE fth = NULL, fev = NULL;
         if (!srv_quit) {
             OVERLAPPED rd = {0};
             rd.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -388,15 +406,67 @@ static void *srv_thread(void *arg) {
                 OVERLAPPED wr = {0};
                 wr.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
                 DWORD w = 0;
+                int wdone = 1;
+                ULONGLONG wt0 = GetTickCount64();
                 if (!WriteFile(h, resp, (DWORD)rl, &w, &wr) &&
                     GetLastError() == ERROR_IO_PENDING) {
                     if (WaitForSingleObject(wr.hEvent, 5000) == WAIT_OBJECT_0)
                         GetOverlappedResult(h, &wr, &w, FALSE);
-                    else
+                    else {
+                        /* cancel AND wait for the cancellation to complete, the
+                           read path's shape above: a cancelled-but-unreaped IRP
+                           still references wr (this frame) and its event, so
+                           CloseHandle-ing the event here races it. */
                         CancelIoEx(h, &wr);
+                        WaitForSingleObject(wr.hEvent, INFINITE);
+                        wdone = 0;
+                    }
                 }
                 if (wr.hEvent) CloseHandle(wr.hEvent);
-                FlushFileBuffers(h);
+                /* why any flush at all: a COMPLETED WriteFile only lands the
+                   bytes in the pipe's out buffer — a client that closes
+                   without reading still loses them. but FlushFileBuffers is
+                   synchronous, and on a pipe the client is not reading it can
+                   block forever, defeating the 5 s deadline this whole loop
+                   enforces. so: skip it when the write was cancelled (the
+                   client is not reading anyway; the bytes are undeliverable
+                   and a flush would only block), and on the completed path
+                   run it on the helper thread bounded by the same 5 s budget.
+                   on timeout: CancelSynchronousIo is best-effort (a pipe
+                   flush may ignore it); the DisconnectNamedPipe + CloseHandle
+                   below are the sure unblock. honest residual caveat: a
+                   client that stalls past the budget can still lose already
+                   written bytes. */
+                if (wdone) {
+                    ULONGLONG spent = GetTickCount64() - wt0;
+                    DWORD left = spent >= 5000 ? 0 : (DWORD)(5000 - spent);
+                    /* no budget left (the write ate the whole 5 s): skip the
+                       flush too — a helper thread spawned only to time out
+                       instantly could reach FlushFileBuffers AFTER the
+                       CloseHandle(h) below, flushing a recycled handle
+                       value. the client is not draining either way. */
+                    if (left > 0) {
+                        PipeFlush *pf = malloc(sizeof *pf);
+                        fev = pf ? CreateEventA(NULL, TRUE, FALSE, NULL) : NULL;
+                        if (!fev) free(pf);
+                        else {
+                            pf->h = h; pf->ev = fev;
+                            fth = CreateThread(NULL, 0, pipe_flush_thr, pf, 0, NULL);
+                            if (!fth) { CloseHandle(fev); free(pf); }
+                        }
+                        if (fth) {
+                            if (WaitForSingleObject(fev, left) == WAIT_OBJECT_0) {
+                                CloseHandle(fth); CloseHandle(fev);
+                                fth = fev = NULL;
+                            } else {
+                                CancelSynchronousIo(fth);
+                                /* fth/fev stay live: reaped right after
+                                   CloseHandle(h) below, which unblocks the
+                                   stuck flush. */
+                            }
+                        }
+                    }
+                }
             }
         }
         if (conn.hEvent) CloseHandle(conn.hEvent);
@@ -405,6 +475,12 @@ static void *srv_thread(void *arg) {
         cur_pipe = INVALID_HANDLE_VALUE;
         pthread_mutex_unlock(&pipe_mtx);
         CloseHandle(h);
+        if (fth) {
+            /* the pipe destruction above completed the stuck flush with an
+               error: the thread now signals and frees its arg block. */
+            WaitForSingleObject(fev, INFINITE);
+            CloseHandle(fth); CloseHandle(fev);
+        }
     }
     if (psd) LocalFree(psd);
     return NULL;
