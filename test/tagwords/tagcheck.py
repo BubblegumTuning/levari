@@ -62,6 +62,15 @@ Modes:
         NUL-padded to 30), same '=>' expectation form as mf
   obsmf same spec as mf; all three decoded fields shown, never asserted
   v1l / v1c  ID3v1 tail (30-byte title, NUL-padded), latin-1 / cp1251
+  sjis  ID3v2.3 TIT2, enc=0, CP932/shift_jis bytes of TEXT (expected:
+        TEXT). AUTO may only claim SJIS with full-field pair validity
+        plus >=1 kana pair (decision D1, internal SJIS plan)
+  v1sjis ID3v1 30-byte title: cp932 of TEXT, NUL-padded (expected: TEXT)
+  obsj  same fixture as sjis; decoded value reported, never asserted
+        (the never-AUTO classes: kanji/symbol-only titles, half-width kana)
+  fs    same fixture as sjis, but the probe re-runs over these fixtures
+        with LEVARI_FORCE_LEGACY=shiftjis (forced-mode pins: half-width
+        kana, kanji/symbol-only — shapes the AUTO gate must not claim)
   obs   decode printed, never asserted
 id3v1-mode expectations are rstripped: copy_fixed trims the trailing space
 run by design (ID3v1 fields pad with spaces; see SECTION 7).
@@ -120,6 +129,18 @@ W1252 = {0x82:0x201A, 0x84:0x201E, 0x85:0x2026, 0x86:0x2020, 0x87:0x2021,
          0x91:0x2018, 0x92:0x2019, 0x93:0x201C, 0x94:0x201D, 0x95:0x2022,
          0x96:0x2013, 0x97:0x2014, 0x99:0x2122, 0x9B:0x203A}
 W1252_REV = {cp: b for b, cp in W1252.items()}
+
+def enc_sjis(s):
+    # Source of truth: the python cp932 codec = the WHATWG shift_jis
+    # mapping (decision D4). CP932/Windows-31J, deliberately NOT strict
+    # JIS X 0208: NEC specials, NEC-selected IBM extensions and vendor
+    # kanji (髙 﨑) / symbols (① ㈱) are the point. NEVER "clean this
+    # up" to a strict-JIS or shift_jis-fallback codec — that is the
+    # regression this corpus exists to catch.
+    try:
+        return s.encode('cp932')
+    except UnicodeEncodeError as e:
+        raise SystemExit('char not encodable via cp932: %s' % e)
 
 def enc_w1252(s):
     out = bytearray()
@@ -275,6 +296,16 @@ def fixture(mode, text):
         pad = lambda fid: (vals.get(fid, b'') + b'\x00' * 30)[:30]
         v1 = b'TAG' + pad('TIT2') + pad('TPE1') + pad('TALB') + b'1999' + b'\x00' * 31
         return (b'\xff\xfb\x90\x64' * 64 + v1, parse_expect(exps))
+    if mode in ('sjis', 'fs'):
+        return (tag23(frame(b'TIT2', b'\x00' + enc_sjis(text))), exp)
+    if mode == 'obsj':
+        return (tag23(frame(b'TIT2', b'\x00' + enc_sjis(text))), exp)
+    if mode == 'v1sjis':
+        b = enc_sjis(text)
+        if len(b) > 30: raise SystemExit('v1sjis title exceeds 30 bytes: %r' % text)
+        title = b + b'\x00' * (30 - len(b))
+        v1 = b'TAG' + title + b'\x00' * (30 + 30) + b'1999' + b'\x00' * 31
+        return (b'\xff\xfb\x90\x64' * 64 + v1, text.rstrip(' ').encode('utf-8'))
     if mode == 'obs':
         try:
             blob = tag23(frame(b'TIT2', b'\x00' + enc_cyr(text)))
@@ -305,7 +336,8 @@ def main():
         mode, _, text = line.partition('\t')
         if mode not in ('l1','l1m','l1w','cyr','u8','u8t','u8cut','u8cut2','u8nul','v1nul','enc2','enc3','v1cut','v1u8',
                         'bigc','bigl','v1l','v1c','v1w','ext23','ext24',
-                        'au8','au8t','au8cut','au8cut2','mf','vmf','obsmf','mf22','bulk','obs'):
+                        'au8','au8t','au8cut','au8cut2','mf','vmf','obsmf','mf22','bulk','obs',
+                        'sjis','v1sjis','obsj','fs'):
             sys.exit('line %d: unknown mode %r' % (lineno, mode))
         path = os.path.join(tmp, 'f%05d' % lineno)
         blob, exp = fixture(mode, text)
@@ -324,6 +356,19 @@ def main():
             p, th, ah, lh = line.split('\t')
             got[p] = (bytes.fromhex(th), bytes.fromhex(ah), bytes.fromhex(lh))
 
+    # forced-mode pass: fs fixtures re-run under LEVARI_FORCE_LEGACY
+    # (probe.c applies it via tag_set_legacy_default before decoding)
+    fs_paths = [path for mode, _, path, _ in entries if mode == 'fs']
+    if fs_paths:
+        env = dict(os.environ, LEVARI_FORCE_LEGACY='shiftjis')
+        for i in range(0, len(fs_paths), 512):
+            r = subprocess.run([obj] + fs_paths[i:i+512], capture_output=True,
+                               text=True, env=env)
+            if r.returncode: sys.exit('probe fs pass chunk %d failed' % i)
+            for line in r.stdout.splitlines():
+                p, th, ah, lh = line.split('\t')
+                got[p] = (bytes.fromhex(th), bytes.fromhex(ah), bytes.fromhex(lh))
+
     fails, observes, bymode = [], [], {}
     for mode, text, path, exp in entries:
         tri = got.get(path)
@@ -331,7 +376,7 @@ def main():
             fails.append((mode, text, b'<no result>', b'')); continue
         # uniform expectation: {slot: expected bytes}; empty dict = observe-only
         if mode in ('mf', 'vmf', 'obsmf', 'bulk', 'mf22'): expd = exp
-        elif mode == 'obs':               expd = {}
+        elif mode in ('obs', 'obsj'):    expd = {}
         else:                             expd = {1 if mode.startswith('au') else 0: exp}
         bad = None
         for slot in sorted(expd):

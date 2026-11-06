@@ -25,9 +25,10 @@ l1w	a‚bc
 l1w	a‚bcd
 l1m	
 l1m	a
-l1m	ab
-l1m	abc
-l1m	abcd
+# NB: the three 0x83 rows with trailing text moved to SECTION 8 OBSERVE --
+# the SJIS kana gate (decision D1) fires on bytes 83 62-64 (valid
+# katakana pairs); those shapes are byte-isomorphic with real SJIS
+# titles and cannot stay pinned l1m without reopening D1.
 l1w	„
 l1w	a„
 l1w	a„b
@@ -1170,6 +1171,15 @@ obs	є
 obs	ґ
 obs	вiн
 obs	ää
+# SJIS-plan D1 trade (2026-11-05): latin-1 words whose 0x83 byte forms a
+# katakana-range pair with the next byte -- AUTO claims SJIS for these,
+# byte-isomorphically indistinguishable from real ones; forced-mode
+# territory. The 0x83 rows WITHOUT trailing text stay pinned in the
+# SECTION 1 matrix (unpaired lead fail-closes, decision D6).
+obs	ab
+obs	abc
+obs	abcd
+
 # == SECTION 9: spec-conformant ID3v2 extended headers (item 4 gate): ==
 # the frame walk must land exactly on TIT2 in both versions.
 ext23	Hello
@@ -1355,9 +1365,89 @@ mf22	COM:0:rus\x00\xE4\xE0 -|TT2:0:Gr\xFC\xDFe=>TT2=Grüße
 # the single comment (2 high-byte fields) -> cp1251 -> 'Я'. Line 3:
 # duplicate stored frames vote only at their FINAL value: five Cyrillic
 # TIT2s overwritten by Latin-1 'Café' decide on 'Café' (was 'Cafй').
-# Line 4 is the master report example (Größe + two COMMs) — green on
+# Line 4 is the reported example (Größe + two COMMs) — green on
 # both builds, kept as the guard for the fixed class. ==
 mf	COMM*2:0:\xE4\xE0 -|TPE1:0:Beyonc\xE9=>TPE1=Beyoncé
 mf	COMM:0:\xE4\xE0 -|TIT2:0:\xDF=>TIT2=Я
 mf	TIT2*5:0:\xCF\xF0\xE8\xE2\xE5\xF2|TIT2:0:Caf\xE9=>TIT2=Café
 mf	COMM*2:0:\xE4\xE0 -|TIT2:0:Gr\xFC\xDFe=>TIT2=Grüße
+# == SECTION 15: 2026-11-05 Shift_JIS legacy tags (CP932/Windows-31J).
+# Fields that STORE Shift_JIS bytes under a latin-1 declaration (enc=0/
+# invalid, id3v1, RIFF INFO) — early-2000s Windows taggers. Table source
+# is the WHATWG shift_jis mapping (python cp932 codec): NEC specials,
+# NEC-selected IBM extensions and vendor kanji (髙 﨑) / symbols (① ㈱)
+# are the POINT — a strict-JIS X 0208 table is the regression this
+# section exists to catch. AUTO may claim SJIS only with full-field pair
+# validity PLUS >=1 kana pair (D1); kanji/symbol-only and half-width
+# kana never fire in AUTO (obsj lines), they decode under the forced
+# mode (fs = same fixture shape, probe re-run with
+# LEVARI_FORCE_LEGACY=shiftjis). Real UTF-8 evidence vetoes SJIS (D7).
+# D6 edge pins (bare 0x80/0xA0, 0xFD-0xFF, unpaired lead at field end)
+# ARE the SECTION 1 matrix rows for those bytes — they must NEVER flip. ==
+
+# the four real id3v2 evidence files + the id3v1-only one (test-assets/,
+# 2003-era RAITO/Touhou + Gundam Seed tags; all five carry kana evidence,
+# so AUTO must fire on every one — decision D3 decided empirically)
+sjis	ボーナストラック
+sjis	PE-RI-CA （地底の王国）
+sjis	Melty Blood （OPテーマ）
+sjis	for Crimson Air （シュライン屋上・紅）
+v1sjis	今 この瞬間がすべて
+# classes: katakana-only, hiragana-only, mixed ascii+kana+kanji
+sjis	カキツバタ
+sjis	さくらさくら
+sjis	100%の夏
+# CP932 vendor pins (D4 made honest): 髙 EEE0, 﨑 ED95, ㈱ 878A, ① 8740
+# must decode to the VENDOR codepoints — a strict-JIS table yields
+# U+FFFD (0x0000 entry) or the wrong glyph. Kana triggers the auto gate.
+sjis	髙﨑園㈱のテスト①
+# D7: these bytes are ALSO pair-valid SJIS (D0 B0 twice) but the field
+# is real UTF-8 — the classifier checks UTF-8 evidence first
+u8	аа
+# collision class: cp1251 words stay cp1251 — Cyrillic carries valid
+# 0xE0-0xEF pair leads but never a kana pair (gate D1 protects them)
+cyr	Привет
+cyr	Від
+# the ƒ trap: w1252 punctuation + ascii parses as a valid SJIS symbol-
+# row pair (82 43 / 85 43); no kana -> stays latin-1 punctuation
+l1w	A‚C
+l1w	A…C
+# D6 beats D1: kana pair + pair truncated at the field end — validity
+# fail-closes, the block never gets the SJIS verdict (latin-1 output)
+mf	TIT2:0:\x83\x4a\x83\x4c\x83=>TIT2=\xc2\x83J\xc2\x83L\xc2\x83
+# half-width kana (0xA1-0xDF) never vote SJIS in AUTO (D2): dense
+# cp1251 collision; here トステ + 0xB5 must fall to latin-1
+mf	TIT2:0:\x83\x65\x83\x58\x83\x67\xb5=>TIT2=\xc2\x83e\xc2\x83X\xc2\x83g\xc2\xb5
+# tier pins: kana title + pure-ASCII artist (ASCII has no vote) -> block
+# SJIS; the kana field's word shape alone must carry it
+mf	TIT2:0:\x83\x4a\x83\x4c\x83\x63\x83\x6f\x83\x5e|TPE1:0:Studio X=>TIT2=カキツバタ|TPE1=Studio X
+# OBSERVE tier interactions (deliberate shape decisions, review the
+# report): kana title + latin-1-accented artist (tier-1 disagreement;
+# tier-2 counter decides); kana title + REAL-UTF-8 artist (D7 vetoes
+# the SJIS claim — UTF-8 evidence wins the block)
+obsmf	TIT2:0:\x83\x4a\x83\x4c|TPE1:0:Caf\xe9
+obsmf	TIT2:0:\x83\x7b\x81\x5b\x83\x69\x83\x58\x83\x67\x83\x89\x83\x62\x83\x4e|TPE1:0:\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82
+# never AUTO (kanji/symbol-only D1, half-width D2) — reported for
+# review; the fs lines below pin the forced decode
+obsj	髙橋﨑園
+obsj	PROMISED　DAWN
+obsj	①②③
+obsj	ｱｲｳｴｵ
+# forced SHIFT-JIS: half-width kana (D2), kanji-only and symbol-only
+# (incl. the real PROMISED DAWN with 0x8140) all decode correctly
+fs	ｱｲｳｴｵ
+fs	PROMISED　DAWN
+fs	髙橋﨑園
+# 2026-11-05b: five MORE real test-assets files, same album — the
+# SJIS-WITHOUT-KANA class in the wild. Fields of ascii + kanji + full-width
+# symbols (parens 81 69/81 6a, ・ 81 45, ! 81 49 — JIS row-1 symbols, no
+# kana lead in ANY byte pair), so AUTO keeps them latin-1 BY DESIGN (D1/D3)
+# and only forced SHIFT-JIS renders them — real-binary --probe verified in
+# both modes 2026-11-05. Texts generated from the file payloads via python
+# cp932 with byte-identity round-trip asserts — not from memory. OBSERVE
+# rows report the auto shape; a future auto-detect loosening shows here.
+obsj	Noble Mind （遠野家・外観）
+obsj	The theme of Arcueid （路地裏）
+obsj	The end of 1000 years （千年城）
+obsj	Chinese Girl （都古）
+obsj	Remember！（勝利）

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deep dive corpus generator (one-shot; master 2026-11-02 directive:
+"""Deep dive corpus generator (one-shot:
 fi 5000, ja 5000, ru 1000, uk 1000 top frequency words; troublemakers get
 promoted to words.txt by hand afterwards, clean words discarded.)"""
 import importlib.util, os, sys

@@ -39,6 +39,9 @@ static int res_cap;
 static LibEnt *libs;
 static int lib_n, lib_cap, lib_loaded;
 static int dgx, dgy;
+/* WM-refusal bookkeeping for the search drag (mirrors drag_step in
+   ui.c; drag state is global so per-window persistence is unnecessary) */
+static int srx, sry, sxlo, sxhi, sylo, syhi;
 
 static int in_rect(const Rect *r, int x, int y) {
     return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
@@ -585,6 +588,15 @@ void search_mouse(SDL_Event *e) {
             SDL_StartTextInput();
             return;
         }
+        if (nres > lines && x >= list.x + list.w - 7 &&
+            y >= list.y && y < list.y + list.h) {
+            /* the thumb is painted INSIDE the list rect's right edge, so
+               this grab must precede the row hit-test or a bar click
+               played the row underneath it. drag == 2 = scrollbar,
+               mirroring drag == 5 in the playlist window */
+            drag = 2;
+            return;
+        }
         if (in_rect(&list, x, y)) {
             int idx = scroll + (y - list.y) / SRCH_LINEH;
             if (idx < nres) { sel = idx; do_jump(&res[idx]); }
@@ -593,6 +605,10 @@ void search_mouse(SDL_Event *e) {
         if (y < 22) {
             drag = 1;
             SDL_GetGlobalMouseState(&dgx, &dgy);
+            int wx, wy;
+            SDL_GetWindowPosition(w, &wx, &wy);
+            srx = wx; sry = wy;
+            sxlo = sxhi = sylo = syhi = 0;
         }
     } else if (e->type == SDL_MOUSEBUTTONUP) {
         Rect xc = srch_close_rect();
@@ -602,18 +618,53 @@ void search_mouse(SDL_Event *e) {
             run_search();
         }
         pressed = SB_NONE;
-        if (drag == 1) drag = 0;
+        if (drag == 1) {
+            ui_drag_bounce(w, sxlo, sxhi, sylo, syhi);
+            drag = 0;
+        }
+        if (drag == 2) drag = 0;
     } else if (e->type == SDL_MOUSEMOTION && drag == 1) {
         if (!(e->motion.state & SDL_BUTTON_LMASK)) { drag = 0; return; }
         int gx, gy, wx, wy;
         SDL_GetGlobalMouseState(&gx, &gy);
         /* incremental: delta since last step onto the CURRENT position, so a
-           WM clamp at a screen edge leaves no phantom overshoot (see ui.c) */
+           WM clamp at a screen edge leaves no phantom overshoot (see ui.c);
+           full refusal bookkeeping mirrors drag_step there */
         SDL_GetWindowPosition(w, &wx, &wy);
+        int ox = wx, oy = wy;
+        if (srx != wx) {
+            dgx = gx;
+            if (srx < wx) sxlo = wx; else sxhi = wx;
+        }
+        if (sry != wy) {
+            dgy = gy;
+            if (sry < wy) sylo = wy; else syhi = wy;
+        }
         wx += gx - dgx; wy += gy - dgy;
         ui_snap_next_to_main(w, &wx, &wy);
-        SDL_SetWindowPosition(w, wx, wy);
-        dgx = gx; dgy = gy;
+        int clx = 0, cly = 0;
+        if (sxlo && wx < sxlo) { wx = sxlo; clx = 1; }
+        if (sxhi && wx > sxhi) { wx = sxhi; clx = 1; }
+        if (sylo && wy < sylo) { wy = sylo; cly = 1; }
+        if (syhi && wy > syhi) { wy = syhi; cly = 1; }
+        if (clx) dgx = gx;
+        if (cly) dgy = gy;
+        if (wx != srx || wy != sry) SDL_SetWindowPosition(w, wx, wy);
+        srx = wx; sry = wy;
+        /* anchor advances by the APPLIED delta, not the raw mouse delta:
+           travel eaten by the snap accumulates and eventually breaks
+           free (see drag_move_snap in ui.c) */
+        dgx += wx - ox; dgy += wy - oy;
+    } else if (e->type == SDL_MOUSEMOTION && drag == 2) {
+        if (!(e->motion.state & SDL_BUTTON_LMASK)) { drag = 0; return; }
+        /* house mapping (playlist drag == 5): pointer y over the track
+           maps proportionally to the scroll range; search_draw re-clamps
+           scroll every frame, the local clamp keeps sel-keeping honest */
+        if (nres > lines) {
+            scroll = (y - list.y) * (nres - lines) / list.h;
+            if (scroll < 0) scroll = 0;
+            if (scroll > nres - lines) scroll = nres - lines;
+        }
     } else if (e->type == SDL_MOUSEWHEEL) {
         scroll -= e->wheel.y;
         if (scroll < 0) scroll = 0;
@@ -749,5 +800,7 @@ void search_focus_drag(void) {
     if (gx >= wx && gx < wx + ww && gy >= wy && gy - wy < 22) {
         drag = 1;
         dgx = gx; dgy = gy;
+        srx = wx; sry = wy;
+        sxlo = sxhi = sylo = syhi = 0;
     }
 }

@@ -9,6 +9,11 @@ int ui_run(Player *p, int show_pl);
    of the main window, snap it flush; while snapped, align tops when they are
    within DOCK_SNAP px of each other */
 void ui_snap_next_to_main(SDL_Window *w, int *x, int *y);
+/* wall release kick: at the end of a window drag that met WM walls
+   (xlo/xhi/ylo/yhi = last accepted positions per refused side, 0 = no
+   wall), move the window 1 px off any wall it sits on, away from the
+   push direction, so the next grab starts clear of the clamp */
+void ui_drag_bounce(SDL_Window *w, int xlo, int xhi, int ylo, int yhi);
 void ui_open_playlist(void);
 /* clipboard helpers shared by the search + options text fields */
 void ui_clip_copy(const char *text);

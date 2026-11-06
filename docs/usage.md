@@ -7,8 +7,11 @@
 Files may be audio (`.mp3 .ogg .oga .opus .flac .wav .mod .s3m .xm .it
 .spc`, plus `.aac .m4a .wma` when built with the optional libav*
 backend),
-`.m3u` playlists (loaded into the playlist), or `.cue` sheets (virtual
-tracks with INDEX offsets). The first file starts playing automatically.
+`.m3u`/`.m3u8`/`.pls` playlists (loaded into the playlist — relative
+entries resolve against the list's own folder; `.pls` is the Winamp INI
+format, `FileN`/`TitleN`/`LengthN` read case-insensitively), or `.cue`
+sheets (virtual tracks with INDEX offsets). The first file starts playing
+automatically.
 
 Flags:
 
@@ -99,7 +102,8 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
                                   so it scrolls while paused/stopped/unfocused
                                   (options window ADV page, `10FPS` toggle)
     tag.legacy_encoding = auto    codepage for tag fields with no declared
-                                  encoding: auto | latin1 | cp1251 | utf8.
+                                  encoding: auto | latin1 | cp1251 | utf8 |
+                                  shiftjis.
                                   auto decides per tag block from byte
                                   evidence; the forced values override that
                                   per field. Changing it re-decodes nothing
@@ -145,7 +149,11 @@ Untagged tracks render their filename with underscores as spaces
 (`artist_-_song_name.mp3` displays as `artist - song name.mp3`) in the
 playlist, title bar, and the daemon `pl`/`status` output. Real tags
 always win. `CLEAR` (or deleting the index) re-probes everything, so
-files tagged after a scan pick their tags up on the next scan.
+files tagged after a scan pick their tags up on the next scan; the
+playlist `SCAN` button refreshes the selected track(s) (multi-selection by
+ctrl/shift-click) the same way without clearing the index (updates or adds
+their rows, certifies or clears the untagged marker, and the fresh values
+show on the playlist rows at once).
 
 Multi-megabyte `.m3u` loads are cheap: entries are appended without a
 per-path stat (the desktop's "program is not responding" popup on slow

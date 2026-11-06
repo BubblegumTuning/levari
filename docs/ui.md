@@ -13,7 +13,13 @@ For a per-button reference of every control in each window, see
   dragging the bottom-right grip; width snaps to the main window's width
   within 12 px. Double-click a track to play it. `SHUF/RPT/ADD/REM/CLO`
   buttons, plus `LIB` which appends the whole media library index to the
-  playlist.
+  playlist. Right-click anywhere in the window opens the **edit menu**:
+  sort by title/artist/album/track/file, reverse, randomize, crop,
+  copy/cut/paste, move rows up/down, `SAVE AS...` (opens the browser in
+  SAVE mode) and `CLEAR` — keyboard: `Ctrl+C/X/V`, `Alt+Up/Down`,
+  `Ctrl+K`. CUE albums move as one unit through every edit, and the
+  playing track always follows its music. Details:
+  [buttons.md](buttons.md).
 - **Equalizer** (`EQ` button or `e`) — 10 bands + preamp, ON/OFF,
   FLAT/ROCK/POP/JAZZ presets. Opens docked flush above the main window,
   same width as it.
@@ -88,7 +94,8 @@ there is no room on the left).
     s shuffle   r repeat   Ctrl+L rescan tags
     Ctrl+F (Cmd+F on Mac) open + focus the search window
     e equalizer   o open browser
-    Left/Right seek ±5s   Up/Down volume
+    Left/Right seek ±5s   Up/Down step the playlist selection by one
+    row (the view follows)   +/= louder, - quieter (numpad too)
     Next/Prev/Play-Stop media keys (when levari is focused; globally
     through MPRIS on Linux, see usage.md)
     Esc quit

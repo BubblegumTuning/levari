@@ -6,8 +6,9 @@
      SDL=$(pkg-config --cflags --libs sdl2)
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/to \
        test/optenc/testoptenc.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o) \
-       $(find build -name 'libmodplug.a' | head -1) -lz -lm -lpthread -ldl -lstdc++
+         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
+       -lz -lm -lpthread -ldl -lstdc++
    Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
 */
 #include "../../src/ui/ui.c"
@@ -69,6 +70,12 @@ int main(void) {
     chk("cycle 3 -> utf8", ui.opt_enc, 3);
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live effect: utf8 forced", strcmp(t.title, "\xcd\xb3") == 0, 1);
+
+    click(186 + 36, 150 + 7);
+    chk("cycle 4 -> shiftjis", ui.opt_enc, 4);
+    tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
+    /* forced shiftjis: CD B3 sit in the half-width kana band (D2 forced) */
+    chk("live effect: shiftjis forced", strcmp(t.title, "\xef\xbe\x8d\xef\xbd\xb3") == 0, 1);
 
     click(186 + 36, 150 + 7);
     chk("cycle wraps to AUTO", ui.opt_enc, 0);

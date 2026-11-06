@@ -29,7 +29,7 @@ extern const Rect R_SHUF, R_REPEAT, R_VIS, R_ABA, R_ABB, R_SEARCH, R_RPT1;
 
 /* playlist window layout */
 extern const Rect P_TITLE;
-extern const Rect P_SHUF, P_REPEAT, P_ADD, P_REM, P_CLOSE, P_LIB;
+extern const Rect P_SHUF, P_REPEAT, P_ADD, P_REM, P_CLOSE, P_LIB, P_SCAN;
 extern const Rect P_TEXT, P_SCROLL;
 
 void skin_draw_main_bg(SDL_Surface *s);

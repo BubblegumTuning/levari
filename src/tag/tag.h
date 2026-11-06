@@ -28,6 +28,11 @@ int spc_tag_duration(const unsigned char *head, long n);
 #define LV_ENC_LATIN1  0
 #define LV_ENC_CP1251  1
 #define LV_ENC_UTF8    2
+/* SHIFT-JIS/CP932 verdict for mislabelled legacy fields (see the SJIS
+   corpus section in test/tagwords/words.txt). Added ahead of the tag.c
+   reader so the tagwords probe builds; tag.c honors the value once the
+   sjis classifier lands. */
+#define LV_ENC_SJIS    3
 void tag_set_legacy_default(int enc);
 
 #endif

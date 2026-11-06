@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.3 LANGUAGES C)
+project(levari VERSION 0.3.4 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

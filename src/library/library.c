@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <time.h>
 
 void lib_index_path(char *out, size_t n) {
     if (cfg.lib_index[0]) {
@@ -75,15 +76,39 @@ static int known_path(const ScanCtx *c, const char *p) {
    the first line "#levari-index v2" marks the escaped format: headerless
    (pre-0.3.0) indexes store RAW paths and must never be unescaped — a
    Windows path C:\Users\me\new would lose backslashes (\n -> newline).
-   lib_scan_add migrates a legacy index to v2 in place. */
-#define IDX_HEADER "#levari-index v2\n"
+   lib_scan_add migrates a legacy index to v2 in place.
+   since 0.3.4 the header carries a creation marker: "<version> <YYMMDD>"
+   (UTC, written when the index is created — appended scans never rewrite
+   it). Detection anywhere is only strncmp("#levari-index", 13), and the
+   whole line stays <= 31 bytes INCLUDING the newline for current version
+   strings, so pre-0.3.4 readers — whose header probe is fgets(probe,32)
+   — consume it in one gulp and see nothing new. If the version string
+   ever outgrows the budget the old readers degrade to one tabless tail
+   line, which the row parsers already skip (only cmd_list prints it);
+   the new reader drains long headers outright. */
+#define IDX_HEADER_FMT "#levari-index v2 %s %s\n"
+
+static void idx_write_header(FILE *w) {
+    time_t t = time(NULL);
+    char stamp[8];
+    stamp[0] = 0;
+    struct tm *g = gmtime(&t); /* sole writer context (scan path); no _r needed */
+    if (g) strftime(stamp, sizeof stamp, "%y%m%d", g);
+    fprintf(w, IDX_HEADER_FMT, LV_VERSION, stamp);
+}
 
 int lib_idx_header(FILE *f) {
     /* consume the v2 header line if present; leave the stream at row 1 */
     long start = ftell(f);
-    char probe[32];
+    char probe[128];
     if (fgets(probe, sizeof probe, f)) {
-        if (!strncmp(probe, "#levari-index", 13)) return 1;
+        if (!strncmp(probe, "#levari-index", 13)) {
+            /* a header longer than the probe (future version strings):
+               swallow the rest so readers never see a phantom tail row */
+            while (!strchr(probe, '\n') && fgets(probe, sizeof probe, f))
+                ;
+            return 1;
+        }
         fseek(f, start, SEEK_SET);
     }
     return 0;
@@ -145,13 +170,13 @@ static void idx_migrate(const char *idx) {
     FILE *r = fopen(idx, "r");
     if (!r) {
         FILE *w = fopen(idx, "w");
-        if (w) { fputs(IDX_HEADER, w); fclose(w); }
+        if (w) { idx_write_header(w); fclose(w); }
         return;
     }
     if (lib_idx_header(r)) { fclose(r); return; } /* already v2 */
     fclose(r);
     FILE *w = fopen(idx, "w"); /* legacy: drop rows, keep only the format */
-    if (w) { fputs(IDX_HEADER, w); fclose(w); }
+    if (w) { idx_write_header(w); fclose(w); }
 }
 
 static void scan_dir(const char *dir, ScanCtx *c) {
@@ -461,6 +486,128 @@ void lib_fill_playlist(Playlist *p) {
        return leaked it */
     if (ix.n) lib_fill_playlist_ix(p, &ix);
     lib_index_free(&ix);
+}
+
+/* Field 5 (duration) of a raw index row: count 4 tabs, atoi. Tag fields are
+   written RAW by the scanner — a literal tab inside a tag shifts this parse
+   exactly as it shifts every reader (pre-existing format hazard, not
+   introduced here); the value only ever preserves a duration a fresh probe
+   could not determine, so a mis-parse loses a length, never corrupts a row. */
+static int row_dur(const char *line) {
+    const char *q = line;
+    for (int f = 0; f < 4; f++) {
+        q = strchr(q, '\t');
+        if (!q) return 0;
+        q++; /* advance PAST the tab: strchr(q,'\t') would find it again */
+    }
+    return atoi(q);
+}
+
+int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
+                     int *out_notag) {
+    char rp[LV_MAX_PATH];
+    if (!realpath(path, rp)) return -1;
+    struct stat st;
+    if (stat(rp, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    Tags t;
+    tag_init(&t);
+    int dur = tag_probe(rp, st.st_size, &t);
+    /* the scanner's notag certification rule (tag-enabled pass): a full
+       probe that finds nothing AT ALL certifies the sparse 7th field */
+    int notag = !t.title[0] && !t.artist[0] && !t.album[0] && !t.track;
+
+    char idx[LV_MAX_PATH];
+    lib_index_path(idx, sizeof idx);
+    idx_migrate(idx);
+
+    char line[2 * LV_MAX_PATH + 1024]; /* house row budget */
+    char *hdr = NULL;                  /* header line kept byte-identically:
+                                          the creation marker attributes the
+                                          index's ORIGIN — a rewrite must not
+                                          restamp it (b6cb2ea semantics) */
+    char **rows = NULL;
+    int n = 0, cap = 0, hit = -1, oom = 0;
+    FILE *r = fopen(idx, "r");
+    if (!r) return -2;
+    if (lib_idx_getline(r, line, sizeof line) == 1 &&
+        !strncmp(line, "#levari-index", 13))
+        hdr = strdup(line);            /* stream now sits at row 1 */
+    else
+        fseek(r, 0, SEEK_SET);         /* headerless: read rows as found */
+    int gr;
+    while ((gr = lib_idx_getline(r, line, sizeof line)) != 0) {
+        if (gr == 2) continue; /* over-long row: dropped, same rule as reload */
+        if (hit < 0) {
+            char key[2 * LV_MAX_PATH];
+            size_t tl = strcspn(line, "\t"); /* path is field 1; never holds
+                                                an UNESCAPED tab */
+            if (tl >= sizeof key) tl = sizeof key - 1;
+            memcpy(key, line, tl);
+            key[tl] = 0;
+            unesc_field(key, sizeof key, key, tl);
+            if (!strcmp(key, rp)) hit = n;
+        }
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 128;
+            char **p2 = realloc(rows, (size_t)nc * sizeof *rows);
+            if (!p2) { oom = 1; break; }
+            rows = p2;
+            cap = nc;
+        }
+        rows[n] = strdup(line);
+        if (!rows[n]) { oom = 1; break; }
+        n++;
+    }
+    fclose(r);
+    if (oom) {
+        for (int i = 0; i < n; i++) free(rows[i]);
+        free(rows);
+        free(hdr);
+        return -2;
+    }
+    /* probe blind on duration: a tag_probe that yields 0 must not erase a
+       duration the scanner learned from the decoder */
+    if (!dur && hit >= 0) dur = row_dur(rows[hit]);
+
+    /* new row in the scanner's exact shape: escaped path, RAW tag fields,
+       sparse 7th marker only when notag */
+    char esc[2 * LV_MAX_PATH];
+    esc_field(esc, sizeof esc, rp);
+    char row[2 * LV_MAX_PATH + 1024];
+    snprintf(row, sizeof row, "%s\t%s\t%s\t%s\t%d\t%d%s\n",
+             esc, t.artist, t.title, t.album, dur, t.track,
+             notag ? "\t1" : "");
+
+    char tmp[LV_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", idx);
+    FILE *w = fopen(tmp, "w");
+    if (!w) {
+        for (int i = 0; i < n; i++) free(rows[i]);
+        free(rows);
+        free(hdr);
+        return -2;
+    }
+    if (hdr) fputs(hdr, w);
+    else idx_write_header(w);
+    for (int i = 0; i < n; i++) {
+        if (i == hit) fputs(row, w);
+        else fputs(rows[i], w);
+        free(rows[i]);
+    }
+    if (hit < 0) fputs(row, w); /* decision A: absent -> append */
+    fclose(w);
+    free(rows);
+    free(hdr);
+    /* mingw's rename refuses to replace an existing file: retry once
+       after removing the target (same fallback as cfg_save) */
+    if (rename(tmp, idx) != 0) {
+        remove(idx);
+        if (rename(tmp, idx) != 0) { remove(tmp); return -2; }
+    }
+    if (out_tags) *out_tags = t;
+    if (out_dur) *out_dur = dur;
+    if (out_notag) *out_notag = notag;
+    return 0;
 }
 
 static int cmd_list(const char *filter, FILE *out) {

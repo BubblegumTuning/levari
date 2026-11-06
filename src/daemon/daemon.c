@@ -121,8 +121,10 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
                 }
                 while (*s == ' ') s++;
                 if (!*tok) continue;
-                const char *dot = strrchr(tok, '.');
-                if (dot && !lv_strcasecmp(dot, ".m3u")) pl_load_m3u(&np, tok);
+                PlKind kind = pl_ext_kind(tok);
+                if (kind == PL_M3U) pl_load_m3u(&np, tok);
+                else if (kind == PL_PLS) pl_load_pls(&np, tok);
+                else if (kind == PL_CUE) pl_load_cue(&np, tok);
                 else pl_add(&np, tok);
             }
             /* index first: library queries arrive as bare paths, and the
@@ -293,10 +295,15 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
 
 /* FlushFileBuffers on a pipe blocks until the client drains the out
    buffer — forever if the client never reads. run it on a helper thread
-   so the caller can bound the wait; destroying the pipe unblocks a
-   stuck flush (it completes with an error). the arg block is heap-owned
-   because the thread can still be running after the caller's scope
-   ends; the caller always reaps it after closing the pipe handle.
+   so the caller can bound the wait; what unblocks a stuck flush is the
+   explicit CancelSynchronousIo and/or the DisconnectNamedPipe at
+   teardown (the flush fails against a disconnected instance) — NOT
+   object destruction, since the thread's own duplicate keeps the pipe
+   object alive across the caller's CloseHandle. the arg block is
+   heap-owned because the thread can still be running after the caller's
+   scope ends; the caller always reaps it after closing the pipe handle,
+   with a BOUNDED wait (see teardown: a pathological stall leaks two
+   handles rather than hanging the server thread forever).
    The thread owns a DUPLICATED pipe handle, never the caller's h: with
    a small remaining budget the caller reaches DisconnectNamedPipe +
    CloseHandle(h) while the thread may not even have entered
@@ -442,8 +449,12 @@ static void *srv_thread(void *arg) {
                    and a flush would only block), and on the completed path
                    run it on the helper thread bounded by the same 5 s budget.
                    on timeout: CancelSynchronousIo is best-effort (a pipe
-                   flush may ignore it); the DisconnectNamedPipe + CloseHandle
-                   below are the sure unblock. honest residual caveat: a
+                   flush may ignore it); the DisconnectNamedPipe below is
+                   the sure unblock — CloseHandle(h) no longer destroys
+                   the object (the thread's duplicate holds a reference,
+                   which is exactly what prevents the recycled-handle
+                   race), so the teardown reap below is BOUNDED. honest
+                   residual caveat: a
                    client that stalls past the budget can still lose already
                    written bytes. */
                 if (wdone) {
@@ -483,9 +494,9 @@ static void *srv_thread(void *arg) {
                                 fth = fev = NULL;
                             } else {
                                 CancelSynchronousIo(fth);
-                                /* fth/fev stay live: reaped right after
-                                   CloseHandle(h) below, which unblocks the
-                                   stuck flush. */
+                                /* fth/fev stay live: reaped after the
+                                   DisconnectNamedPipe + CloseHandle(h)
+                                   below. */
                             }
                         }
                     }
@@ -499,10 +510,23 @@ static void *srv_thread(void *arg) {
         pthread_mutex_unlock(&pipe_mtx);
         CloseHandle(h);
         if (fth) {
-            /* the pipe destruction above completed the stuck flush with an
-               error: the thread now signals and frees its arg block. */
-            WaitForSingleObject(fev, INFINITE);
-            CloseHandle(fth); CloseHandle(fev);
+            /* what ends the stuck flush: the cancellation(s) and/or the
+               flush failing against the disconnected instance — not the
+               CloseHandle(h) above, which only drops the caller's
+               reference (the thread's duplicate keeps the object alive;
+               that IS the recycled-handle fix). cancel once more: the
+               budget-expiry cancel above can miss if the thread entered
+               FlushFileBuffers only after it ran. the reap is BOUNDED:
+               a client that neither drains nor dies could keep the flush
+               wedged past every unblock, and the accept loop must not
+               inherit that hang — on timeout fth/fev (and the thread's
+               own duplicate + arg block) leak deliberately; two handles
+               beat a dead daemon, and the next pipe instance is a fresh
+               object unaffected by the stuck one. */
+            CancelSynchronousIo(fth);
+            if (WaitForSingleObject(fev, 5000) == WAIT_OBJECT_0) {
+                CloseHandle(fth); CloseHandle(fev);
+            }
         }
     }
     if (psd) LocalFree(psd);

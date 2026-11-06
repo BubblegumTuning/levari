@@ -1,5 +1,6 @@
 #include "tag.h"
 #include "../common.h"
+#include "sjis_table.h"
 #include <ctype.h>
 #include <stdatomic.h>
 
@@ -297,6 +298,95 @@ static void copy_cp1251(char *dst, size_t dn, const unsigned char *src, int n) {
     dst[j] = 0;
 }
 
+/* ---- Shift_JIS/CP932 legacy verdict (decisions D1-D7, internal SJIS plan) ----
+   Early-2000s Windows taggers wrote Shift_JIS bytes into fields declared
+   latin-1 (id3v2 enc=0/invalid, id3v1, RIFF INFO). AUTO may claim the
+   fourth legacy table only with a full-field structurally-valid pair
+   string AND >=1 kana pair — see the corpus SECTION 15 and
+   tools/gen_sjis_table.py for the decision table. */
+
+/* full-string pair validation. Returns 1 when every byte >=0x80 is a
+   well-formed SJIS unit, 0 = fail-closed (decision D6: the non-lead
+   bytes 0x80, 0xA0, 0xF0-0xFF and any truncated pair reject the whole
+   field). Sets *kana when any pair lands in a kana range (decision D1:
+   hiragana 0x82 0x9F-0xF2, full-width katakana 0x83 0x40-0x97) — AUTO
+   claims SJIS only with kana; kanji/punctuation-only strings are
+   forced-mode territory. hw=1 additionally accepts the half-width kana
+   band 0xA1-0xDF as single bytes (decision D2: FORCED mode only). An
+   unpaired 0x5C/0x7E is ordinary ASCII (decision D4b); consumed as a
+   TRAIL byte it is normal — the 表/ソ dame-oji pairs land right. */
+static int sjis_scan(const unsigned char *src, int n, int *kana, int hw) {
+    int nt = 0;
+    while (nt < n && src[nt]) nt++;       /* NUL ends the text (pad-NUL) */
+    n = nt;
+    if (kana) *kana = 0;
+    for (int i = 0; i < n; ) {
+        unsigned char c = src[i];
+        if (c < 0x80) { i++; continue; }
+        if (hw && c >= 0xA1 && c <= 0xDF) {   /* half-width kana, forced */
+            if (kana) *kana = 1;
+            i++;
+            continue;
+        }
+        int lead = (c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xEF);
+        if (!lead || i + 1 >= n) return 0;
+        unsigned char t = src[i + 1];
+        if (!((t >= 0x40 && t <= 0x7E) || (t >= 0x80 && t <= 0xFC)))
+            return 0;
+        if (kana &&
+            ((c == 0x82 && t >= 0x9F && t <= 0xF2) ||
+             (c == 0x83 && t >= 0x40 && t <= 0x97)))
+            *kana = 1;
+        i += 2;
+    }
+    return 1;
+}
+
+/* decode validated-or-not SJIS bytes to UTF-8. cp932 is BMP (generated
+   table proves no codepoint exceeds U+FFFF and none is a surrogate), so
+   1/2/3-byte emit paths cover everything — there is no 4-byte path by
+   construction. Table entry 0x0000 = CP932-unassigned pair: emit U+FFFD,
+   the Windows-tool behavior, and consume the pair. An unpaired lead or
+   structurally invalid trail byte cannot appear in fields the AUTO scan
+   validated, but tier-2 block verdicts and forced hw=1 mode still must
+   not derail: emit U+FFFD and consume the lead only. Buffer-tight like
+   copy_utf8 (worst case 2 SJIS bytes -> 3 UTF-8). */
+static void copy_sjis(char *dst, size_t dn, const unsigned char *src, int n, int hw) {
+    size_t j = 0;
+    for (int i = 0; i < n && src[i]; i++) {
+        unsigned char c = src[i];
+        if (c < 0x20) continue;
+        unsigned cp;
+        if (c < 0x80) cp = c;
+        else {
+            unsigned char r = sjis_lead[c];
+            unsigned char t = i + 1 < n ? src[i + 1] : 0;
+            if (r != 0xFF && t >= 0x40 && t <= 0xFC) {
+                cp = sjis_rows[r][t - 0x40];
+                if (!cp) cp = 0xFFFD;
+                i++;
+            } else if (hw && c >= 0xA1 && c <= 0xDF)
+                cp = sjis_hw[c - 0xA1];
+            else cp = 0xFFFD;
+        }
+        if (cp < 0x80) {
+            if (j + 1 >= dn) break;
+            dst[j++] = (char)cp;
+        } else if (cp < 0x800) {
+            if (j + 2 >= dn) break;
+            dst[j++] = (char)(0xC0 | (cp >> 6));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (j + 3 >= dn) break;
+            dst[j++] = (char)(0xE0 | (cp >> 12));
+            dst[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    while (j > 0 && dst[j - 1] == ' ') j--;
+    dst[j] = 0;
+}
+
 static void copy_legacy(char *dst, size_t dn, const unsigned char *src, int n) {
     size_t clamped = 0;
     int mb = 0;
@@ -350,6 +440,11 @@ enum { EV_ART, EV_GENRE, EV_YEAR, EV_COMPOSER, EV_GROUP, EV_COMM, EV_N };
 typedef struct {
     int strong, weak, masq, invalid, high_fields;
     int amb_tail, cyr_letters, lat_letters;
+    int u8mb;       /* fields that per-field utf8_scan accepts with >=1
+                       multibyte sequence — the strict D7 veto against
+                       the SJIS claim */
+    int sjis_kana;  /* fields sjis_scan validates AND lands a kana pair
+                       in (decision D1: strong tier-2 evidence) */
 } BlockEv;
 
 typedef struct {
@@ -421,6 +516,32 @@ static void ev_field(const unsigned char *s, int n, BlockEv *e, int nulsafe) {
         i += len;
     }
     if (bad) e->invalid++;
+    /* strict D7 scan (internal SJIS plan): a field per-field utf8_scan
+       accepts WITH multibyte evidence vetoes an SJIS block claim; a
+       field that fails UTF-8 but passes the SJIS pair scan AND lands a
+       kana pair is a strong D1 vote. No-kana strings never vote SJIS.
+       COMM (nulsafe) iterates NUL-separated segments so text past the
+       separator is scanned too. */
+    {
+        int pos = 0;
+        for (;;) {
+            int sl = 0;
+            while (pos + sl < n && s[pos + sl]) sl++;
+            if (sl > 0) {
+                size_t cl7;
+                int mb7 = 0;
+                if (utf8_scan(s + pos, sl, &cl7, &mb7)) {
+                    if (mb7) e->u8mb++;
+                } else {
+                    int kana = 0;
+                    if (sjis_scan(s + pos, sl, &kana, 0) && kana) e->sjis_kana++;
+                }
+            }
+            if (!nulsafe) break;
+            pos += sl + 1;
+            if (pos >= n) break;
+        }
+    }
     /* word-shape counts: unglued runs of >=2 cp1251-letter bytes are
        cyrillic words; high bytes glued into ascii words are latin-1
        accents — looks_cp1251's own rule, counted across the block */
@@ -448,6 +569,8 @@ static void ev_merge(BlockEv *dst, const BlockEv *s) {
     dst->amb_tail |= s->amb_tail;
     dst->cyr_letters += s->cyr_letters;
     dst->lat_letters += s->lat_letters;
+    dst->u8mb += s->u8mb;
+    dst->sjis_kana += s->sjis_kana;
 }
 
 /* store one legacy field into its dedicated slot (last duplicate wins,
@@ -486,17 +609,31 @@ static void lb_evidence(LegacyBlock *lb, const unsigned char *v, size_t vn, int 
 
 /* UNKNOWN and the contradict case decode every field with today's
    per-field copy_legacy: bit-identical to the a525af3-era decoder */
-enum { V_UNKNOWN, V_UTF8, V_CP1251, V_LATIN1, V_PERFIELD };
+enum { V_UNKNOWN, V_UTF8, V_CP1251, V_LATIN1, V_PERFIELD, V_SJIS, V_FORCED_SJIS };
 
 /* the verdict implied by the MERGED counters (stored + evidence frames):
-   exactly the 2188f3e-era block rule. It runs only when the stored fields
-   are not unanimous per-field (see lb_finish), so it can tip ambiguous or
-   contradictory blocks but never outvote agreeing stored fields. */
+   exactly the 2188f3e-era block rule, plus the SJIS tier (internal plan
+   task 2.3): a kana-bearing field pins the block to shiftjis UNLESS any
+   field carries valid-UTF-8-multibyte evidence (decision D7's strict
+   veto). It runs after the UTF-8 claim and after the invalid-vs-strong
+   contradiction, so UTF-8 evidence in any form outranks the SJIS claim,
+   and an unresolved contradiction falls to per-field as before. It runs
+   only when the stored fields are not unanimous per-field (see
+   lb_finish), so it can tip ambiguous or contradictory blocks but never
+   outvote agreeing stored fields. */
 static int core_verdict(const BlockEv *e) {
     if (!e->invalid) {
         if (e->strong || (e->weak && !e->masq)) return V_UTF8;
         return V_UNKNOWN;   /* ascii/ambiguous only: no block claim */
     }
+    /* The SJIS kana pin runs BEFORE the invalid-vs-strong contradiction:
+       D7's veto is per-field utf8_scan VALIDATION (u8mb), not the raw
+       tolerant walk counter — SJIS pair bytes can fake a well-formed
+       UTF-8 sequence mid-stream (92 EA 82 CC walks as bad, then a
+       "3-byte char" EA 82 CC), and that must not veto a kana-bearing
+       field. A block with a genuinely UTF-8-valid field carries
+       u8mb >= 1 and the veto below still wins. */
+    if (e->sjis_kana && !e->u8mb) return V_SJIS;
     if (e->strong) return V_UNKNOWN;          /* invalid vs strong: contradiction */
     if (e->cyr_letters > e->lat_letters) return V_CP1251;
     if (e->lat_letters > e->cyr_letters) return V_LATIN1;
@@ -517,14 +654,19 @@ static int ev_verdict(const BlockEv *s, const BlockEv *c) {
 }
 
 /* which table per-field copy_legacy would pick for one field:
-   0 = utf-8, 1 = cp1251, 2 = latin-1. This is the oracle behind the
-   stored-unanimity tier: if every high-byte stored field makes copy_legacy
-   pick the SAME table, pinning the block to that verdict reproduces
-   copy_legacy's output byte-for-byte by construction. */
+   0 = utf-8, 1 = cp1251, 2 = latin-1, 3 = shiftjis (internal SJIS plan:
+   gated on sjis_scan validity AND a kana pair, decision D1, AFTER the
+   UTF-8 check — UTF-8 evidence vetoes SJIS, decision D7). This is the
+   oracle behind the stored-unanimity tier: if every high-byte stored
+   field makes copy_legacy pick the SAME table, pinning the block to
+   that verdict reproduces copy_legacy's output byte-for-byte by
+   construction. */
 static int pv_table(const unsigned char *b, int n) {
     size_t cl;
     int mb = 0;
     if (utf8_scan(b, n, &cl, &mb) && mb) return 0;
+    int kana = 0;
+    if (sjis_scan(b, n, &kana, 0) && kana) return 3;
     if (looks_cp1251(b, n)) return 1;
     return 2;
 }
@@ -543,6 +685,15 @@ static void decode_verdict(char *dst, size_t dn, const unsigned char *b, int len
     }
     case V_CP1251: copy_cp1251(dst, dn, b, len); break;
     case V_LATIN1: copy_fixed(dst, dn, b, len); break;
+    case V_SJIS: copy_sjis(dst, dn, b, len, 0); break;
+    case V_FORCED_SJIS: {                       /* forced shiftjis (D2):
+        waives the kana gate and accepts half-width kana, but a field
+        with an invalid pair structure STILL fail-closes to the shape
+        guesser (decision D6). */
+        if (sjis_scan(b, len, 0, 1)) copy_sjis(dst, dn, b, len, 1);
+        else copy_legacy(dst, dn, b, len);
+        break;
+    }
     case V_PERFIELD:
         if (looks_cp1251(b, len)) copy_cp1251(dst, dn, b, len);
         else copy_fixed(dst, dn, b, len);
@@ -575,14 +726,16 @@ static void lb_finish(LegacyBlock *lb, Tags *t, int fill_empty_only) {
     if (forced == LV_ENC_LATIN1)      v = V_LATIN1;
     else if (forced == LV_ENC_CP1251) v = V_CP1251;
     else if (forced == LV_ENC_UTF8)   v = V_UNKNOWN;
+    else if (forced == LV_ENC_SJIS)   v = V_FORCED_SJIS;
     else {
         /* tier 1 — stored unanimity: classify every high-byte stored field
            by the table per-field copy_legacy would pick for it. If they
            all pick the SAME table and at least one of them actually
-           carries evidence (a utf-8 claim or a non-zero word-shape count),
-           pin the block to that verdict — bit-identical to per-field
-           decoding by construction. Disagreement or evidence-less
-           unanimity falls through to tier 2 (merged counters). */
+           carries evidence (a utf-8 claim, an sjis claim, or a non-zero
+           word-shape count), pin the block to that verdict — bit-identical
+           to per-field decoding by construction. Disagreement or
+           evidence-less unanimity falls through to tier 2 (merged
+           counters). */
         BlockEv sev = {0};
         int pv = -1, pv_ev = 0;
         for (int i = 0; i < LF_COUNT; i++) {
@@ -594,10 +747,10 @@ static void lb_finish(LegacyBlock *lb, Tags *t, int fill_empty_only) {
             int t = pv_table(lb->b[i], lb->n[i]);
             if (pv < 0) pv = t;
             else if (pv != t) pv = -2;
-            if (t == 0 || fe.cyr_letters || fe.lat_letters) pv_ev++;
+            if (t == 0 || t == 3 || fe.cyr_letters || fe.lat_letters) pv_ev++;
         }
         if (pv >= 0 && pv_ev)
-            v = pv == 0 ? V_UTF8 : pv == 1 ? V_CP1251 : V_LATIN1;
+            v = pv == 0 ? V_UTF8 : pv == 1 ? V_CP1251 : pv == 2 ? V_LATIN1 : V_SJIS;
         else
             v = ev_verdict(&sev, &lb->eev);     /* tier 2 */
     }

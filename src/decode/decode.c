@@ -600,7 +600,13 @@ Decoder *dec_open(const char *path) {
            is no delay/padding subtraction, and the decoder emits exactly
            the samples it counts, so trust samples; keep the size-based
            estimate only when the scan produced nothing. */
-        d->total = (long long)d->u.mp3.samples / d->ch;
+        /* A frameless (tag-only / garbage-header) stream opens SUCCESSFULLY
+           with samples == 0 AND channels == 0 — minimp3_ex fills info only
+           from decoded frames. Integer 0/0 traps exactly like n/0: an
+           unguarded division here SIGFPE'd the scan thread mid-scan
+           (journal 'trap divide error' in lvscan). Skip the division and
+           let the validity gate at the end of dec_open reject the decoder. */
+        d->total = d->ch > 0 ? (long long)d->u.mp3.samples / d->ch : 0;
         if (d->total == 0) {
             int kbps = d->u.mp3.info.bitrate_kbps;
             long long fs = 0;
@@ -832,7 +838,10 @@ Decoder *dec_open(const char *path) {
 #else
         d->ch = cc->channels;
 #endif
-        if (st->duration > 0 && st->time_base.num > 0)
+        /* rate > 0: a crafted container can carry codecpar.sample_rate == 0,
+           and a {1,0} rational makes av_rescale_q divide by zero before the
+           validity gate at the end of dec_open ever sees the decoder */
+        if (st->duration > 0 && st->time_base.num > 0 && d->rate > 0)
             d->total = p_av_rescale_q(st->duration, st->time_base, (AVRational){1, d->rate});
         else if (a->ic->duration > 0)
             d->total = a->ic->duration * d->rate / AV_TIME_BASE;

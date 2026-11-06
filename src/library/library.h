@@ -59,4 +59,16 @@ void lib_fill_playlist_ix(Playlist *p, const LibIndex *ix);
 /* convenience load + apply + free; safe for private temp playlists */
 void lib_fill_playlist(Playlist *p);
 
+/* Rescan ONE file (tags + duration via tag_probe) and update its index row:
+   replace the matching row, append when absent (playlist entries outside the
+   library become findable). The path is realpath'd like the scanner's, so a
+   symlinked playlist entry updates the scanned row instead of shadowing it.
+   Duration: probe-only — the scanner's dec_open fallback slurps whole files
+   and this runs on the UI thread; a probe that yields 0 KEEPS the stored
+   duration. The header line (creation marker) is preserved byte-identically.
+   Returns 0 on success; -1 if the file cannot be opened for probing (index
+   untouched); -2 on index read/write failure. Out params may be NULL. */
+int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
+                     int *out_notag);
+
 #endif

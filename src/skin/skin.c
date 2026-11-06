@@ -35,6 +35,7 @@ const Rect P_ADD     = {58, 24, 23, 12};
 const Rect P_REM     = {81, 24, 23, 12};
 const Rect P_CLOSE   = {104, 24, 23, 12};
 const Rect P_LIB     = {127, 24, 23, 12};
+const Rect P_SCAN    = {150, 24, 23, 12};
 const Rect P_TEXT    = {14, 40, 251, 64};
 const Rect P_SCROLL  = {267, 40, 8, 64};
 

@@ -42,6 +42,17 @@ int main(void) {
     chk("reloaded latin1", cfg.tag_legacy_enc, LV_ENC_LATIN1);
 
     f = fopen(path, "w");
+    fputs("tag.legacy_encoding = shiftjis\n", f); fclose(f);
+    cfg_load();
+    chk("parsed shiftjis", cfg.tag_legacy_enc, LV_ENC_SJIS);
+    if (cfg_save() != 0) { printf("FAIL cfg_save shiftjis\n"); return 1; }
+    f = fopen(path, "r");
+    n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+    if (!strstr(buf, "tag.legacy_encoding = shiftjis")) {
+        fails++; printf("FAIL saved file lacks shiftjis line\n");
+    } else printf("PASS saved file carries shiftjis\n");
+
+    f = fopen(path, "w");
     fputs("tag.legacy_encoding = bogus\n", f); fclose(f);
     cfg_load();
     chk("bogus value keeps auto", cfg.tag_legacy_enc, LV_ENC_AUTO);

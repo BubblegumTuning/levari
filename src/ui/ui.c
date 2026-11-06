@@ -21,8 +21,8 @@
 enum {
     B_PLAY, B_PAUSE, B_STOP, B_PREV, B_NEXT, B_OPEN,
     B_SHUF, B_REPEAT, B_EQ, B_VIS, B_LIST, B_ABA, B_ABB, B_XMAIN, B_SEARCH, B_RPT1,
-    PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_X, FB_ADDDIR, FB_X,
-    EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X,
+    PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_SCAN, PB_X, FB_ADDDIR, FB_X,
+    EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X, EQB_RESET,
     OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
     OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC,
     OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA,
@@ -46,8 +46,23 @@ enum { OPTF_LIBDIRS, OPTF_LIBIDX, OPTF_LIBAV, OPTF_BACKEND, OPTF_DEVICE, OPTF_SO
 #define EQ_H 156
 #define EQ_SL_Y 50
 #define EQ_SL_H 70
-#define EQ_PRE_X 44
-#define EQ_BAND_X(i) (68 + (i) * 24)
+/* slider group centered in EQ_W: preamp + 10 bands at 24 pitch, 12 wide —
+   span 252 -> margins 31/32 */
+#define EQ_PRE_X 31
+#define EQ_BAND_X(i) (55 + (i) * 24)
+/* bottom row: ON/OFF at the lower right with RESET tucked next to it —
+   A centered RESET proved too easy to hit by accident. The four
+   presets sit one button width (34 px) LEFT of true center:
+   x 51/89/127/161 (span 51..195), leaving a 38 px breathing gap
+   before RESET. ONE table drives draw AND hit-testing so they can never
+   drift apart. */
+#define EQ_PRE_Y 132
+static const struct { int id; const char *l; int x, w; } EQ_PRE[] = {
+    {EQB_FLAT, "FLAT", 51, 34}, {EQB_ROCK, "ROCK", 89, 34},
+    {EQB_POP, "POP", 127, 30}, {EQB_JAZZ, "JAZZ", 161, 34},
+    {EQB_RESET, "RESET", 233, 38},
+};
+static Rect eq_on_rect(void) { Rect r = {EQ_W - 40, EQ_PRE_Y, 30, 12}; return r; }
 
 typedef struct { int id; const Rect *r; } Btn;
 
@@ -60,8 +75,38 @@ static const Btn MAIN_BTNS[] = {
 };
 static const Btn PL_BTNS[] = {
     {PB_SHUF, &P_SHUF}, {PB_REPEAT, &P_REPEAT}, {PB_ADD, &P_ADD},
-    {PB_REM, &P_REM}, {PB_CLOSE, &P_CLOSE}, {PB_LIB, &P_LIB},
+    {PB_REM, &P_REM}, {PB_CLOSE, &P_CLOSE}, {PB_LIB, &P_LIB}, {PB_SCAN, &P_SCAN},
 };
+
+/* ---- playlist right-click edit menu (D1: menu, not new PL_BTNS — chrome
+   space is precious and Winamp-authentic playlists edit through the list
+   menu). Two columns of flat items fit the default 116px window; 5x7
+   ASCII labels. Right-click anywhere in the window opens it (the row list
+   ignores right-click today, and the title-strip drag is left-only, so
+   the menu cannot race the drag-4 latch; while open it EATS the next left
+   click — outside: close only, inside: fire and close, the same one-click
+   contract as the MAIN menu). The action switch lives next to
+   handle_pl_mouse; CLEAR reuses PB_REM's proven select-all path. */
+enum {
+    PM_STITLE, PM_SARTIST, PM_SALBUM, PM_STRACK, PM_SFILE,
+    PM_REVERSE, PM_SHUFFLE, PM_CROP, PM_CLEAR,
+    PM_COPY, PM_CUT, PM_PASTE, PM_MUP, PM_MDOWN, PM_SAVEAS, PM_N
+};
+static const struct { int act; const char *lbl; } PL_MENU[PM_N] = {
+    { PM_STITLE,  "SORT TITLE"  }, { PM_SARTIST,  "SORT ARTIST" },
+    { PM_SALBUM,  "SORT ALBUM"  }, { PM_STRACK,   "SORT TRACK"  },
+    { PM_SFILE,   "SORT FILE"   }, { PM_REVERSE,  "REVERSE"     },
+    { PM_SHUFFLE, "RANDOMIZE"   }, { PM_CROP,     "CROP"        },
+    { PM_CLEAR,   "CLEAR"       },
+    { PM_COPY,    "COPY"        }, { PM_CUT,      "CUT"         },
+    { PM_PASTE,   "PASTE"       }, { PM_MUP,      "MOVE UP"     },
+    { PM_MDOWN,   "MOVE DOWN"   }, { PM_SAVEAS,   "SAVE AS..."  },
+};
+#define PL_MENU_ROWS 8                 /* first col 8, second the rest */
+static Rect pl_menu_item_rect(int i) {
+    Rect r = { 2 + (i / PL_MENU_ROWS) * 90, 2 + (i % PL_MENU_ROWS) * 13, 90, 13 };
+    return r;
+}
 
 typedef struct {
     Player *pl;
@@ -85,13 +130,15 @@ typedef struct {
     int file_err;        /* "path not valid" showing over the field */
     Uint32 file_err_at;  /* SDL_GetTicks when the error started */
     int file_pseudo;     /* Windows pseudo-root: logical drives, no parent */
+    int file_saving;     /* browser in SAVE mode (playlist Save-As): title
+                            differs, Enter writes the file, no audio filter */
     /* options window */
     int opt_visible, opt_focus, opt_hover;
     int opt_caret;               /* caret byte offset in the focused field (codepoint boundary) */
     int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
-    int opt_enc;                 /* LEGACY button cycle: 0 auto, 1 latin1, 2 cp1251, 3 utf8 (cfg value = opt_enc - 1) */
+    int opt_enc;                 /* LEGACY button cycle: 0 auto, 1 latin1, 2 cp1251, 3 utf8, 4 shiftjis (cfg value = opt_enc - 1) */
     int opt_adv;                 /* options window on the ADVANCED tab */
     int opt_scanning;            /* a library scan thread is running */
     int opt_tags;                /* scan reads tags+duration, not just names */
@@ -99,12 +146,29 @@ typedef struct {
     int opt_scan_added, opt_scan_seen, opt_scan_skipped;
     char opt_status[96];         /* one-line scan/clear feedback */
     int menu;            /* right-click titlebar dropdown: 0 closed 1 open */
+    int pl_menu;         /* playlist right-click edit menu: 0 closed 1 open */
     int pressed;
-    int drag;          /* 0 none 1 seek 2 vol 3 win-main 4 win-pl 5 plscroll 6 eq-slider 7 win-eq 8 pl-resize 9 win-file 10 pan 11 win-opt */
+    int drag;          /* 0 none 1 seek 2 vol 3 win-main 4 win-pl 5 plscroll 6 eq-slider 7 win-eq 8 pl-resize 9 win-file 10 pan 11 win-opt 12 pl-row */
     int eq_band;       /* 0..9 band, 10 = preamp, while dragging */
     int pl_scroll, pl_sel;
     int pl_cur;            /* last cur index the playlist was scrolled for */
     int pl_selall;           /* ctrl-a: whole playlist selected, del/rem removes it */
+    int pl_drop;             /* drag-12: row index the block lands AT (insertion
+                                gap, 0..count; -1 = drag armed but not yet moved
+                                past the arm threshold, so nothing to apply) */
+    int pl_press_y;          /* drag-12: press y, the arm-threshold origin */
+    int pl_dbl;              /* drag-12: row the deferred double-click plays
+                                on release, -1 = none (deferred so a row drag
+                                eats the play the old down-time play fired) */
+    int pl_collapse;         /* drag-12: row a plain press inside a multi-row
+                              selection collapses to on release (-1 = none) */
+    int *pl_multi;         /* sorted row indices of the multi-selection — the
+                              whole truth once a modifier click has run (plain
+                              click keeps it the single row); pl_sel is the
+                              shift-range anchor. Indices go stale when the
+                              playlist changes elsewhere; every consumer clamps
+                              (pl_sel alone always did). */
+    int pl_multi_n, pl_multi_cap;
     int pl_visible, eq_visible;
     int pl_w, pl_h;        /* current playlist window size */
     int pl_docked;         /* playlist attached under main window */
@@ -112,8 +176,19 @@ typedef struct {
     char title[512];
     int scroll_off;
     int marquee;            /* 1 when draw_main took the scrolling-title path */
+    char msg[64];           /* transient red line over the title strip (rescan
+                               feedback; users dislike silence); empty
+                               = off, kept short on purpose so it never scrolls */
+    Uint32 msg_at;          /* SDL_GetTicks when the message appeared */
     int drag_gx, drag_gy;   /* global mouse pos anchor, re-anchored each drag step */
     int drag_wx, drag_wy;   /* window size at resize start (drag 8) */
+    int drag_rx, drag_ry;   /* last position REQUESTED this drag (refusal check) */
+    int drag_wxlo, drag_wxhi, drag_wylo, drag_wyhi;  /* walls hit this drag */
+    /* per-window WM-refusal bookkeeping for the drag-3 follow moves (see
+       follow_move): last REQUESTED pos + walls hit this drag; valid=0 until
+       the window first takes part in the current drag */
+    struct FollowState { int rx, ry, xlo, xhi, ylo, yhi, valid; }
+        follow_pl, follow_snap[4];
     Uint32 focus_wid;       /* window id of the focused one of ours */
     int app_focused;        /* 1 while any of our windows holds WM focus */
     /* windows snapped beside the main one: follow it while it moves.
@@ -185,27 +260,73 @@ static void pl_layout(Rect *text, Rect *scroll) {
     scroll->w = 8; scroll->h = text->h;
 }
 
+/* ---- playlist multi-selection -------------------------------------------
+   pl_multi is a sorted array of selected row indices — the whole truth of
+   the selection (pl_sel is the shift-range anchor, pl_selall the ctrl-a
+   shortcut). Indices can go stale when the playlist changes elsewhere
+   (daemon adds, drops); every consumer clamps on use, as pl_sel always did. */
+static void pl_sel_reset(void) { ui.pl_multi_n = 0; }
+
+static int pl_sel_find(int idx) { /* >=0 hit, else -(insertion point + 1) */
+    int lo = 0, hi = ui.pl_multi_n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (ui.pl_multi[mid] == idx) return mid;
+        if (ui.pl_multi[mid] < idx) lo = mid + 1; else hi = mid - 1;
+    }
+    return -(lo + 1);
+}
+
+static int pl_sel_has(int idx) { return pl_sel_find(idx) >= 0; }
+
+static int pl_multi_grow(int need) {
+    if (need <= ui.pl_multi_cap) return 0;
+    int cap = ui.pl_multi_cap ? ui.pl_multi_cap * 2 : 16;
+    while (cap < need) cap *= 2;
+    int *m = realloc(ui.pl_multi, (size_t)cap * sizeof *m);
+    if (!m) return -1;                  /* OOM: selection stays as-is, never crash */
+    ui.pl_multi = m; ui.pl_multi_cap = cap;
+    return 0;
+}
+
+static void pl_sel_add(int idx) {
+    int at = pl_sel_find(idx);
+    if (at >= 0) return;
+    if (pl_multi_grow(ui.pl_multi_n + 1) != 0) return;
+    at = -at - 1;
+    memmove(&ui.pl_multi[at + 1], &ui.pl_multi[at],
+            (size_t)(ui.pl_multi_n - at) * sizeof *ui.pl_multi);
+    ui.pl_multi[at] = idx;
+    ui.pl_multi_n++;
+}
+
+static void pl_sel_del(int idx) {
+    int at = pl_sel_find(idx);
+    if (at < 0) return;
+    memmove(&ui.pl_multi[at], &ui.pl_multi[at + 1],
+            (size_t)(ui.pl_multi_n - at - 1) * sizeof *ui.pl_multi);
+    ui.pl_multi_n--;
+}
+
+/* ctrl-a collapses "everything" into a flag; the first modifier click
+   expands it back into rows before touching the selection */
+static void pl_sel_materialize(int count) {
+    if (pl_multi_grow(count) != 0) return;
+    for (int i = 0; i < count; i++) ui.pl_multi[i] = i;
+    ui.pl_multi_n = count;
+}
+
 static void pl_dock_pos(int *x, int *y) {
     SDL_GetWindowPosition(ui.wmain, x, y);
     *y += MAIN_H;
 }
 
 static void drag_begin(SDL_Window *w) {
-    (void)w;
     SDL_GetGlobalMouseState(&ui.drag_gx, &ui.drag_gy);
-}
-
-/* Incremental drag: apply the mouse delta since the previous step to the
-   window's CURRENT position, not a cumulative delta from drag start. A WM
-   that clamps the window (dock/strut at a screen edge) then leaves no
-   phantom overshoot: pulling back moves the window immediately instead of
-   first retracing however far we pushed against the clamp. */
-static void drag_move(SDL_Window *w) {
-    int gx, gy, wx, wy;
-    SDL_GetGlobalMouseState(&gx, &gy);
-    SDL_GetWindowPosition(w, &wx, &wy);
-    SDL_SetWindowPosition(w, wx + gx - ui.drag_gx, wy + gy - ui.drag_gy);
-    ui.drag_gx = gx; ui.drag_gy = gy;
+    /* refusal bookkeeping is drag-scoped: start from the window's true
+       position with no known walls (see drag_step) */
+    SDL_GetWindowPosition(w, &ui.drag_rx, &ui.drag_ry);
+    ui.drag_wxlo = ui.drag_wxhi = ui.drag_wylo = ui.drag_wyhi = 0;
 }
 
 static int snap_idx(SDL_Window *w) {
@@ -236,34 +357,158 @@ void ui_snap_next_to_main(SDL_Window *w, int *x, int *y) {
     }
 }
 
-static void drag_move_snap(SDL_Window *w) {
-    int gx, gy, x, y;
+/* One incremental move step with WM-refusal bookkeeping. The rules below
+   are pinned by test/pldock/testpldock.c:
+   - Incremental: apply the mouse delta since the previous step to the
+     window's CURRENT position, so a WM clamp at a screen edge leaves no
+     phantom overshoot (2d69fac).
+   - The X11 SDL polls up to 100 ms per REFUSED position request
+     (X11_SetWindowPosition waits for the WM to honour the move): one
+     refused call per motion event while a window is pinned against a
+     wall starves the event loop and prompts the desktop's "app not
+     responding" popup. So a refusal is remembered as a wall for the
+     rest of the drag, deeper requests are clamped away from it, and a
+     request identical to the last one is skipped entirely.
+   - A refusal is CONSUMED: the anchor jumps to the mouse, so travel
+     into a wall is spent, not stored — coordinates must stop updating
+     when the window is not moving, or the pull-back must retrace the
+     whole push (the pre-2d69fac dead zone).
+   - Otherwise the anchor advances by the delta ACTUALLY APPLIED
+     post-snap: travel eaten by the dock/snap stays parked at the anchor
+     and accumulates, so a slow pull can still cross DOCK_SNAP and break
+     free (afc93b5; an externally-corrected position is treated as fully
+     applied, keeping the clamp property).
+   snap: 0 none, 1 beside/above main, 2 docked under main (playlist).
+   ax/ay are the caller-owned drag anchors. */
+static void drag_step(SDL_Window *w, int snap, int *ax, int *ay) {
+    int gx, gy;
     SDL_GetGlobalMouseState(&gx, &gy);
+    int x, y;
     SDL_GetWindowPosition(w, &x, &y);
-    x += gx - ui.drag_gx; y += gy - ui.drag_gy;
-    ui_snap_next_to_main(w, &x, &y);
-    SDL_SetWindowPosition(w, x, y);
-    ui.drag_gx = gx; ui.drag_gy = gy;
+    int ox = x, oy = y;
+    if (ui.drag_rx != x) {
+        *ax = gx;
+        if (ui.drag_rx < x) ui.drag_wxlo = x; else ui.drag_wxhi = x;
+    }
+    if (ui.drag_ry != y) {
+        *ay = gy;
+        if (ui.drag_ry < y) ui.drag_wylo = y; else ui.drag_wyhi = y;
+    }
+    x += gx - *ax; y += gy - *ay;
+    if (snap == 2) {
+        int mx, my, mw, mh;
+        SDL_GetWindowPosition(ui.wmain, &mx, &my);
+        SDL_GetWindowSize(ui.wmain, &mw, &mh);
+        int snapped = 0;
+        if (abs(y - (my + mh)) <= DOCK_SNAP) { y = my + mh; snapped = 1; }
+        if (snapped && abs(x - mx) <= DOCK_SNAP) x = mx;
+        ui.pl_docked = snapped;
+    } else if (snap == 1) {
+        ui_snap_next_to_main(w, &x, &y);
+    }
+    int clx = 0, cly = 0;
+    if (ui.drag_wxlo && x < ui.drag_wxlo) { x = ui.drag_wxlo; clx = 1; }
+    if (ui.drag_wxhi && x > ui.drag_wxhi) { x = ui.drag_wxhi; clx = 1; }
+    if (ui.drag_wylo && y < ui.drag_wylo) { y = ui.drag_wylo; cly = 1; }
+    if (ui.drag_wyhi && y > ui.drag_wyhi) { y = ui.drag_wyhi; cly = 1; }
+    if (clx) *ax = gx;
+    if (cly) *ay = gy;
+    if (x != ui.drag_rx || y != ui.drag_ry) SDL_SetWindowPosition(w, x, y);
+    ui.drag_rx = x; ui.drag_ry = y;
+    *ax += x - ox; *ay += y - oy;
 }
+
+/* main window drag: no snap */
+static void drag_move(SDL_Window *w) { drag_step(w, 0, &ui.drag_gx, &ui.drag_gy); }
+
+/* file/eq/options drag: live-snap beside main, follows main until
+   dragged away */
+static void drag_move_snap(SDL_Window *w) { drag_step(w, 1, &ui.drag_gx, &ui.drag_gy); }
 
 /* playlist drag: live-snap flush under the main window's bottom edge,
    x-aligned, within DOCK_SNAP px; docked state follows live like the
    side-snapped windows so it keeps following main until dragged away */
-static void drag_move_pl(void) {
-    int gx, gy;
-    SDL_GetGlobalMouseState(&gx, &gy);
-    int x, y;
-    SDL_GetWindowPosition(ui.wpl, &x, &y);
-    x += gx - ui.drag_gx; y += gy - ui.drag_gy;
-    int mx, my, mw, mh;
+static void drag_move_pl(void) { drag_step(ui.wpl, 2, &ui.drag_gx, &ui.drag_gy); }
+
+/* Refusal-aware follow move for the windows the main drag (3) carries:
+   same discipline as drag_step — a refusal becomes a wall for the rest of
+   the drag, deeper targets clamp away from it, and a request identical to
+   the last is skipped — but the target is fully determined by main's live
+   position, so there is no anchor to manage. Without this, a docked or
+   snapped carry-over window pinned at a screen edge receives a fresh
+   REFUSED position request per motion event, and each refused request
+   costs SDL's X11 backend up to 100 ms of polling (see drag_step): the
+   event loop starves and the desktop pops "app not responding". A window
+   first seen in this drag baselines on its TRUE position so a mid-drag
+   dock or snap cannot fabricate a refusal. */
+static void follow_move(SDL_Window *w, struct FollowState *fs, int x, int y) {
+    int tx, ty;
+    SDL_GetWindowPosition(w, &tx, &ty);
+    if (!fs->valid) {
+        fs->rx = tx; fs->ry = ty;
+        fs->xlo = fs->xhi = fs->ylo = fs->yhi = 0;
+        fs->valid = 1;
+    } else {
+        if (fs->rx != tx) { if (fs->rx < tx) fs->xlo = tx; else fs->xhi = tx; }
+        if (fs->ry != ty) { if (fs->ry < ty) fs->ylo = ty; else fs->yhi = ty; }
+    }
+    if (fs->xlo && x < fs->xlo) x = fs->xlo;
+    if (fs->xhi && x > fs->xhi) x = fs->xhi;
+    if (fs->ylo && y < fs->ylo) y = fs->ylo;
+    if (fs->yhi && y > fs->yhi) y = fs->yhi;
+    if (x != fs->rx || y != fs->ry) SDL_SetWindowPosition(w, x, y);
+    fs->rx = x; fs->ry = y;
+}
+
+/* End of a window drag that met a WM wall: kick the window 1 px off that
+   wall, opposite the direction it was pushed. A window left pinned
+   exactly at the clamp boundary feels sticky on the next grab; one pixel
+   clear, the first motion of a new drag moves freely. The wall values are
+   the last ACCEPTED (truth) positions recorded by drag_step/search.c, so
+   the bounce lands inside the WM's clamp and is honoured. No wall -> no
+   move. */
+void ui_drag_bounce(SDL_Window *w, int xlo, int xhi, int ylo, int yhi) {
+    int x, y, move = 0;
+    SDL_GetWindowPosition(w, &x, &y);
+    if (xlo && x <= xlo) { x = xlo + 1; move = 1; }
+    else if (xhi && x >= xhi) { x = xhi - 1; move = 1; }
+    if (ylo && y <= ylo) { y = ylo + 1; move = 1; }
+    else if (yhi && y >= yhi) { y = yhi - 1; move = 1; }
+    if (move) SDL_SetWindowPosition(w, x, y);
+}
+
+/* The wall-facing window need not be the dragged one: with a docked or
+   snapped window between main and the wall, pushing MAIN into the wall
+   pins the carried window at its own clamp (follow_move) while main keeps
+   travelling until its clamp or its travel stops — main then sits inside
+   or overlapping the pinned window. On main's release, pull main back to
+   the dock position flush against every carried window it overshoots
+   (per axis: a carried window at truth t with snap offset d must end up
+   at main+d, so main returns to t-d on that axis). Only overshoot is
+   corrected — a gap the user opened deliberately stays. This REPLACES
+   the wall kick for main's release: the dock position is already clear of
+   the wall, and kicking would tear the flush dock open again. */
+static int drag_dock_restore(void) {
+    int mx, my;
     SDL_GetWindowPosition(ui.wmain, &mx, &my);
-    SDL_GetWindowSize(ui.wmain, &mw, &mh);
-    int snapped = 0;
-    if (abs(y - (my + mh)) <= DOCK_SNAP) { y = my + mh; snapped = 1; }
-    if (snapped && abs(x - mx) <= DOCK_SNAP) x = mx;
-    ui.pl_docked = snapped;
-    SDL_SetWindowPosition(ui.wpl, x, y);
-    ui.drag_gx = gx; ui.drag_gy = gy;
+    struct { SDL_Window *w; int dx, dy; } c[5];
+    int n = 0;
+    if (ui.pl_docked && ui.pl_visible) {
+        c[n].w = ui.wpl; c[n].dx = 0; c[n].dy = MAIN_H; n++;
+    }
+    for (int i = 0; i < 4; i++)
+        if (ui.snap[i].w) { c[n].w = ui.snap[i].w; c[n].dx = ui.snap[i].dx; c[n].dy = ui.snap[i].dy; n++; }
+    int moved = 0;
+    for (int i = 0; i < n; i++) {
+        int tx, ty;
+        SDL_GetWindowPosition(c[i].w, &tx, &ty);
+        if (c[i].dx < 0 && mx < tx - c[i].dx) { mx = tx - c[i].dx; moved = 1; }
+        else if (c[i].dx > 0 && mx > tx - c[i].dx) { mx = tx - c[i].dx; moved = 1; }
+        if (c[i].dy < 0 && my < ty - c[i].dy) { my = ty - c[i].dy; moved = 1; }
+        else if (c[i].dy > 0 && my > ty - c[i].dy) { my = ty - c[i].dy; moved = 1; }
+    }
+    if (moved) SDL_SetWindowPosition(ui.wmain, mx, my);
+    return moved;
 }
 
 static Uint32 col(SDL_Surface *s, int r, int g, int b) { return SDL_MapRGB(s->format, r, g, b); }
@@ -336,7 +581,11 @@ static void draw_main(void) {
 
     int tx = R_TSCROLL.x + 2, tw = R_TSCROLL.w - 4;
     ui.marquee = 0;
-    if (ui.vis_on) {
+    if (ui.msg[0]) {
+        /* transient rescan feedback outranks even the viz bars: the strip
+           carries the message, plain red, for its 10 s */
+        font_puts16(s, tx, R_TSCROLL.y + 1, ui.msg, col(s, 255, 60, 60));
+    } else if (ui.vis_on) {
         static float bars[VIZ_BARS], smooth[VIZ_BARS];
         static Uint32 viz_last;
         int16_t snap[4096];
@@ -509,6 +758,7 @@ static void draw_pl(void) {
         case PB_REM: lbl = "REM"; break;
         case PB_CLOSE: lbl = "CLO"; break;
         case PB_LIB: lbl = "LIB"; break;
+        case PB_SCAN: lbl = "SCAN"; break;
         }
         font_puts(s, b->r->x + (b->r->w - font_w(lbl)) / 2, b->r->y + 3, lbl, c);
     }
@@ -544,7 +794,7 @@ static void draw_pl(void) {
         if ((int)strlen(line) > fit) line[fit] = 0;
         Uint32 c = col(s, 170, 170, 170);
         if (idx == p->cur) c = col(s, 0, 255, 0);
-        else if (idx == ui.pl_sel || ui.pl_selall) c = col(s, 255, 255, 255);
+        else if (ui.pl_selall || pl_sel_has(idx)) c = col(s, 255, 255, 255);
         font_puts16(s, ptext.x + 2, ptext.y + 1 + i * 17, line, c);
     }
 
@@ -555,6 +805,16 @@ static void draw_pl(void) {
         int ty = pscroll.y + (pscroll.h - th) * ui.pl_scroll / (pl->count - lines);
         SDL_Rect r = {pscroll.x + 1, ty, pscroll.w - 2, th};
         SDL_FillRect(s, &r, col(s, 110, 110, 110));
+    }
+
+    /* row-drag (12): drop-index highlight — a green hairline at the gap
+       the block will land at, clamped to the visible rows */
+    if (ui.drag == 12 && ui.pl_drop >= 0) {
+        int dy = ptext.y + (ui.pl_drop - ui.pl_scroll) * 17;
+        if (dy < ptext.y) dy = ptext.y;
+        if (dy > ptext.y + lines * 17 - 1) dy = ptext.y + lines * 17 - 1;
+        SDL_Rect r = {ptext.x, dy, ptext.w, 1};
+        SDL_FillRect(s, &r, col(s, 0, 255, 0));
     }
 
     /* totals, pinned to the bottom edge */
@@ -574,6 +834,23 @@ static void draw_pl(void) {
             SDL_FillRect(s, &r, ghi);
             if (d < 10) { SDL_Rect q = {r.x - 1, r.y + 1, 1, 1}; SDL_FillRect(s, &q, glo); }
         }
+
+    if (ui.pl_menu) {
+        /* dark sheet over everything, same shape as the MAIN dropdown:
+           two columns of flat labels, the hit rects are pl_menu_item_rect */
+        int cols = (PM_N + PL_MENU_ROWS - 1) / PL_MENU_ROWS;
+        SDL_Rect mb = { 2, 2, cols * 90, PL_MENU_ROWS * 13 };
+        SDL_FillRect(s, &mb, col(s, 40, 40, 40));
+        SDL_Rect t = { mb.x, mb.y, mb.w, 1 }, b = { mb.x, mb.y + mb.h - 1, mb.w, 1 };
+        SDL_Rect l = { mb.x, mb.y, 1, mb.h }, r = { mb.x + mb.w - 1, mb.y, 1, mb.h };
+        Uint32 bc = col(s, 140, 140, 140);
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        for (int i = 0; i < PM_N; i++) {
+            Rect ir = pl_menu_item_rect(i);
+            font_puts(s, ir.x + 8, ir.y + 3, PL_MENU[i].lbl, col(s, 220, 220, 220));
+        }
+    }
     pthread_mutex_unlock(&p->mtx);
 }
 
@@ -609,19 +886,17 @@ static void draw_eq(void) {
     { Rect x = close_rect(EQ_W); draw_x(s, &x, ui.pressed == EQB_X); }
 
     int eq_on = eq_enabled(&p->eq);
-    Rect on = {10, 28, 30, 12};
+    Rect on = eq_on_rect();
     skin_button(s, &on, ui.pressed == EQB_ON, eq_on);
-    font_puts(s, 16, 31, eq_on ? "ON" : "OFF",
+    const char *onl = eq_on ? "ON" : "OFF";
+    font_puts(s, on.x + (on.w - font_w(onl)) / 2, on.y + 3, onl,
               eq_on ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
 
-    static const struct { int id; const char *l; int x, w; } PRE[] = {
-        {EQB_FLAT, "FLAT", 48, 34}, {EQB_ROCK, "ROCK", 86, 34},
-        {EQB_POP, "POP", 124, 30}, {EQB_JAZZ, "JAZZ", 158, 34},
-    };
-    for (size_t i = 0; i < sizeof PRE / sizeof PRE[0]; i++) {
-        Rect r = {PRE[i].x, 132, PRE[i].w, 12};
-        skin_button(s, &r, ui.pressed == PRE[i].id, 0);
-        font_puts(s, r.x + (r.w - font_w(PRE[i].l)) / 2, 135, PRE[i].l, col(s, 220, 220, 220));
+    for (size_t i = 0; i < sizeof EQ_PRE / sizeof EQ_PRE[0]; i++) {
+        Rect r = {EQ_PRE[i].x, EQ_PRE_Y, EQ_PRE[i].w, 12};
+        skin_button(s, &r, ui.pressed == EQ_PRE[i].id, 0);
+        font_puts(s, r.x + (r.w - font_w(EQ_PRE[i].l)) / 2, EQ_PRE_Y + 3,
+                  EQ_PRE[i].l, col(s, 220, 220, 220));
     }
 
     /* preamp */
@@ -676,7 +951,16 @@ static void refresh_title(void) {
     if (strcmp(buf, ui.title) != 0) {
         lv_strlcpy(ui.title, buf, sizeof ui.title);
         ui.scroll_off = 0;
+        ui.msg[0] = 0;   /* a real title change preempts the transient red
+                            line, unless something else replaces it */
     }
+}
+
+/* transient red feedback over the title strip, 10 s (main-loop expiry):
+   kept short by every caller so it never needs the marquee path */
+static void ui_msg(const char *text) {
+    lv_strlcpy(ui.msg, text, sizeof ui.msg);
+    ui.msg_at = SDL_GetTicks();
 }
 
 /* ---------- built-in open file/folder browser ---------- */
@@ -809,7 +1093,9 @@ static void file_list(void) {
                 dirs = d2;
             }
             dirs[nd++] = dup;
-        } else if (audio_name(de->d_name)) {
+        } else if (audio_name(de->d_name) || ui.file_saving) {
+            /* SAVE mode lists every file (no audio filter): the user must
+               see the .m3u they aim to overwrite */
             if (nf == cf) {
                 cf = cf ? cf * 2 : 32;
                 char **f2 = realloc(files, (size_t)cf * sizeof *files);
@@ -928,6 +1214,7 @@ static void focus_click_drag(Uint32 wid) {
 static void file_close(void) {
     ui.file_visible = 0;
     ui.file_focus = 0;
+    ui.file_saving = 0;
     if (ui.wfile) SDL_HideWindow(ui.wfile);
 }
 
@@ -978,6 +1265,47 @@ static void file_adddir(void) {
     file_close();
 }
 
+/* ---- SAVE mode (playlist Save-As, decision D4: .m3u EXTINF is the only
+   format we write; overwrite is silent, an empty list refuses via the
+   title-strip ui_msg — the browser only ever opens from a non-empty list,
+   the recheck guards the race where REM emptied it meanwhile) ---- */
+static void file_save_to(const char *path) {
+    Player *p = ui.pl;
+    /* the save reads every row: one micro-hold, an m3u dump is a fast
+       sequential write with no tag I/O */
+    pthread_mutex_lock(&p->mtx);
+    int rc = p->pl->count == 0 ? -1 : pl_save_m3u(p->pl, path);
+    pthread_mutex_unlock(&p->mtx);
+    if (rc) {
+        ui.file_err = 1;              /* same ~1 s red feedback as open mode */
+        ui.file_err_at = SDL_GetTicks();
+        return;
+    }
+    file_close();                     /* also clears file_saving */
+}
+
+static void file_save_enter(void) {
+    if (!ui.file_field[0]) return;
+    struct stat st;
+    if (stat(ui.file_field, &st) == 0 && S_ISDIR(st.st_mode)) {
+        lv_strlcpy(ui.file_dir, ui.file_field, sizeof ui.file_dir);
+        ui.file_pseudo = 0;
+        file_list();
+        return;
+    }
+    /* a bare name lands in the folder being shown; no extension -> .m3u */
+    char full[LV_MAX_PATH];
+    if (lv_is_abs(ui.file_field)) lv_strlcpy(full, ui.file_field, sizeof full);
+    else lv_path_join(full, sizeof full, ui.file_dir, ui.file_field);
+    const char *base = lv_strrsep(full);
+    base = base ? base + 1 : full;
+    if (!strrchr(base, '.')) {
+        size_t fl = strlen(full);
+        if (fl + 5 < sizeof full) snprintf(full + fl, sizeof full - fl, ".m3u");
+    }
+    file_save_to(full);
+}
+
 static void file_choose(const char *name) {
 #ifdef _WIN32
     if (ui.file_pseudo) {
@@ -1021,6 +1349,10 @@ static void file_choose(const char *name) {
         return;
     }
     Player *p = ui.pl;
+    if (ui.file_saving) {          /* SAVE mode: clicking a file overwrites it */
+        file_save_to(full);
+        return;
+    }
     LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
     pthread_mutex_lock(&p->mtx);
     int added = pl_add(p->pl, full);
@@ -1082,7 +1414,8 @@ static void draw_file(void) {
     SDL_Surface *s = ui.sfile;
     if (!s) return;
     skin_window_bg(s, FILE_W, FILE_H);
-    font_puts(s, 10, 6, "OPEN FILE OR FOLDER", col(s, 0, 224, 255));
+    font_puts(s, 10, 6, ui.file_saving ? "SAVE PLAYLIST" : "OPEN FILE OR FOLDER",
+              col(s, 0, 224, 255));
     { Rect x = close_rect(FILE_W); draw_x(s, &x, ui.pressed == FB_X); }
     FILE_LIST_RECT;
     FILE_FLD_RECT;
@@ -1144,8 +1477,10 @@ static void draw_file(void) {
         SDL_Rect r = {list.x + list.w - 7, ty, 5, th};
         SDL_FillRect(s, &r, col(s, 110, 110, 110));
     }
-    skin_button(s, &addb, ui.pressed == FB_ADDDIR, 0);
-    font_puts(s, addb.x + (addb.w - font_w("ADD DIR")) / 2, addb.y + 3, "ADD DIR", col(s, 220, 220, 220));
+    if (!ui.file_saving) {          /* ADD DIR is meaningless in SAVE mode */
+        skin_button(s, &addb, ui.pressed == FB_ADDDIR, 0);
+        font_puts(s, addb.x + (addb.w - font_w("ADD DIR")) / 2, addb.y + 3, "ADD DIR", col(s, 220, 220, 220));
+    }
     char dir[LV_MAX_PATH];
 #ifdef _WIN32
     if (ui.file_pseudo) lv_strlcpy(dir, "COMPUTER", sizeof dir);
@@ -1170,7 +1505,7 @@ static void handle_file_mouse(SDL_Event *e) {
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
         Rect xc = close_rect(FILE_W);
         if (in_rect(&xc, x, y)) { ui.pressed = FB_X; return; }
-        if (in_rect(&addb, x, y)) { ui.pressed = FB_ADDDIR; return; }
+        if (in_rect(&addb, x, y)) { if (!ui.file_saving) ui.pressed = FB_ADDDIR; return; }
         if (in_rect(&fld, x, y)) {
             /* caret to end like the opt fields; the field already mirrors
                the current folder whenever it is unfocused */
@@ -1195,7 +1530,10 @@ static void handle_file_mouse(SDL_Event *e) {
         if (ui.pressed == FB_X && in_rect(&xc, x, y)) file_close();
         else if (ui.pressed == FB_ADDDIR && in_rect(&addb, x, y)) file_adddir();
         ui.pressed = B_NONE;
-        if (ui.drag == 9) ui.drag = 0;
+        if (ui.drag == 9) {
+            ui_drag_bounce(ui.wfile, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
+            ui.drag = 0;
+        }
     } else if (e->type == SDL_MOUSEMOTION && ui.drag == 9) {
         drag_move_snap(ui.wfile);
     } else if (e->type == SDL_MOUSEWHEEL) {
@@ -1211,6 +1549,7 @@ static void handle_file_mouse(SDL_Event *e) {
    "path not valid" for ~1 s with the typed text UNTOUCHED (the browser
    stays put so the entry can be corrected). */
 static void file_field_enter(void) {
+    if (ui.file_saving) { file_save_enter(); return; }
     if (!ui.file_field[0]) return;
     struct stat st;
     if (stat(ui.file_field, &st) == 0) {
@@ -1351,7 +1690,7 @@ static void opt_open(void) {
     ui.opt_large = cfg.allow_large > 0;
     ui.opt_f10 = cfg.ui_always10 > 0;
     ui.opt_enc = cfg.tag_legacy_enc + 1;   /* LV_ENC_AUTO(-1) -> cycle 0 */
-    if (ui.opt_enc < 0 || ui.opt_enc > 3) ui.opt_enc = 0;
+    if (ui.opt_enc < 0 || ui.opt_enc > 4) ui.opt_enc = 0;
     ui.opt_adv = 0;
     ui.opt_hover = -1;
     ui.opt_focus = -1;
@@ -1575,14 +1914,14 @@ static void draw_opt(void) {
         skin_button(s, &r2, ui.pressed == OPTB_TFPS, ui.opt_f10);
         font_puts(s, r2.x + (r2.w - font_w("10FPS")) / 2, r2.y + 3, "10FPS",
                   ui.opt_f10 ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
-        /* 4-state cycle button (NOT a checkbox): label shows the current
+        /* 5-state cycle button (NOT a checkbox): label shows the current
            override for legacy 8-bit tag fields */
         font_puts(s, 10, 146, "LEGACY: tag fields", col(s, 220, 220, 220));
         font_puts(s, 10, 160, "with no declared encoding", col(s, 220, 220, 220));
         Rect r3 = opt_enc_rect();
         skin_button(s, &r3, ui.pressed == OPTB_TENC, 0);
-        static const char *ENCL[4] = { "AUTO", "LATIN-1", "CP1251", "UTF-8" };
-        const char *el = ENCL[ui.opt_enc & 3];
+        static const char *ENCL[5] = { "AUTO", "LATIN-1", "CP1251", "UTF-8", "SHIFT-JIS" };
+        const char *el = ENCL[ui.opt_enc % 5];
         font_puts(s, r3.x + (r3.w - font_w(el)) / 2, r3.y + 3, el,
                   ui.opt_enc ? col(s, 0, 224, 255) : col(s, 220, 220, 220));
     }
@@ -1688,7 +2027,7 @@ static void handle_opt_mouse(SDL_Event *e) {
             else if (ui.pressed == OPTB_TLARGE && in_rect(&tg0, x, y)) ui.opt_large = !ui.opt_large;
             else if (ui.pressed == OPTB_TFPS && in_rect(&tf0, x, y)) ui.opt_f10 = !ui.opt_f10;
             else if (ui.pressed == OPTB_TENC && in_rect(&te0, x, y)) {
-                ui.opt_enc = (ui.opt_enc + 1) % 4;
+                ui.opt_enc = (ui.opt_enc + 1) % 5;
                 tag_set_legacy_default(ui.opt_enc - 1); /* live effect; SAVE persists */
             }
             else if (ui.pressed == OPTB_SAVE && in_rect(&sv, x, y)) opt_save();
@@ -1717,7 +2056,10 @@ static void handle_opt_mouse(SDL_Event *e) {
             }
             ui.pressed = B_NONE;
         }
-        if (ui.drag == 11) ui.drag = 0;
+        if (ui.drag == 11) {
+            ui_drag_bounce(ui.wopt, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
+            ui.drag = 0;
+        }
     } else if (e->type == SDL_MOUSEMOTION && ui.drag == 11) {
         drag_move_snap(ui.wopt);
     } else if (e->type == SDL_MOUSEMOTION) {
@@ -1824,13 +2166,24 @@ static void action(int id) {
             ui.pl_sel = -1;
             ui.pl_scroll = 0;
             ui.pl_selall = 0;
-        } else if (ui.pl_sel >= 0 && ui.pl_sel < p->pl->count) {
-            if (ui.pl_sel == p->cur) pl_post(p, CMD_STOP, 0);
+            pl_sel_reset();
+        } else if (ui.pl_multi_n > 0) {
+            /* multi-removal: walk the sorted set high-to-low so removals
+               never shift a still-pending index; p->cur drops by the number
+               of removed rows below it (CMD_STOP keeps p->cur, exactly as
+               the single-row path relied on: deleting the current row lets
+               cur fall onto its successor) */
+            if (p->cur >= 0 && pl_sel_has(p->cur)) pl_post(p, CMD_STOP, 0);
+            int below = 0;
+            for (int i = 0; i < ui.pl_multi_n && p->cur >= 0; i++)
+                if (ui.pl_multi[i] < p->cur) below++; else break;
             pthread_mutex_lock(&p->mtx);
-            pl_remove(p->pl, ui.pl_sel);
-            if (p->cur > ui.pl_sel) p->cur--;
+            for (int i = ui.pl_multi_n - 1; i >= 0; i--)
+                pl_remove(p->pl, ui.pl_multi[i]);  /* stale-high clamped inside */
+            if (p->cur >= 0) p->cur -= below;
             pthread_mutex_unlock(&p->mtx);
             ui.pl_sel = -1;
+            pl_sel_reset();
         }
         break;
     case PB_CLOSE:
@@ -1856,6 +2209,51 @@ static void action(int id) {
         }
         pthread_mutex_unlock(&p->mtx);
         lib_index_free(&ix);
+        break;
+    }
+    case PB_SCAN: {
+        /* Re-probe every SELECTED row (tags + duration) and update each
+           index row in place — the antidote to the "stale by design" rule.
+           Multi-selection is bounded by what the user clicked; the ctrl-a
+           select-all state stays a deliberate no-op (decision D: a whole-
+           playlist probe on the UI thread can stall on network shares).
+           CUE virtual rows skip (their tags live in the parent .cue); never
+           during a background scan (the scan thread appends to the very
+           index being rewritten). Decision F: a failure leaves that row's
+           index entry untouched, reports in the "cannot decode" house style
+           to stdout, and shows red on the title strip for 10 s (preemptable
+           by a real title change); one summary message covers the batch. */
+        ui.msg[0] = 0;                      /* a fresh attempt clears the old error */
+        if (ui.pl_selall || ui.pl_multi_n == 0) break;
+        if (ui.opt_scanning) { ui_msg("  scan running, wait"); break; }
+        int fails = 0;
+        for (int k = 0; k < ui.pl_multi_n; k++) {
+            int sel = ui.pl_multi[k];
+            char path[LV_MAX_PATH];
+            path[0] = 0;
+            pthread_mutex_lock(&p->mtx);
+            if (sel >= 0 && sel < p->pl->count && p->pl->items[sel].end_sec == 0)
+                lv_strlcpy(path, p->pl->items[sel].path, sizeof path);
+            pthread_mutex_unlock(&p->mtx);
+            if (!path[0]) continue;         /* stale index / virtual row */
+            Tags nt;
+            int ndur = 0, nnotag = 0;
+            if (lib_index_rescan(path, &nt, &ndur, &nnotag) != 0) {
+                fprintf(stderr, "levari: cannot rescan %s\n", path);
+                fails = 1;
+                continue;
+            }
+            /* apply the fresh values to the Track — micro-lock hold, path-guarded
+               write-back exactly like pl_scan_tags (the row may have moved) */
+            pthread_mutex_lock(&p->mtx);
+            if (sel < p->pl->count && !strcmp(p->pl->items[sel].path, path)) {
+                p->pl->items[sel].tags = nt;
+                if (ndur) p->pl->items[sel].duration = ndur;
+                p->pl->items[sel].notag = nnotag;
+            }
+            pthread_mutex_unlock(&p->mtx);
+        }
+        if (fails) ui_msg("  cannot rescan");
         break;
     }
     case B_OPEN: case PB_ADD: file_open(); break;
@@ -1907,7 +2305,13 @@ static void handle_main_mouse(SDL_Event *e) {
             if (p->pan > 32) p->pan = 32;
             return;
         }
-        if (y < 22) { ui.drag = 3; drag_begin(ui.wmain); }
+        if (y < 22) {
+            ui.drag = 3; drag_begin(ui.wmain);
+            /* follow bookkeeping is drag-scoped too: re-baseline every
+               carried window on its first follow step (follow_move) */
+            ui.follow_pl.valid = 0;
+            for (int i = 0; i < 4; i++) ui.follow_snap[i].valid = 0;
+        }
     } else if (e->type == SDL_MOUSEBUTTONUP && ui.drag == 0 && ui.pressed != B_NONE) {
         Rect xc = close_rect(MAIN_W);
         if (ui.pressed == B_XMAIN && in_rect(&xc, x, y)) {
@@ -1932,14 +2336,262 @@ static void handle_main_mouse(SDL_Event *e) {
             int wx, wy;
             SDL_GetWindowPosition(ui.wmain, &wx, &wy);
             if (ui.pl_docked && ui.pl_visible)
-                SDL_SetWindowPosition(ui.wpl, wx, wy + MAIN_H);
+                follow_move(ui.wpl, &ui.follow_pl, wx, wy + MAIN_H);
             for (int i = 0; i < 4; i++)
                 if (ui.snap[i].w)
-                    SDL_SetWindowPosition(ui.snap[i].w, wx + ui.snap[i].dx, wy + ui.snap[i].dy);
+                    follow_move(ui.snap[i].w, &ui.follow_snap[i], wx + ui.snap[i].dx, wy + ui.snap[i].dy);
         }
     }
     if (e->type == SDL_MOUSEBUTTONUP) {
+        if (ui.drag == 3) {
+            /* wall-facing carried window -> main jumps back flush to the
+               dock instead of the wall kick (drag_dock_restore) */
+            if (!drag_dock_restore())
+                ui_drag_bounce(ui.wmain, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
+        }
         if (ui.drag == 1 || ui.drag == 2 || ui.drag == 3 || ui.drag == 10) ui.drag = 0;
+    }
+}
+
+/* OS file drop (SDL_DROPBEGIN / SDL_DROPFILE* / SDL_DROPCOMPLETE): files
+   dragged from the desktop onto the main or playlist window are buffered
+   and applied as ONE batch on DROPCOMPLETE — a single off-lock index load
+   plus one lock hold, the file-browser add pattern. Files append in
+   arrival order; folders recurse through pl_add's dir probe; playlist
+   files route through their loader by pl_ext_kind (relative entries in a
+   dropped .m3u/.pls resolve against the list's own dir). The brackets are
+   emitted by every backend that does drops, but a DROPFILE arriving with
+   no open session opens one implicitly so a backend omitting the brackets
+   still lands its files. */
+static char **drop_paths;
+static int drop_n, drop_cap;
+static int drop_open;
+
+static void drop_add(const char *path) {
+    if (drop_n == drop_cap) {
+        int cap = drop_cap ? drop_cap * 2 : 16;
+        char **n2 = realloc(drop_paths, (size_t)cap * sizeof *drop_paths);
+        if (!n2) return;
+        drop_paths = n2; drop_cap = cap;
+    }
+    char *dup = strdup(path);
+    if (!dup) return;
+    drop_paths[drop_n++] = dup;
+}
+
+static void drop_flush(void) {
+    Player *p = ui.pl;
+    int n = drop_n;
+    drop_n = 0;
+    if (!n) return;
+    LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
+    pthread_mutex_lock(&p->mtx);
+    int old = p->pl->count;
+    for (int i = 0; i < n; i++) {
+        PlKind kind = pl_ext_kind(drop_paths[i]);
+        if (kind == PL_M3U) pl_load_m3u(p->pl, drop_paths[i]);
+        else if (kind == PL_PLS) pl_load_pls(p->pl, drop_paths[i]);
+        else if (kind == PL_CUE) pl_load_cue(p->pl, drop_paths[i]);
+        else pl_add(p->pl, drop_paths[i]);
+    }
+    lib_fill_playlist_ix(p->pl, &ix);
+    int added = p->pl->count - old;
+    pthread_mutex_unlock(&p->mtx);
+    lib_index_free(&ix);
+    for (int i = 0; i < n; i++) free(drop_paths[i]);
+    /* play the first NEW row (file_adddir's tail); a batch of nothing new
+       must not stop or restart the running track */
+    if (added > 0) pl_post(p, CMD_PLAY, old);
+}
+
+/* ---- playlist edit actions (menu items and shortcuts converge here) ---- */
+
+/* scratch: the materialized, group-expanded selection for the edit
+   actions (grown on demand; never NULL-freed to shrink, house style) */
+static int *pl_edit_sel;
+static int pl_edit_sel_cap;
+
+/* the selection as the edit actions see it: ctrl-a collapses to rows,
+   stale indices clamp, then rows grow to whole CUE groups. Returns the
+   expanded row count (0 = nothing selected), -1 on OOM. Needs p->mtx. */
+static int pl_sel_material(Playlist *pl) {
+    int n = ui.pl_selall ? pl->count : ui.pl_multi_n;
+    if (n <= 0) return 0;
+    if (pl_edit_sel_cap < pl->count * 2) {
+        int *g = realloc(pl_edit_sel, (size_t)pl->count * 2 * sizeof *g);
+        if (!g) return -1;
+        pl_edit_sel = g;
+        pl_edit_sel_cap = pl->count * 2;
+    }
+    if (ui.pl_selall) {
+        for (int i = 0; i < pl->count; i++) pl_edit_sel[i] = i;
+        n = pl->count;
+    } else {
+        int k = 0;
+        for (int i = 0; i < ui.pl_multi_n; i++)
+            if (ui.pl_multi[i] >= 0 && ui.pl_multi[i] < pl->count)
+                pl_edit_sel[k++] = ui.pl_multi[i];
+        n = k;
+        if (!n) return 0;
+    }
+    int en = pl_sel_expand(pl, pl_edit_sel, n, pl_edit_sel + pl->count);
+    if (en < 0) return -1;
+    memcpy(pl_edit_sel, pl_edit_sel + pl->count, (size_t)en * sizeof *pl_edit_sel);
+    return en;
+}
+
+/* membership against the LIVE selection (pre-expansion): conservative,
+   same lookup the PB_REM stop-check uses — a row kept only because its
+   group grew around the selection may see an over-eager stop, which is
+   always safe (CMD_STOP never touches p->cur) */
+static int pl_sel_live_has(int idx) {
+    if (idx < 0) return 0;
+    if (ui.pl_selall) return 1;
+    return pl_sel_has(idx);
+}
+
+static void pl_edit_clear_sel(void) {
+    ui.pl_sel = -1;
+    ui.pl_selall = 0;
+    pl_sel_reset();
+}
+
+/* row-drag (12) release: move the live group-expanded selection to the
+   gap. pl_drop remaps pl_edit_sel onto the landed rows, and the set
+   rides along (the PM_MUP/PM_MDOWN pattern) so repeated drags compose. */
+static void pl_drop_apply(void) {
+    Player *p = ui.pl;
+    pthread_mutex_lock(&p->mtx);
+    int n = pl_sel_material(p->pl);
+    if (n > 0) {
+        int cur = p->cur;
+        pl_drop(p->pl, pl_edit_sel, n, ui.pl_drop, &cur);
+        p->cur = cur;
+        if (pl_multi_grow(n) == 0) {
+            memcpy(ui.pl_multi, pl_edit_sel, (size_t)n * sizeof *ui.pl_multi);
+            ui.pl_multi_n = n;
+            ui.pl_selall = 0;
+            ui.pl_sel = ui.pl_multi[n - 1];
+        }
+    }
+    pthread_mutex_unlock(&p->mtx);
+}
+
+static void pl_saveas_open(void) {
+    Player *p = ui.pl;
+    pthread_mutex_lock(&p->mtx);
+    int n = p->pl->count;
+    pthread_mutex_unlock(&p->mtx);
+    if (!n) { ui_msg("  playlist empty"); return; }   /* D7: empty refuses */
+    ui.file_saving = 1;
+    file_open();
+}
+
+static void pl_menu_action(int act) {
+    Player *p = ui.pl;
+    switch (act) {
+    case PM_SAVEAS:
+        pl_saveas_open();
+        break;
+    case PM_CLEAR:
+        /* select-all is already the proven destructive path in PB_REM
+           (stop + pl_clear + cur=-1 + sel reset): reuse it verbatim */
+        ui.pl_selall = 1;
+        action(PB_REM);
+        break;
+    case PM_STITLE: case PM_SARTIST: case PM_SALBUM: case PM_STRACK: case PM_SFILE:
+    case PM_REVERSE: case PM_SHUFFLE: {
+        static const int KEY[5] = { PL_SORT_TITLE, PL_SORT_ARTIST, PL_SORT_ALBUM,
+                                    PL_SORT_TRACK, PL_SORT_FILE };
+        pthread_mutex_lock(&p->mtx);
+        int cur = p->cur;
+        if (act == PM_REVERSE) {
+            srand((unsigned)SDL_GetTicks());   /* re-randomize every press (D6) */
+            pl_reverse(p->pl, &cur);
+        } else if (act == PM_SHUFFLE) {
+            srand((unsigned)SDL_GetTicks());
+            pl_shuffle(p->pl, &cur);
+        } else
+            pl_sort(p->pl, KEY[act - PM_STITLE], &cur);
+        p->cur = cur;                          /* permutation remapped: same MUSIC */
+        pthread_mutex_unlock(&p->mtx);
+        pl_edit_clear_sel();                   /* row indices lost their meaning */
+        break;
+    }
+    case PM_COPY:
+        pthread_mutex_lock(&p->mtx);
+        {
+            int n = pl_sel_material(p->pl);
+            if (n > 0 && pl_clip_copy(p->pl, pl_edit_sel, n) != 0)
+                ui_msg("  out of memory");     /* refused whole, old clip intact */
+        }
+        pthread_mutex_unlock(&p->mtx);
+        break;
+    case PM_CUT:
+        if (pl_sel_live_has(p->cur)) pl_post(p, CMD_STOP, 0);  /* multi-REM pattern */
+        pthread_mutex_lock(&p->mtx);
+        {
+            int n = pl_sel_material(p->pl);
+            int cur = p->cur;
+            if (n > 0) {
+                int before = pl_clip_count();
+                pl_clip_cut(p->pl, pl_edit_sel, n, &cur);
+                if (pl_clip_count() == before && n > 0) ui_msg("  out of memory");
+                p->cur = cur;
+            }
+        }
+        pthread_mutex_unlock(&p->mtx);
+        pl_edit_clear_sel();
+        break;
+    case PM_PASTE: {
+        pthread_mutex_lock(&p->mtx);
+        /* paste below the single selected row when there is one, else append */
+        int at = (!ui.pl_selall && ui.pl_multi_n == 1) ? ui.pl_multi[0] + 1
+                                                       : p->pl->count;
+        int cur = p->cur;
+        int rc = pl_clip_paste(p->pl, at, &cur);
+        p->cur = cur;
+        pthread_mutex_unlock(&p->mtx);
+        if (rc) ui_msg("  out of memory");
+        pl_edit_clear_sel();
+        break;
+    }
+    case PM_CROP:
+        /* an empty selection is a total no-op — it must not stop the track */
+        if ((ui.pl_selall || ui.pl_multi_n > 0) &&
+            p->cur >= 0 && !pl_sel_live_has(p->cur))
+            pl_post(p, CMD_STOP, 0);
+        pthread_mutex_lock(&p->mtx);
+        {
+            int n = pl_sel_material(p->pl);
+            int cur = p->cur;
+            if (n > 0) {
+                pl_crop(p->pl, pl_edit_sel, n, &cur);
+                p->cur = cur;
+            }
+        }
+        pthread_mutex_unlock(&p->mtx);
+        pl_edit_clear_sel();
+        break;
+    case PM_MUP: case PM_MDOWN:
+        pthread_mutex_lock(&p->mtx);
+        {
+            int n = pl_sel_material(p->pl);
+            if (n > 0) {
+                int cur = p->cur;
+                pl_move(p->pl, pl_edit_sel, n, act == PM_MDOWN ? 1 : -1, &cur);
+                p->cur = cur;
+                /* the selection rides along with the moved rows */
+                if (pl_multi_grow(n) == 0) {
+                    memcpy(ui.pl_multi, pl_edit_sel, (size_t)n * sizeof *ui.pl_multi);
+                    ui.pl_multi_n = n;
+                    ui.pl_selall = 0;
+                    ui.pl_sel = ui.pl_multi[n - 1];
+                }
+            }
+        }
+        pthread_mutex_unlock(&p->mtx);
+        break;
     }
 }
 
@@ -1950,6 +2602,26 @@ static void handle_pl_mouse(SDL_Event *e) {
     Rect ptext, pscroll;
     pl_layout(&ptext, &pscroll);
     int lines = ptext.h / 17;
+    if (e->type == SDL_MOUSEBUTTONDOWN) {
+        /* any press ends the previous press cycle: a lost release (the
+           event loop clears a latched drag on a button-less motion) must
+           never leave a deferred collapse/play riding on the next UP */
+        ui.pl_dbl = -1;
+        ui.pl_collapse = -1;
+    }
+    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_RIGHT) {
+        ui.pl_menu = 1;
+        return;
+    }
+    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT && ui.pl_menu) {
+        /* the menu eats one click: outside closes, inside fires and closes */
+        ui.pl_menu = 0;
+        for (int i = 0; i < PM_N; i++) {
+            Rect r = pl_menu_item_rect(i);
+            if (in_rect(&r, x, y)) { pl_menu_action(PL_MENU[i].act); break; }
+        }
+        return;
+    }
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
         Rect xc = close_rect(ui.pl_w);
         if (in_rect(&xc, x, y)) { ui.pressed = PB_X; return; }
@@ -1964,15 +2636,91 @@ static void handle_pl_mouse(SDL_Event *e) {
         if (in_rect(&ptext, x, y)) {
             int idx = ui.pl_scroll + (y - ptext.y) / 17;
             if (idx < pl->count) {
-                ui.pl_sel = idx;
-                ui.pl_selall = 0;
-                if (e->button.clicks == 2) pl_post(p, CMD_PLAY, idx);
+                /* SDL2 mouse-button events carry no modifier mask — the
+                   physical keyboard state is the only truth at click time */
+                const Uint8 *ks = SDL_GetKeyboardState(NULL);
+                int ctrl = ks[SDL_SCANCODE_LCTRL] || ks[SDL_SCANCODE_RCTRL];
+                int shift = ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT];
+                if (ctrl) {
+                    if (ui.pl_selall) {
+                        pl_sel_materialize(pl->count);
+                        ui.pl_selall = 0;
+                    }
+                    if (pl_sel_has(idx)) pl_sel_del(idx);
+                    else pl_sel_add(idx);
+                    ui.pl_sel = idx;   /* anchor follows the ctrl click */
+                } else if (shift && ui.pl_sel >= 0) {
+                    ui.pl_selall = 0;
+                    pl_sel_reset();
+                    int a = ui.pl_sel, b = idx;   /* anchor keeps its place,
+                                                     further shift-clicks extend */
+                    if (a > b) { int t = a; a = b; b = t; }
+                    if (b >= pl->count) b = pl->count - 1;  /* stale anchor past end */
+                    if (a <= b && pl_multi_grow(b - a + 1) == 0) {
+                        for (int i = a; i <= b; i++) ui.pl_multi[i - a] = i;
+                        ui.pl_multi_n = b - a + 1;
+                    } else {
+                        pl_sel_add(idx);
+                    }
+                } else {
+                    /* plain press. A press inside a multi-row selection
+                       DEFERS the collapse-to-one to release: a drag that
+                       starts inside the set carries the whole set (pl_drop
+                       group-expands), while a released click collapses to
+                       exactly the single row it always selected. Outside
+                       the set (or over ctrl-a) the collapse stays
+                       immediate. The row drag arms on every plain press;
+                       the drop only exists once motion past the threshold
+                       sets a gap, and the double-click play defers to
+                       release so a drag between the clicks eats it. */
+                    int keep = ui.pl_multi_n > 1 && !ui.pl_selall &&
+                               pl_sel_has(idx);
+                    ui.pl_collapse = keep ? idx : -1;
+                    if (!keep) {
+                        ui.pl_sel = idx;
+                        ui.pl_selall = 0;
+                        pl_sel_reset();
+                        pl_sel_add(idx);
+                    }
+                    ui.drag = 12;
+                    ui.pl_drop = -1;
+                    ui.pl_press_y = y;
+                    /* a modifier double-click still never plays (toggle
+                       semantics), and this branch only runs without them */
+                    ui.pl_dbl = (e->button.clicks == 2) ? idx : -1;
+                }
             }
             return;
         }
         if (in_rect(&pscroll, x, y)) { ui.drag = 5; return; }
         if (y < 22) { ui.drag = 4; drag_begin(ui.wpl); }
     } else if (e->type == SDL_MOUSEBUTTONUP) {
+        /* row-drag (12) first: applying the drop, and only then the
+           deferred click completions. A press that became a drag (a gap
+           was set past the arm threshold) neither collapses an
+           in-selection set nor plays the deferred double-click — the
+           plan's "double-click must not fire after a drag". */
+        int rowdrop = 0;
+        if (ui.drag == 12) {
+            rowdrop = ui.pl_drop >= 0;
+            if (rowdrop) pl_drop_apply();
+            ui.drag = 0;
+        }
+        if (ui.pl_collapse >= 0) {
+            int idx = ui.pl_collapse;
+            ui.pl_collapse = -1;
+            if (!rowdrop && idx < pl->count) {
+                ui.pl_sel = idx;
+                ui.pl_selall = 0;
+                pl_sel_reset();
+                pl_sel_add(idx);
+            }
+        }
+        if (ui.pl_dbl >= 0) {
+            int idx = ui.pl_dbl;
+            ui.pl_dbl = -1;
+            if (!rowdrop && idx < pl->count) pl_post(p, CMD_PLAY, idx);
+        }
         if (ui.pressed != B_NONE) {
             Rect xc = close_rect(ui.pl_w);
             if (ui.pressed == PB_X && in_rect(&xc, x, y)) action(PB_CLOSE);
@@ -1987,12 +2735,31 @@ static void handle_pl_mouse(SDL_Event *e) {
                 int dx, dy;
                 pl_dock_pos(&dx, &dy);
                 SDL_SetWindowPosition(ui.wpl, dx, dy);
-            }
+            } else
+                ui_drag_bounce(ui.wpl, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
         }
         if (ui.drag == 4 || ui.drag == 5 || ui.drag == 8) ui.drag = 0;
     } else if (e->type == SDL_MOUSEMOTION) {
         if (ui.drag == 4) {
             drag_move_pl();
+        } else if (ui.drag == 12) {
+            /* armed below an arm threshold of 4px so click jitter never
+               turns into a drop (the deferred double-click must survive
+               a two-pixel wobble). Half-row gap bias: the cursor in the
+               top half of a row drops above it, the bottom half below. */
+            if (ui.pl_drop >= 0 || abs(y - ui.pl_press_y) >= 4) {
+                /* edge auto-scroll: riding the list bounds keeps long
+                   drags reachable from one press (motion-event driven) */
+                if (y < ptext.y + 8 && ui.pl_scroll > 0)
+                    ui.pl_scroll--;
+                else if (pl->count > lines && y >= ptext.y + lines * 17 - 8 &&
+                         ui.pl_scroll < pl->count - lines)
+                    ui.pl_scroll++;
+                int gap = ui.pl_scroll + (y - ptext.y + 8) / 17;
+                if (gap < 0) gap = 0;
+                if (gap > pl->count) gap = pl->count;
+                ui.pl_drop = gap;
+            }
         } else if (ui.drag == 5 && pl->count > lines) {
             ui.pl_scroll = (y - pscroll.y) * (pl->count - lines) / pscroll.h;
             if (ui.pl_scroll < 0) ui.pl_scroll = 0;
@@ -2018,6 +2785,32 @@ static void handle_pl_mouse(SDL_Event *e) {
     }
 }
 
+/* plain Up/Down walks the playlist cursor by one row (volume moved to
+   +/-): the selection collapses to the single landed row, the origin is
+   the selection's edge in the travel direction, falling back to the
+   anchor, then to the playing track. The view follows with the same
+   just-enough-scroll rule draw_pl applies to the playing track. */
+static void pl_cursor(int dir) {
+    Player *p = ui.pl;
+    if (p->pl->count == 0) return;
+    int base = ui.pl_multi_n > 0
+                   ? (dir > 0 ? ui.pl_multi[ui.pl_multi_n - 1] : ui.pl_multi[0])
+                   : (ui.pl_sel >= 0 ? ui.pl_sel : p->cur);
+    int idx = base + dir;              /* base -1 (nothing anywhere):
+                                          Down lands on 0, Up clamps to 0 */
+    if (idx < 0) idx = 0;
+    if (idx > p->pl->count - 1) idx = p->pl->count - 1;
+    ui.pl_sel = idx;
+    ui.pl_selall = 0;
+    pl_sel_reset();
+    pl_sel_add(idx);
+    Rect ptext, pscroll;
+    pl_layout(&ptext, &pscroll);
+    int lines = ptext.h / 17;
+    if (idx < ui.pl_scroll) ui.pl_scroll = idx;
+    else if (idx >= ui.pl_scroll + lines) ui.pl_scroll = idx - lines + 1;
+}
+
 /* keys for the playlist window; returns 1 when handled so the playback
    shortcuts in handle_key don't also fire. pgup/pgdn scroll by one page
    minus one line, so the bottom visible line becomes the new top */
@@ -2028,12 +2821,63 @@ static int pl_key(SDL_Event *e) {
     case SDLK_a:
         if (!ctrl || p->pl->count == 0) return 0;
         ui.pl_selall = 1;
+        pl_sel_reset();
         return 1;
     case SDLK_DELETE:
     case SDLK_BACKSPACE:
-        if (!ui.pl_selall && ui.pl_sel < 0) return 0;
+        if (!ui.pl_selall && ui.pl_sel < 0 && ui.pl_multi_n == 0) return 0;
         action(PB_REM);
         return 1;
+    case SDLK_ESCAPE:
+        /* while the edit menu is open, Esc closes it instead of quitting */
+        if (ui.pl_menu) { ui.pl_menu = 0; return 1; }
+        return 0;
+    case SDLK_c:
+        if (ctrl && (ui.pl_selall || ui.pl_multi_n)) { pl_menu_action(PM_COPY); return 1; }
+        return 0;
+    case SDLK_x:
+        if (ctrl && (ui.pl_selall || ui.pl_multi_n)) { pl_menu_action(PM_CUT); return 1; }
+        return 0;
+    case SDLK_v:
+        if (ctrl && pl_clip_count() > 0) { pl_menu_action(PM_PASTE); return 1; }
+        return 0;
+    case SDLK_k:
+        if (ctrl) { pl_menu_action(PM_SAVEAS); return 1; }
+        return 0;
+    case SDLK_UP:
+    case SDLK_DOWN:
+        /* Alt+Up/Down move the (group-expanded) selection; the plain
+           arrows walk the playlist cursor (they used to be volume,
+           +/- took over — handle_key carries the main-window path) */
+        if ((e->key.keysym.mod & KMOD_ALT) && (ui.pl_selall || ui.pl_multi_n)) {
+            pl_menu_action(e->key.keysym.sym == SDLK_DOWN ? PM_MDOWN : PM_MUP);
+            return 1;
+        }
+        if (!(e->key.keysym.mod & (KMOD_ALT | KMOD_CTRL)) && p->pl->count > 0) {
+            pl_cursor(e->key.keysym.sym == SDLK_DOWN ? 1 : -1);
+            return 1;
+        }
+        return 0;
+    case SDLK_HOME:
+    case SDLK_END: {
+        /* jump the selection AND the view to the first/last row: with an
+           anchor set, the range keys compose (End then shift-click, or a
+           later Shift+Home); empty list returns 0 so the global hotkeys
+           stay reachable */
+        if (p->pl->count == 0) return 0;
+        Rect ptext, pscroll;
+        pl_layout(&ptext, &pscroll);
+        int lines = ptext.h / 17;
+        int last = p->pl->count - 1;
+        int at_end = e->key.keysym.sym == SDLK_END;
+        int idx = at_end ? last : 0;
+        ui.pl_sel = idx;              /* new anchor, single selection */
+        ui.pl_selall = 0;
+        pl_sel_reset();
+        pl_sel_add(idx);
+        ui.pl_scroll = at_end && p->pl->count > lines ? p->pl->count - lines : 0;
+        return 1;
+    }
     case SDLK_PAGEUP:
     case SDLK_PAGEDOWN: {
         Rect ptext, pscroll;
@@ -2056,17 +2900,14 @@ static int pl_key(SDL_Event *e) {
 static void handle_eq_mouse(SDL_Event *e) {
     Player *p = ui.pl;
     int x = e->motion.x, y = e->motion.y;
-    static const struct { int id; int x, w; } PRE[] = {
-        {EQB_FLAT, 48, 34}, {EQB_ROCK, 86, 34}, {EQB_POP, 124, 30}, {EQB_JAZZ, 158, 34},
-    };
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
         Rect xc = close_rect(EQ_W);
         if (in_rect(&xc, x, y)) { ui.pressed = EQB_X; return; }
-        Rect on = {10, 28, 30, 12};
+        Rect on = eq_on_rect();
         if (in_rect(&on, x, y)) { ui.pressed = EQB_ON; return; }
-        for (size_t i = 0; i < sizeof PRE / sizeof PRE[0]; i++) {
-            Rect r = {PRE[i].x, 132, PRE[i].w, 12};
-            if (in_rect(&r, x, y)) { ui.pressed = PRE[i].id; return; }
+        for (size_t i = 0; i < sizeof EQ_PRE / sizeof EQ_PRE[0]; i++) {
+            Rect r = {EQ_PRE[i].x, EQ_PRE_Y, EQ_PRE[i].w, 12};
+            if (in_rect(&r, x, y)) { ui.pressed = EQ_PRE[i].id; return; }
         }
         if (y >= EQ_SL_Y - 6 && y <= EQ_SL_Y + EQ_SL_H + 6) {
             if (x >= EQ_PRE_X - 2 && x < EQ_PRE_X + 14) { ui.drag = 6; ui.eq_band = 10; }
@@ -2089,9 +2930,11 @@ static void handle_eq_mouse(SDL_Event *e) {
             ui.eq_visible = 0;
             SDL_HideWindow(ui.weq);
         } else if (ui.pressed == EQB_ON) eq_toggle(&p->eq);
-        else for (size_t i = 0; i < sizeof PRE / sizeof PRE[0]; i++)
-            if (ui.pressed == PRE[i].id) eq_preset(p, PRE[i].id);
+        else for (size_t i = 0; i < sizeof EQ_PRE / sizeof EQ_PRE[0]; i++)
+            if (ui.pressed == EQ_PRE[i].id) eq_preset(p, EQ_PRE[i].id);
         ui.pressed = B_NONE;
+        if (ui.drag == 7)
+            ui_drag_bounce(ui.weq, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
         if (ui.drag == 6 || ui.drag == 7) ui.drag = 0;
     } else if (e->type == SDL_MOUSEMOTION && ui.drag == 7) {
         drag_move_snap(ui.weq);
@@ -2114,8 +2957,22 @@ static void handle_key(SDL_Event *e) {
                                       (double)((p->track_end > 0 ? p->track_end : p->total_frames) - p->track_start)); break;
     case SDLK_LEFT: pl_post_seek(p, (double)(p->pos_frames - p->track_start - p->rate * 5) /
                                      (double)((p->track_end > 0 ? p->track_end : p->total_frames) - p->track_start)); break;
-    case SDLK_UP: p->vol += 8; if (p->vol > 128) p->vol = 128; break;
-    case SDLK_DOWN: p->vol -= 8; if (p->vol < 0) p->vol = 0; break;
+    case SDLK_UP:
+    case SDLK_DOWN:
+        /* arrows walk the playlist cursor from any window (pl_key
+           already claimed the playlist window's own); Alt stays with the
+           row-move path, Ctrl passes through */
+        if (e->key.keysym.mod & (KMOD_ALT | KMOD_CTRL)) break;
+        pl_cursor(e->key.keysym.sym == SDLK_DOWN ? 1 : -1);
+        break;
+    case SDLK_PLUS:
+    case SDLK_KP_PLUS:
+    case SDLK_EQUALS:   /* '+' shares the key with '=' on common layouts
+                           — volume up accepts both, and the numpad */
+        p->vol += 8; if (p->vol > 128) p->vol = 128; break;
+    case SDLK_MINUS:
+    case SDLK_KP_MINUS:
+        p->vol -= 8; if (p->vol < 0) p->vol = 0; break;
     case SDLK_l: if (ctrl) { pl_scan_tags(p->pl, &p->mtx); } break;
     case SDLK_f:
 #ifdef __APPLE__
@@ -2359,6 +3216,27 @@ int ui_run(Player *p, int show_pl) {
             }
             ui_dirty |= D_SRCH | D_OPT;
             break;
+        case SDL_DROPBEGIN:
+            if (drop_n) drop_flush(); /* previous session never completed */
+            drop_open = 1;
+            break;
+        case SDL_DROPFILE: {
+            /* route by target window: drops on the search/options/browser
+               windows are ignored. e.drop.file is SDL-owned: copy into the
+               batch, then SDL_free the original */
+            if (e.drop.windowID == SDL_GetWindowID(ui.wmain) ||
+                e.drop.windowID == SDL_GetWindowID(ui.wpl)) {
+                drop_open = 1;
+                if (e.drop.file) drop_add(e.drop.file);
+            }
+            if (e.drop.file) SDL_free(e.drop.file);
+            break;
+        }
+        case SDL_DROPCOMPLETE:
+            if (drop_open) drop_flush();
+            drop_open = 0;
+            ui_dirty |= D_PL | D_MAIN;
+            break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
         case SDL_MOUSEMOTION:
@@ -2444,11 +3322,17 @@ int ui_run(Player *p, int show_pl) {
                 ui.file_err = 0;
                 ui_dirty |= D_FILE;
             }
+            /* the title-strip rescan message lasts 10 s; D_MAIN below makes
+               the expiry repaint immediate (file_err precedent) */
+            if (ui.msg[0] && now - ui.msg_at >= 10000) {
+                ui.msg[0] = 0;
+                ui_dirty |= D_MAIN;
+            }
 
             int vis_live = ui.vis_on && playing;
             int f10_live = cfg.ui_always10 > 0 && ui.marquee;
             int anim = (ui.marquee && (playing || f10_live)) || vis_live ||
-                       ui.drag || ui.opt_scanning;
+                       ui.drag || ui.opt_scanning || ui.msg[0];
 
             if (ui.app_focused) {
                 if ((ui_dirty & D_MAIN) || anim) {

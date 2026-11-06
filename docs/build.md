@@ -91,7 +91,7 @@ the Pi's OS). Pass `-DLV_TUNE=<cpu>` to tune for the board:
 
 On 32-bit armv7 `LV_TUNE` also enables NEON, which switches the mp3
 decoder to its SIMD path (~2-3x faster). The Pi Zero 1 and Pi 1 are
-armv6 (ARM1176: VFPv2, no NEON): they get plain VFP instead and the mp3
+armv6 (ARM1176: VFPv3-D16, no NEON): they get plain VFP instead and the mp3
 decoder stays on its scalar path, which still decodes in real time at
 1 GHz; NEON flags on those boards would SIGILL. On aarch64 NEON is
 used automatically with or without `LV_TUNE`.

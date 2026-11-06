@@ -82,6 +82,7 @@ static void set_key(const char *k, char *v) {
         else if (!lv_strcasecmp(v, "latin1")) cfg.tag_legacy_enc = LV_ENC_LATIN1;
         else if (!lv_strcasecmp(v, "cp1251")) cfg.tag_legacy_enc = LV_ENC_CP1251;
         else if (!lv_strcasecmp(v, "utf8"))   cfg.tag_legacy_enc = LV_ENC_UTF8;
+        else if (!lv_strcasecmp(v, "shiftjis")) cfg.tag_legacy_enc = LV_ENC_SJIS;
     }
 }
 
@@ -114,7 +115,8 @@ void cfg_load(void) {
 static const char *onoff_s(int v) { return v > 0 ? "on" : "off"; }
 static const char *legacy_enc_s(int e) {
     return e == LV_ENC_LATIN1 ? "latin1" : e == LV_ENC_CP1251 ? "cp1251"
-         : e == LV_ENC_UTF8   ? "utf8"   : "auto";
+         : e == LV_ENC_UTF8   ? "utf8"   : e == LV_ENC_SJIS ? "shiftjis"
+         : "auto";
 }
 
 /* cfg_save runs on the UI thread (options save, scan) AND the daemon

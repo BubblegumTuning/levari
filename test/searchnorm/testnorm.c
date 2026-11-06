@@ -2,7 +2,7 @@
    Compile (from the repo root, after `cmake --build build`):
 
      gcc -std=gnu11 test/searchnorm/testnorm.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o ! -name search.c.o) \
+       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o ! -name search.c.o ! -name dispatch.c.o) \
        $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
        $(pkg-config --libs sdl2) -lz -lm -lpthread -ldl -lstdc++ -o build/testnorm
 

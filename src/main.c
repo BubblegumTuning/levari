@@ -56,15 +56,6 @@ static int probe(const char *path) {
 static Player player;
 static Playlist playlist;
 
-static int is_m3u(const char *p) {
-    const char *e = strrchr(p, '.');
-    return e && !lv_strcasecmp(e, ".m3u");
-}
-static int is_cue(const char *p) {
-    const char *e = strrchr(p, '.');
-    return e && !lv_strcasecmp(e, ".cue");
-}
-
 int main(int argc, char **argv) {
 #ifdef _WIN32
     /* GUI-subsystem exe (no console window on double-click): when invoked as
@@ -117,8 +108,9 @@ int main(int argc, char **argv) {
             print_usage();
             return 0;
         }
-        else if (is_m3u(argv[i])) pl_load_m3u(&playlist, argv[i]);
-        else if (is_cue(argv[i])) pl_load_cue(&playlist, argv[i]);
+        else if (pl_ext_kind(argv[i]) == PL_M3U) pl_load_m3u(&playlist, argv[i]);
+        else if (pl_ext_kind(argv[i]) == PL_PLS) pl_load_pls(&playlist, argv[i]);
+        else if (pl_ext_kind(argv[i]) == PL_CUE) pl_load_cue(&playlist, argv[i]);
         else pl_add(&playlist, argv[i]);
     }
 
