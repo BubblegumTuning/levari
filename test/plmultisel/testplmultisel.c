@@ -12,12 +12,17 @@
    jitter), in-set press deferring the collapse so a drag carries the whole
    set, edge auto-scroll, and selection/cur riding the landed rows.
    Technique (see skill): #include ui.c, link every object EXCEPT main.c.o
-   AND ui.c.o AND dispatch.c.o (duplicate dec_* symbols otherwise):
+   AND ui.c.o AND the stale pre-split leftovers (decode.c.o, stb_vorbis.c.o)
+   + the dec_*.dir tier objects (canonical shape per test/snapwin — the
+   leftovers carry no dec_ffmpeg_probe_info; dispatch.c.o supplies the
+   plain symbols and resolves through the tier objects):
      SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o build/testplmultisel \
+     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL -o build/testplmultisel \
        test/plmultisel/testplmultisel.c \
        $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
+         ! -name stb_vorbis.c.o) \
+       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        $(find build -name 'libmodplug.a' | head -1) \
        $(find build -name 'libsnes_spc.a' | head -1) \
        -lz -lm -lpthread -ldl -lstdc++

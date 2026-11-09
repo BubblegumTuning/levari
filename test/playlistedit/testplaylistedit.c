@@ -5,8 +5,8 @@
    crop == multi-REM engine parity, cut/paste with the internal clipboard,
    move at the boundaries / into-group / over-group, pl_drop gap-index
    drops (P4 row drag: sel+cur remap, self-drop identity, non-adjacent
-   set merges, group snap-forward + whole-unit atomicity), pl_insert_track
-   full row copy, the shared extension classifier, and the .pls parser against
+   set merges, group snap-forward + whole-unit atomicity), the shared
+   extension classifier, and the .pls parser against
    hand-built byte-forward fixtures (NumberOfEntries mismatch, relative +
    absolute FileN, Windows backslash paths, CRLF, UTF-8 labels — expected
    UTF-8 literals generated from the codec, garbage keys ignored).
@@ -146,6 +146,42 @@ int main(void) {
     reset();
     load_pls("empty.pls");
     chk("pls empty", pl.count, 0);
+    /* hostile entry numbers (2026-11-07 GH-line ASan report): pre-fix,
+       File3221225472 narrowed (int) to a NEGATIVE index which skipped the
+       grow branch and wrote ent[at] ~4 GB below the heap; File2147483648
+       wrapped to a huge positive that overflowed the int cap-doubling.
+       Now everything above PLS_MAX_ENT=65536 is dropped as garbage. */
+    static const unsigned char pls3[] =
+        "[playlist]\n"
+        "File1=ok.mp3\n"
+        "File3221225472=underflow.mp3\n"          /* (int) negative */
+        "Title3221225472=junk\n"                  /* same index, title */
+        "File2147483648=wrap.mp3\n"               /* (int) INT_MIN */
+        "File65537=over-cap.mp3\n"                /* PLS_MAX_ENT+1 */
+        "File2=still-ok.mp3\n";
+    write_file("t3.pls", pls3, sizeof pls3 - 1);
+    reset();
+    load_pls("t3.pls");
+    chk("pls hostile numbers dropped", pl.count, 2);
+    if (pl.count == 2) {
+        char joined[LV_MAX_PATH];
+        snprintf(joined, sizeof joined, "%s/still-ok.mp3", tmpdir);
+        chks("pls rows survive hostile lines", pl.items[1].path, joined);
+    }
+    /* boundary: PLS_MAX_ENT itself is accepted — real playlists run to
+       30k+ songs (master), so the ceiling is a hazard bound, never a
+       size cap; the gap stays empty-skipped like any other gap */
+    static const unsigned char pls4[] =
+        "[playlist]\nFile1=first.mp3\nFile65536=edge.mp3\n";
+    write_file("t4.pls", pls4, sizeof pls4 - 1);
+    reset();
+    load_pls("t4.pls");
+    chk("pls ceiling accepted", pl.count, 2);
+    if (pl.count == 2) {
+        char joined[LV_MAX_PATH];
+        snprintf(joined, sizeof joined, "%s/edge.mp3", tmpdir);
+        chks("pls ceiling row", pl.items[1].path, joined);
+    }
 
     /* ---------- pl_group_span / two plain copies of one file ---------- */
     reset();
@@ -253,12 +289,31 @@ int main(void) {
     addrow("/h/4.mp3", "", "4", "", 0, 0, 0, 4);
     addrow("/h/5.mp3", "", "5", "", 0, 0, 0, 5);
     cur = 4; /* /h/5.mp3 */
-    srand(42);
-    pl_shuffle(&pl, &cur);
     {
-        /* pinned to srand(42) on this host's rand() (glibc), measured */
-        const char *want[] = { "/h/4.mp3", "/h/5.mp3", "/h/3.mp3", "/h/1.mp3", "/h/2.mp3" };
-        expect_paths(want, 5);
+        /* invariants, never a permutation: an exact srand(42) order pins
+           glibc's rand(), not the engine's contract. Paths are copied
+           BEFORE the shuffle (rows move by struct copy). */
+        char want[5][64], orig[5][64];
+        for (int i = 0; i < 5; i++) {
+            snprintf(want[i], sizeof want[i], "%s", pl.items[i].path);
+            snprintf(orig[i], sizeof orig[i], "%s", pl.items[i].path);
+        }
+        srand(42);
+        pl_shuffle(&pl, &cur);
+        int multiset = pl.count == 5, identity = pl.count == 5;
+        for (int i = 0; i < pl.count; i++) {
+            int hit = -1;
+            for (int j = 0; j < 5 && hit < 0; j++)
+                if (want[j][0] && !strcmp(pl.items[i].path, want[j])) hit = j;
+            if (hit < 0) { multiset = identity = 0; break; }
+            want[hit][0] = 0;                     /* consume: dupes must not resurface */
+            if (strcmp(pl.items[i].path, orig[i])) identity = 0;
+        }
+        chk("shuffle keeps the row set (multiset)", multiset, 1);
+        /* srand(42) keeps this deterministic; the only residual coupling to
+           the host rand() is that it lands NON-identity (measured) — a
+           shuffle that never moves a row fails here. */
+        chk("shuffle actually permutes", identity, 0);
         expect_cur("shuffle cur same music", "/h/5.mp3");
     }
     /* shuffle keeps a group whole, rows in internal order */
@@ -457,7 +512,7 @@ int main(void) {
     addrow("/w/alb.flac", "", "t1", "", 1, 0, 60, 60);
     addrow("/w/alb.flac", "", "t2", "", 2, 60, 0, 60);
     addrow("/w/B.mp3", "", "B", "", 0, 0, 0, 1);
-    cur = 0;                            /* A keeps its music at row 1 */
+    cur = 0;                            /* A never moves: it stays on row 0 */
     {
         int sel[] = { 3 };
         pl_move(&pl, sel, 1, -1, &cur);
@@ -629,20 +684,6 @@ int main(void) {
         pl_drop(&pl, sel, 0, 1, &cur);
         chk("empty-sel drop is a no-op", pl.count, 4);
     }
-
-    /* ---------- pl_insert_track: full row copy ---------- */
-    reset();
-    addrow("/i/A.mp3", "art", "ttl", "alb", 7, 12.5, 34.25, 42);
-    Track *src = &pl.items[0];
-    Track snap = *src;
-    pl_insert_track(&pl, 0, src);
-    chk("insert_track count", pl.count, 2);
-    chks("insert_track path", pl.items[0].path, snap.path);
-    chks("insert_track title", pl.items[0].tags.title, snap.tags.title);
-    chk("insert_track track#", pl.items[0].tags.track, snap.tags.track);
-    chk("insert_track dur", pl.items[0].duration, snap.duration);
-    chk("insert_track bounds", pl.items[0].start_sec == snap.start_sec &&
-        pl.items[0].end_sec == snap.end_sec, 1);
 
     /* ---------- P2 gate: real m3u round-trip (save -> reload -> compare) ---------- */
     reset();

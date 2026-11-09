@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.4 LANGUAGES C)
+project(levari VERSION 0.3.5 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -16,6 +16,18 @@ endif()
 # the RIFF chunk-skip math in tag.c could go negative and spin on files with
 # chunks >= 2 GB; 32-bit Linux (Pi arm32/armv6) needs it for LFS too.
 add_compile_definitions(_FILE_OFFSET_BITS=64)
+
+# LV_STREAMING=OFF compiles URL playback out entirely (the per-user
+# no-streaming option): URLs fail as plain nonexistent files and the URL
+# button/window are absent from the UI. The define MUST reach every
+# decode.c compile (levari, every SIMD tier object, levari-mcp) or the
+# FF/struct layouts differ between objects — an ODR/ABI disaster — so it
+# is directory-scoped, exactly where the tier compiles inherit. Default
+# keeps streaming on; release.sh ships only the default.
+option(LV_STREAMING "build network streaming (URL playback)" ON)
+if(LV_STREAMING)
+    add_compile_definitions(LV_URL_ENABLED=1)
+endif()
 
 if(WIN32)
     # MinGW cross builds: point SDL2_DIR at the SDL2-mingw cmake dir, e.g.
@@ -109,15 +121,26 @@ endif()
 # tier (SSE2 baseline, AVX+FMA, AVX2); tier_rename.h suffixes every tier's
 # symbols and src/decode/dispatch.c owns the public API, picking the best
 # tier the CPU supports at runtime (LEVAR_DECODE=sse2|avx|avx2 to force).
-# Same source, bit-identical output ONLY with -ffp-contract=off: with the
-# default (fast) contraction the compiler folds a multiply+add into one FMA
-# rounding, and the avx/avx2 Vorbis output drifts +/-1 LSB from sse2 (FLAC
-# and WAV are unaffected — no fused ops). Tiers stay OFF for the legacy
-# x86-64 build: tools/release.sh's ISA floor gate must not see VEX
-# instructions, and old CPUs run the SSE2 tier anyway.
-option(LEVAR_SIMD_TIERS "runtime-dispatched AVX/AVX2 decoder tiers" ON)
-set(LEVAR_TIERS "")
-if(LEVAR_SIMD_TIERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+# LEVAR_TIERS selects WHICH tiers ship: each tier costs roughly a full
+# second copy of the decode stack, so a build should ship only what its
+# target audience can execute — release.sh ships the flagship linux/win
+# zips AVX2-only; the legacy zip is tier-less (plain decode.c at the
+# baseline ISA IS its SSE2 floor). The lowest tier in the list is the
+# runtime floor: a CPU below it cannot run the binary at all (dispatch.c
+# picks the best COMPILED tier the CPU supports). Same source,
+# bit-identical output ONLY with -ffp-contract=off: with the default
+# (fast) contraction the compiler folds a multiply+add into one FMA
+# rounding, and the avx/avx2 Vorbis output drifts +/-1 LSB from sse2
+# (FLAC and WAV are unaffected — no fused ops). Tiers stay OFF for the
+# legacy x86-64 build: tools/release.sh's ISA floor gate must not see VEX
+# instructions, and old CPUs run the baseline code anyway.
+set(LEVAR_TIERS "sse2;avx;avx2" CACHE STRING
+    "decoder tiers to compile: any of sse2 avx avx2 (lowest shipped is the runtime floor; empty = tier-less build)")
+option(LEVAR_SIMD_TIERS "runtime-dispatched x86 decoder tiers" ON)
+set(LEVAR_TIERS_REQ "${LEVAR_TIERS}")  # the cache request
+set(LEVAR_TIERS "")                    # resolved list of tiers to compile
+if(LEVAR_TIERS_REQ AND LEVAR_SIMD_TIERS
+        AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
         AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     include(CheckCCompilerFlag)
     # every tier compiles with LEVAR_TIER_BASE's -march=x86-64, and not
@@ -129,15 +152,29 @@ if(LEVAR_SIMD_TIERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
     # does not compile
     check_c_compiler_flag("-march=x86-64" LEVAR_CC_MARCH)
     if(LEVAR_CC_MARCH)
-        set(LEVAR_TIERS sse2)
         check_c_compiler_flag("-mavx -mfma" LEVAR_CC_AVX)
         check_c_compiler_flag("-mavx2 -mfma -mbmi -mbmi2 -mlzcnt" LEVAR_CC_AVX2)
-        if(LEVAR_CC_AVX)
-            list(APPEND LEVAR_TIERS avx)
-        endif()
-        if(LEVAR_CC_AVX2)
-            list(APPEND LEVAR_TIERS avx2)
-        endif()
+        foreach(t IN LISTS LEVAR_TIERS_REQ)
+            if(NOT t MATCHES "^(sse2|avx|avx2)$")
+                message(FATAL_ERROR "LEVAR_TIERS: unknown tier '${t}' (allowed: sse2 avx avx2; empty list = tier-less)")
+            endif()
+        endforeach()
+        # canonical order regardless of the request's spelling
+        foreach(t sse2 avx avx2)
+            if(t IN_LIST LEVAR_TIERS_REQ)
+                # a requested tier the compiler cannot spell is a hard
+                # error, never a silent downgrade: release.sh pins avx2
+                # for the flagship zips and a quietly SSE2-only "flagship"
+                # would be a wrong artifact with a right exit code
+                if(t STREQUAL "avx" AND NOT LEVAR_CC_AVX)
+                    message(FATAL_ERROR "LEVAR_TIERS: 'avx' requested but the compiler rejects -mavx -mfma")
+                endif()
+                if(t STREQUAL "avx2" AND NOT LEVAR_CC_AVX2)
+                    message(FATAL_ERROR "LEVAR_TIERS: 'avx2' requested but the compiler rejects -mavx2 -mfma -mbmi -mbmi2 -mlzcnt")
+                endif()
+                list(APPEND LEVAR_TIERS ${t})
+            endif()
+        endforeach()
     else()
         message(STATUS "LEVAR_SIMD_TIERS: requested but off — compiler rejects -march=x86-64 (zig cc)")
     endif()
@@ -286,7 +323,9 @@ if(LEVAR_TIERS)
         # target_sources (not target_link_libraries): levari's link line uses
         # the plain signature above, and keyword/plain mixing is an error
         target_sources(levari PRIVATE $<TARGET_OBJECTS:dec_${tier}>)
-        if(tier STREQUAL "avx")
+        if(tier STREQUAL "sse2")
+            target_compile_definitions(levari PRIVATE LEVAR_HAVE_SSE2)
+        elseif(tier STREQUAL "avx")
             target_compile_definitions(levari PRIVATE LEVAR_HAVE_AVX)
         elseif(tier STREQUAL "avx2")
             target_compile_definitions(levari PRIVATE LEVAR_HAVE_AVX2)
@@ -295,19 +334,31 @@ if(LEVAR_TIERS)
     target_compile_definitions(levari PRIVATE LEVAR_DECODE_HAVE_X86)
 endif()
 
-# optional libav* backend for aac/wma and other exotic formats:
-# dev headers only at build time; the libraries are dlopen'd at runtime,
-# so a missing libav* just disables those formats instead of breaking startup
+# libav* backend for aac/wma/URLs: compiled once per supported libav major
+# against the vendored public headers (vendor/ffmpeg/, see its README) —
+# NEVER against the system's libav: the backend reads libav struct FIELDS
+# across the dlopen boundary, so each variant is paired with the runtime
+# majors it was compiled for and decode.c dispatches by avutil_version().
+# The libraries are still dlopen'd at runtime, so a machine without any
+# libav simply loses the ffmpeg formats instead of failing to start.
+# LEVAR_FF_ABIS must stay in sync with LV_FFAPI_LIST in src/decode/ffabi.h.
 if(NOT WIN32)
-    pkg_check_modules(AV libavformat libavcodec libavutil)
-    if(AV_FOUND)
-        target_compile_definitions(levari PRIVATE HAVE_FFMPEG)
-        target_include_directories(levari PRIVATE ${AV_INCLUDE_DIRS})
-        foreach(tier IN LISTS LEVAR_TIERS)
-            target_compile_definitions(dec_${tier} PRIVATE HAVE_FFMPEG)
-            target_include_directories(dec_${tier} PRIVATE ${AV_INCLUDE_DIRS})
-        endforeach()
-    endif()
+    set(LEVAR_FF_ABIS 5 6 7 8 9)
+    foreach(abi IN LISTS LEVAR_FF_ABIS)
+        add_library(dec_ffab${abi} OBJECT src/decode/ffab.c)
+        # OBJECT libs do NOT inherit the main target's position-independence:
+        # without this the Linux PIE link dies on R_X86_64_32 (same trap as
+        # the modplug static archive)
+        set_target_properties(dec_ffab${abi} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(dec_ffab${abi} PRIVATE LV_FFSUF=${abi})
+        target_include_directories(dec_ffab${abi} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/vendor/ffmpeg/ff${abi}/include)
+        target_sources(levari PRIVATE $<TARGET_OBJECTS:dec_ffab${abi}>)
+    endforeach()
+    target_compile_definitions(levari PRIVATE HAVE_FFMPEG)
+    foreach(tier IN LISTS LEVAR_TIERS)
+        target_compile_definitions(dec_${tier} PRIVATE HAVE_FFMPEG)
+    endforeach()
 endif()
 
 # optional MPRIS (D-Bus) media-player integration, Linux only:
@@ -379,9 +430,12 @@ if(ENABLE_MCP)
         target_link_options(levari-mcp PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
     endif()
     set_source_files_properties(third_party/cJSON.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter;-Wno-unknown-pragmas;-fstack-protector-strong;-D_FORTIFY_SOURCE=2")
-    if(AV_FOUND)
+    if(NOT WIN32)
+        # ffmpeg backend: same variant objects as the levari target
         target_compile_definitions(levari-mcp PRIVATE HAVE_FFMPEG)
-        target_include_directories(levari-mcp PRIVATE ${AV_INCLUDE_DIRS})
+        foreach(abi IN LISTS LEVAR_FF_ABIS)
+            target_sources(levari-mcp PRIVATE $<TARGET_OBJECTS:dec_ffab${abi}>)
+        endforeach()
     endif()
     install(TARGETS levari-mcp RUNTIME DESTINATION bin)
 endif()

@@ -19,7 +19,7 @@ extern const Rect R_INFO;
 /* row 3: volume */
 extern const Rect R_VOL;
 /* row 4: left/right balance + EQ + playlist buttons */
-extern const Rect R_PAN, R_EQ, R_LIST;
+extern const Rect R_PAN, R_EQ, R_LIST, R_URL;
 /* row 5: timeline slider, on its own row below the display */
 extern const Rect R_SEEK;
 /* row 6: prev play pause stop next + open file/folder */

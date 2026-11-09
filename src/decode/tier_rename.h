@@ -22,10 +22,12 @@
 #define dec_rate           LEV_TIER(dec_rate)
 #define dec_channels       LEV_TIER(dec_channels)
 #define dec_total_frames   LEV_TIER(dec_total_frames)
+#define dec_take_title     LEV_TIER(dec_take_title)
 #define dec_read           LEV_TIER(dec_read)
 #define dec_seek           LEV_TIER(dec_seek)
 #define dec_close          LEV_TIER(dec_close)
-#define dec_ffmpeg_probe   LEV_TIER(dec_ffmpeg_probe)
+#define dec_ffmpeg_probe      LEV_TIER(dec_ffmpeg_probe)
+#define dec_ffmpeg_probe_info LEV_TIER(dec_ffmpeg_probe_info)
 
 /* minimp3: plain extern functions, the vendored header has no API macro */
 #define mp3dec_init              LEV_TIER(mp3dec_init)

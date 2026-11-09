@@ -14,7 +14,6 @@ void ui_snap_next_to_main(SDL_Window *w, int *x, int *y);
    wall), move the window 1 px off any wall it sits on, away from the
    push direction, so the next grab starts clear of the clamp */
 void ui_drag_bounce(SDL_Window *w, int xlo, int xhi, int ylo, int yhi);
-void ui_open_playlist(void);
 /* clipboard helpers shared by the search + options text fields */
 void ui_clip_copy(const char *text);
 int ui_clip_paste(char *dst, size_t n); /* appends sanitized text; returns changed */

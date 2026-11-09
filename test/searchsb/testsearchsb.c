@@ -81,7 +81,22 @@ int main(void) {
     int y2 = list.y + 3 * list.h / 4;
     motion(barx, y2, SDL_BUTTON_LMASK);
     long want = (long)(y2 - list.y) * (100 - lines) / list.h;
-    chk("drag maps y to scroll", scroll, want);
+    chk("drag maps y to scroll", scroll, want);   /* mirrors the pinned contract
+        (search.c scrollbar entry: scroll=(y-list.y)*(nres-lines)/list.h clamped) */
+
+    /* order/range properties the single-point mirror above cannot catch:
+       the mapping must be monotone and stay inside [0, nres-lines] */
+    {
+        int prev = -1, ok = 1;
+        for (int y = list.y; y <= list.y + list.h; y += 7) {
+            motion(barx, y, SDL_BUTTON_LMASK);
+            if (scroll < prev || scroll > 100 - lines) ok = 0;
+            prev = scroll;
+        }
+        chk("scrollbar maps monotonically inside [0, nres-lines]", ok, 1);
+        motion(barx, list.y + list.h, SDL_BUTTON_LMASK);   /* exact bottom edge (the 7-px sweep may stop short) */
+        chk("track bottom reaches the last page", scroll, 100 - lines);
+    }
 
     /* clamped at the bottom of the track */
     motion(barx, list.y + list.h + 64, SDL_BUTTON_LMASK);

@@ -17,6 +17,49 @@ Optional: `-DENABLE_MCP=ON` also builds `levari-mcp`, a stdio MCP
 (see [usage.md](usage.md)). Off by default, so release builds don't
 contain it.
 
+Optional: `-DLV_STREAMING=OFF` (on by default) compiles network
+streaming out entirely: the `URL` button and window vanish and URLs
+fail as plain nonexistent files — a per-user no-streaming build;
+release builds only ever ship the default. Streaming needs the libav*
+shared libraries at runtime; without them URLs are refused cleanly
+(everything else still builds and runs either way).
+
+Optional: `-DLEVAR_TIERS=sse2;avx;avx2` (that full set by default,
+x86-64 only) selects which decoder codegen tiers are COMPILED IN.
+Each tier is a full extra copy of the decode stack (~250 KB), picked
+at runtime by CPU support, so ship only what the target audience can
+execute: the flagship linux/win release zips ship `-DLEVAR_TIERS=avx2`
+(Haswell+/2013+; roughly 40% smaller than the full set), the legacy
+"drop it anywhere" zip builds tier-less (`-DLEVAR_SIMD_TIERS=OFF`,
+plain code at the baseline ISA is its SSE2 floor). The lowest tier in
+the list is the runtime floor — a CPU below it cannot run the binary.
+An empty list means tier-less; an unknown tier name or a tier the
+compiler rejects is a hard configure error, never a silent downgrade.
+The `LEVAR_DECODE=sse2|avx|avx2` env var remains a verification hook:
+it forces a tier when built AND CPU-supported, else warns and runs
+the floor. Examples (all from the repo root; quote the value when it
+holds a `;`):
+
+    # all three tiers (default) — any x86-64 CPU runs the binary
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    # AVX2-only flagship (Haswell/2013+; what release.sh ships)
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DLEVAR_TIERS=avx2
+    # AVX+FMA only (Sandy Bridge 2011 .. Ivy Bridge 2012 era)
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DLEVAR_TIERS=avx
+    # SSE2-only (every x86-64; the widest single-tier build)
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DLEVAR_TIERS=sse2
+    # any combination: the lowest listed tier is the runtime floor
+    cmake -B build -DCMAKE_BUILD_TYPE=Release "-DLEVAR_TIERS=sse2;avx2"
+    # tier-less (baseline ISA code; what the legacy zip cross-builds)
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DLEVAR_TIERS=
+
+    cmake --build build -j"$(nproc)"
+
+To force a tier at runtime (a typo'd, unbuilt or CPU-unsupported
+value says so on stderr and runs the floor instead of silently):
+
+    LEVAR_DECODE=avx2 ./build/levari --probe test/sample.flac
+
 ## Linux install
 
     sudo cmake --install build --prefix /usr
@@ -51,13 +94,22 @@ build was made with, sha256
 
     curl -sfO https://www.libsdl.org/release/SDL2-2.32.10.tar.gz
     tar xzf SDL2-2.32.10.tar.gz
-    cmake -S SDL2-2.32.10 -B sdl2-legacy-build -DCMAKE_BUILD_TYPE=Release \
+    cmake -S SDL2-2.32.10 -B sdl2-legacy-build -DCMAKE_BUILD_TYPE=MinSizeRel \
       -DCMAKE_C_COMPILER=$PWD/levari/tools/zig-cc-2.17 \
       -DCMAKE_INSTALL_PREFIX=$HOME/sdl2-legacy-x86_64 \
       -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_STATIC_PIC=ON \
       -DSDL_DBUS=OFF -DSDL_WAYLAND=OFF -DSDL_OPENGL=OFF \
-      -DSDL_GLES1=OFF -DSDL_GLES2=OFF -DSDL_TESTS=OFF -DSDL_TEST=OFF
+      -DSDL_GLES1=OFF -DSDL_GLES2=OFF -DSDL_TESTS=OFF -DSDL_TEST=OFF \
+      -DSDL_X11_SHARED=ON \
+      -DSDL_JOYSTICK=OFF -DSDL_HAPTIC=OFF -DSDL_SENSOR=OFF \
+      -DSDL_HIDAPI=OFF -DSDL_RENDER=OFF -DSDL_VIDEO_VULKAN=OFF
     cmake --build sdl2-legacy-build -j"$(nproc)" && cmake --install sdl2-legacy-build
+
+levari touches only VIDEO+AUDIO on software surfaces, so the floor build
+carries no joystick/haptics/sensor/HIDAPI/Render/Vulkan code (subsystems
+we later need simply get switched back on); MinSizeRel (-Os) trims the
+rest. libSDL2.a shrinks 13.3 MB -> 2.1 MB, the shipped legacy binary
+2.42 MB -> 1.82 MB stripped (zip 1074 KB -> 869 KB).
 
 Then the player (tools/zig-legacy-toolchain.cmake wraps `zig cc/c++
 -target x86_64-linux-gnu.2.17`; zig rejects `-march=x86-64`/`-mtune` —

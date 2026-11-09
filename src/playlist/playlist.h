@@ -23,7 +23,6 @@ void pl_clear(Playlist *p);
 int  pl_add(Playlist *p, const char *path); /* 0 appended, -1 out of memory */
 int  pl_add_file(Playlist *p, const char *path); /* no dir probe: path is a file */
 void pl_insert(Playlist *p, int idx, const char *path);
-void pl_insert_track(Playlist *p, int idx, const Track *src); /* full row copy (paste) */
 void pl_remove(Playlist *p, int idx);
 int  pl_load_m3u(Playlist *p, const char *m3u);
 int  pl_load_pls(Playlist *p, const char *pls);

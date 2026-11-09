@@ -7,6 +7,7 @@
 #include "../config/config.h"
 #include "../tag/tag.h"
 #include "../library/library.h"
+#include "../decode/decode.h"   /* dec_ffmpeg_probe: URL-window notice */
 #include "../mpris/mpris.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,12 +21,12 @@
 
 enum {
     B_PLAY, B_PAUSE, B_STOP, B_PREV, B_NEXT, B_OPEN,
-    B_SHUF, B_REPEAT, B_EQ, B_VIS, B_LIST, B_ABA, B_ABB, B_XMAIN, B_SEARCH, B_RPT1,
-    PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_SCAN, PB_X, FB_ADDDIR, FB_X,
+    B_SHUF, B_REPEAT, B_EQ, B_VIS, B_LIST, B_ABA, B_ABB, B_XMAIN, B_SEARCH, B_URL, B_RPT1,
+    PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_SCAN, PB_X, FB_ADDDIR, FB_X, B_URLX, IB_X,
     EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X, EQB_RESET,
     OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
     OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC,
-    OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA,
+    OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA, OPTB_TABU,
     B_NONE
 };
 
@@ -69,6 +70,12 @@ typedef struct { int id; const Rect *r; } Btn;
 static const Btn MAIN_BTNS[] = {
     {B_SHUF, &R_SHUF}, {B_REPEAT, &R_REPEAT}, {B_EQ, &R_EQ}, {B_VIS, &R_VIS},
     {B_LIST, &R_LIST},
+#ifdef LV_URL_ENABLED
+    /* the URL button beside LST (streaming-plan UI entry): absence IS
+       the message in LV_STREAMING=OFF builds — no registered id, no
+       draw, no hit-test, no action */
+    {B_URL, &R_URL},
+#endif
     {B_PREV, &R_PREV}, {B_PLAY, &R_PLAY}, {B_PAUSE, &R_PAUSE},
     {B_STOP, &R_STOP}, {B_NEXT, &R_NEXT}, {B_OPEN, &R_OPEN},
     {B_ABA, &R_ABA}, {B_ABB, &R_ABB}, {B_SEARCH, &R_SEARCH}, {B_RPT1, &R_RPT1},
@@ -90,7 +97,8 @@ static const Btn PL_BTNS[] = {
 enum {
     PM_STITLE, PM_SARTIST, PM_SALBUM, PM_STRACK, PM_SFILE,
     PM_REVERSE, PM_SHUFFLE, PM_CROP, PM_CLEAR,
-    PM_COPY, PM_CUT, PM_PASTE, PM_MUP, PM_MDOWN, PM_SAVEAS, PM_N
+    PM_COPY, PM_CUT, PM_PASTE, PM_MUP, PM_MDOWN, PM_SAVEAS,
+    PM_INFO, PM_N
 };
 static const struct { int act; const char *lbl; } PL_MENU[PM_N] = {
     { PM_STITLE,  "SORT TITLE"  }, { PM_SARTIST,  "SORT ARTIST" },
@@ -101,6 +109,7 @@ static const struct { int act; const char *lbl; } PL_MENU[PM_N] = {
     { PM_COPY,    "COPY"        }, { PM_CUT,      "CUT"         },
     { PM_PASTE,   "PASTE"       }, { PM_MUP,      "MOVE UP"     },
     { PM_MDOWN,   "MOVE DOWN"   }, { PM_SAVEAS,   "SAVE AS..."  },
+    { PM_INFO,    "SONG INFO"   },
 };
 #define PL_MENU_ROWS 8                 /* first col 8, second the rest */
 static Rect pl_menu_item_rect(int i) {
@@ -108,10 +117,16 @@ static Rect pl_menu_item_rect(int i) {
     return r;
 }
 
+/* ui.snap[] / ui.follow_snap[] slots (see the UI struct): 0 eq, 1 file,
+   2 search, 3 options, 4 url — the url slot exists in every build, it
+   only ever fills while LV_URL_ENABLED compiles the URL window in */
+#define SNAP_NSLOT 5
+#define SNAP_URL 4
+
 typedef struct {
     Player *pl;
-    SDL_Window *wmain, *wpl, *weq, *wfile, *wopt;
-    SDL_Surface *smain, *spl, *seq, *sfile, *sopt;
+    SDL_Window *wmain, *wpl, *weq, *wfile, *wopt, *winfo;
+    SDL_Surface *smain, *spl, *seq, *sfile, *sopt, *sinfo;
     /* built-in open file/folder browser */
     char file_dir[LV_MAX_PATH];
     char **file_names;   /* entries of file_dir, dirs first, then ".." at 0 */
@@ -134,21 +149,57 @@ typedef struct {
                             differs, Enter writes the file, no audio filter */
     /* options window */
     int opt_visible, opt_focus, opt_hover;
+#ifdef LV_URL_ENABLED
+    /* URL loader window (streaming-plan UI entry): ONE paste field,
+       Enter = open + play (transient one-row list) + close, Esc = close.
+       Prefill on OPEN comes from urlIndex and is inert — nothing GETs
+       until Enter; the scheme gate re-validates whatever is in the field
+       at Enter time, no matter its source (typed/pasted/prefilled). */
+    SDL_Window *wurl;
+    SDL_Surface *surl;
+    int url_visible, url_focus, url_err;
+    int url_ff_ok;               /* dec_ffmpeg_probe()==1, cached at open:
+                                    0 = streaming cannot work (no libav) and
+                                    the window says so below the field */
+    int url_ff_code;             /* raw probe return (1/2/3): 3 reads a
+                                    different red line — found, wrong ABI */
+    char url_ff_ver[32];         /* release found at open (for that line) */
+    Uint32 url_err_at;
+    char url_field[LV_MAX_PATH];
+    TField url_tf;               /* buf points at url_field */
+#endif
     int opt_caret;               /* caret byte offset in the focused field (codepoint boundary) */
     int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
     int opt_enc;                 /* LEGACY button cycle: 0 auto, 1 latin1, 2 cp1251, 3 utf8, 4 shiftjis (cfg value = opt_enc - 1) */
-    int opt_adv;                 /* options window on the ADVANCED tab */
+    int opt_ff;                  /* ADV status line: ffmpeg (libav*) detected
+                                    on the system — probed once at opt_open
+                                    (the probe dlopens per call; libav.dir
+                                    changes need a restart anyway) */
+    char opt_ff_ver[32];         /* release of the ffmpeg actually found
+                                    (probe_info), shown on the same line */
+    int opt_tab;                 /* options window tab: 0 BASIC, 1 ADVANCED, 2 ABOUT */
     int opt_scanning;            /* a library scan thread is running */
     int opt_tags;                /* scan reads tags+duration, not just names */
     SDL_atomic_t opt_scan_done;  /* set by the scan thread when finished */
     int opt_scan_added, opt_scan_seen, opt_scan_skipped;
     char opt_status[96];         /* one-line scan/clear feedback */
+    /* song-info window (playlist edit menu): ONE selected row's tags,
+       freshly read from disk at invocation, plus its file location.
+       Re-opening re-reads (the library index is never consulted).
+       info_focus = the copy-focused value box, -1 = none (the values are
+       read-only: click selects, Ctrl+C copies the whole value). */
+    int info_visible;
+    TagFull info_full;
+    int info_focus;
+    char info_path[LV_MAX_PATH];
+    char info_dir[LV_MAX_PATH];
+    char info_file[LV_MAX_PATH];
     int menu;            /* right-click titlebar dropdown: 0 closed 1 open */
     int pl_menu;         /* playlist right-click edit menu: 0 closed 1 open */
     int pressed;
-    int drag;          /* 0 none 1 seek 2 vol 3 win-main 4 win-pl 5 plscroll 6 eq-slider 7 win-eq 8 pl-resize 9 win-file 10 pan 11 win-opt 12 pl-row */
+    int drag;          /* 0 none 1 seek 2 vol 3 win-main 4 win-pl 5 plscroll 6 eq-slider 7 win-eq 8 pl-resize 9 win-file 10 pan 11 win-opt 12 pl-row 13 win-url 14 win-info */
     int eq_band;       /* 0..9 band, 10 = preamp, while dragging */
     int pl_scroll, pl_sel;
     int pl_cur;            /* last cur index the playlist was scrolled for */
@@ -172,7 +223,7 @@ typedef struct {
     int pl_visible, eq_visible;
     int pl_w, pl_h;        /* current playlist window size */
     int pl_docked;         /* playlist attached under main window */
-    int eq_on, vis_on, mini;
+    int vis_on;
     char title[512];
     int scroll_off;
     int marquee;            /* 1 when draw_main took the scrolling-title path */
@@ -188,12 +239,13 @@ typedef struct {
        follow_move): last REQUESTED pos + walls hit this drag; valid=0 until
        the window first takes part in the current drag */
     struct FollowState { int rx, ry, xlo, xhi, ylo, yhi, valid; }
-        follow_pl, follow_snap[4];
+        follow_pl, follow_snap[SNAP_NSLOT];
     Uint32 focus_wid;       /* window id of the focused one of ours */
     int app_focused;        /* 1 while any of our windows holds WM focus */
     /* windows snapped beside the main one: follow it while it moves.
-       slots: 0 eq, 1 file, 2 search, 3 options; w = NULL when not snapped */
-    struct { SDL_Window *w; int dx, dy; } snap[4];
+       slots: SNAP_NSLOT (0 eq, 1 file, 2 search, 3 options, 4 url);
+       w = NULL when not snapped */
+    struct { SDL_Window *w; int dx, dy; } snap[SNAP_NSLOT];
 } UI;
 
 static UI ui;
@@ -327,6 +379,11 @@ static void drag_begin(SDL_Window *w) {
        position with no known walls (see drag_step) */
     SDL_GetWindowPosition(w, &ui.drag_rx, &ui.drag_ry);
     ui.drag_wxlo = ui.drag_wxhi = ui.drag_wylo = ui.drag_wyhi = 0;
+    /* carried/pushed windows are drag-scoped too (follow_move in the
+       drag-3 follow AND reflow_above pushes during snap drags): a wall
+       from a previous drag must never leak into this one */
+    ui.follow_pl.valid = 0;
+    for (int i = 0; i < SNAP_NSLOT; i++) ui.follow_snap[i].valid = 0;
 }
 
 static int snap_idx(SDL_Window *w) {
@@ -334,8 +391,13 @@ static int snap_idx(SDL_Window *w) {
     if (w == ui.wfile) return 1;
     if (w == search_window()) return 2;
     if (w == ui.wopt) return 3;
+#ifdef LV_URL_ENABLED
+    if (ui.wurl && w == ui.wurl) return SNAP_URL;
+#endif
     return -1;
 }
+
+static void reflow_above(SDL_Window *self, int cursor_y);
 
 void ui_snap_next_to_main(SDL_Window *w, int *x, int *y) {
     if (!ui.wmain || !w) return;
@@ -348,7 +410,30 @@ void ui_snap_next_to_main(SDL_Window *w, int *x, int *y) {
     else if (abs((*x + ww) - mx) <= DOCK_SNAP) { *x = mx - ww; snapped = 1; }
     if (snapped && abs(*y - my) <= DOCK_SNAP) *y = my;
     else if (abs(*y - (my - wh)) <= DOCK_SNAP && abs(*x - mx) <= DOCK_SNAP) {
-        *y = my - wh; *x = mx; snapped = 1;
+        /* the edge above main is a STACK (2026-11-07 layout):
+           the URL window always inserts flush above main (bottom of the
+           stack, pushing everything already snapped above one level up);
+           every other window stacks flush above the current top. The
+           URL window is URL_W=320 vs MAIN_W=315: like the old flush-above
+           rule it left-aligns to main, the 5 px ride over its right edge. */
+        *x = mx;
+        snapped = 1;
+#ifdef LV_URL_ENABLED
+        if (w == ui.wurl) {
+            *y = my - wh;
+            reflow_above(w, *y);
+        } else
+#endif
+        {
+            int top = my;
+            for (int j = 0; j < SNAP_NSLOT; j++) {
+                if (!ui.snap[j].w || ui.snap[j].w == w || ui.snap[j].dy >= 0) continue;
+                int jx, jy;
+                SDL_GetWindowPosition(ui.snap[j].w, &jx, &jy);
+                if (jy < top) top = jy;
+            }
+            *y = top - wh;
+        }
     }
     int i = snap_idx(w);
     if (i >= 0) {
@@ -460,6 +545,38 @@ static void follow_move(SDL_Window *w, struct FollowState *fs, int x, int y) {
     fs->rx = x; fs->ry = y;
 }
 
+/* The edge above main is a stack (see ui_snap_next_to_main). Re-pack the
+   windows snapped there — slot registered with dy < 0 — in their current
+   distance order from main (snap dy, most-negative = highest first),
+   stacking upward from cursor_y; the stack is left-aligned to main.
+   Moves go through follow_move so they carry the same refusal discipline
+   as the drag-3 carry (walls recorded per drag, deeper requests clamped,
+   identical requests skipped). Outside a drag (url open/close) the
+   bookkeeping is re-baselined first: those are one-shot placement moves,
+   a previous drag's wall must not clamp them. self (may be NULL) is
+   skipped — the caller has just placed it. */
+static void reflow_above(SDL_Window *self, int cursor_y) {
+    int mx, my;
+    SDL_GetWindowPosition(ui.wmain, &mx, &my);
+    int left[SNAP_NSLOT], n = 0;
+    for (int i = 0; i < SNAP_NSLOT; i++)
+        if (ui.snap[i].w && ui.snap[i].w != self && ui.snap[i].dy < 0) left[n++] = i;
+    /* nearest-to-main first = largest (least negative) dy, selected */
+    while (n > 0) {
+        int best = 0;
+        for (int m = 1; m < n; m++)
+            if (ui.snap[left[m]].dy > ui.snap[left[best]].dy) best = m;
+        int i = left[best];
+        left[best] = left[--n];
+        int sw, sh;
+        SDL_GetWindowSize(ui.snap[i].w, &sw, &sh);
+        cursor_y -= sh;
+        if (!ui.drag) ui.follow_snap[i].valid = 0;
+        follow_move(ui.snap[i].w, &ui.follow_snap[i], mx, cursor_y);
+        ui.snap[i].dy = cursor_y - my;
+    }
+}
+
 /* End of a window drag that met a WM wall: kick the window 1 px off that
    wall, opposite the direction it was pushed. A window left pinned
    exactly at the clamp boundary feels sticky on the next grab; one pixel
@@ -491,12 +608,12 @@ void ui_drag_bounce(SDL_Window *w, int xlo, int xhi, int ylo, int yhi) {
 static int drag_dock_restore(void) {
     int mx, my;
     SDL_GetWindowPosition(ui.wmain, &mx, &my);
-    struct { SDL_Window *w; int dx, dy; } c[5];
+    struct { SDL_Window *w; int dx, dy; } c[SNAP_NSLOT + 1];
     int n = 0;
     if (ui.pl_docked && ui.pl_visible) {
         c[n].w = ui.wpl; c[n].dx = 0; c[n].dy = MAIN_H; n++;
     }
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < SNAP_NSLOT; i++)
         if (ui.snap[i].w) { c[n].w = ui.snap[i].w; c[n].dx = ui.snap[i].dx; c[n].dy = ui.snap[i].dy; n++; }
     int moved = 0;
     for (int i = 0; i < n; i++) {
@@ -696,6 +813,10 @@ static void draw_main(void) {
         if (b->id == B_EQ) font_puts(s, b->r->x + 6, b->r->y + 3, "EQ", active ? col(s, 0, 255, 0) : c);
         if (b->id == B_VIS) font_puts(s, b->r->x + 5, b->r->y + 3, "VIS", active ? col(s, 0, 255, 0) : c);
         if (b->id == B_LIST) font_puts(s, b->r->x + (b->r->w - font_w("LST")) / 2, b->r->y + 3, "LST", c);
+#ifdef LV_URL_ENABLED
+        if (b->id == B_URL) font_puts(s, b->r->x + (b->r->w - font_w("URL")) / 2, b->r->y + 3, "URL",
+                                      ui.url_visible ? col(s, 0, 255, 0) : c);
+#endif
         if (b->id == B_SEARCH) font_puts(s, b->r->x + (b->r->w - font_w("SRCH")) / 2, b->r->y + 3,
                                          "SRCH", search_is_open() ? col(s, 0, 255, 0) : c);
         if (b->id == B_RPT1) font_puts(s, b->r->x + (b->r->w - font_w("RPT1")) / 2, b->r->y + 3,
@@ -1175,6 +1296,10 @@ static void raise_all(void) {
     if (ui.eq_visible && ui.weq) SDL_RaiseWindow(ui.weq);
     if (ui.file_visible && ui.wfile) SDL_RaiseWindow(ui.wfile);
     if (ui.opt_visible && ui.wopt) SDL_RaiseWindow(ui.wopt);
+    if (ui.info_visible && ui.winfo) SDL_RaiseWindow(ui.winfo);
+#ifdef LV_URL_ENABLED
+    if (ui.url_visible && ui.wurl) SDL_RaiseWindow(ui.wurl);
+#endif
     if (search_is_open()) SDL_RaiseWindow(search_window());
 #endif
 }
@@ -1190,6 +1315,10 @@ static void focus_click_drag(Uint32 wid) {
     else if (ui.weq && wid == SDL_GetWindowID(ui.weq)) { w = ui.weq; drag = 7; }
     else if (ui.wfile && wid == SDL_GetWindowID(ui.wfile)) { w = ui.wfile; drag = 9; }
     else if (ui.wopt && wid == SDL_GetWindowID(ui.wopt)) { w = ui.wopt; drag = 11; }
+    else if (ui.winfo && wid == SDL_GetWindowID(ui.winfo)) { w = ui.winfo; drag = 14; }
+#ifdef LV_URL_ENABLED
+    else if (ui.wurl && wid == SDL_GetWindowID(ui.wurl)) { w = ui.wurl; drag = 13; }
+#endif
     if (!w) {
         if (search_is_open() && wid == search_window_id()) search_focus_drag();
         return;
@@ -1545,12 +1674,24 @@ static void handle_file_mouse(SDL_Event *e) {
 }
 
 /* Enter in the path field: valid dir -> navigate; valid audio file ->
-   load + play + close (same tail as file_choose); anything else -> red
-   "path not valid" for ~1 s with the typed text UNTOUCHED (the browser
-   stays put so the entry can be corrected). */
+   load + play + close (same tail as file_choose); a URL -> the URL
+   window's transient-play path (D3: a typed URL must not become a
+   persistent row); anything else -> red "path not valid" for ~1 s with
+   the typed text UNTOUCHED (the browser stays put so the entry can be
+   corrected). */
+#ifdef LV_URL_ENABLED
+static void url_play_transient(Player *p, const char *url); /* fwd: defined with the URL window below */
+#endif
 static void file_field_enter(void) {
     if (ui.file_saving) { file_save_enter(); return; }
     if (!ui.file_field[0]) return;
+#ifdef LV_URL_ENABLED
+    if (lv_is_url(ui.file_field)) {
+        url_play_transient(ui.pl, ui.file_field);
+        file_close();
+        return;
+    }
+#endif
     struct stat st;
     if (stat(ui.file_field, &st) == 0) {
         if (S_ISDIR(st.st_mode)) {
@@ -1622,6 +1763,238 @@ static void file_text(const char *text) {
     file_build_view();
 }
 
+#ifdef LV_URL_ENABLED
+/* ---------- URL loader window (streaming-plan UI entry) ---------- */
+#define URL_W 320
+#define URL_H 48
+#define URL_H_NOFF 64 /* grown variant: one red notice line below the field */
+#define URL_FLD_RECT Rect fld = {6, 26, URL_W - 12, 16}
+
+/* Transient one-row playlist (plan: play = transient, the row NEVER
+   persists): built off-lock, pointers swapped under the microlock —
+   the daemon play-handler shape, so big-open discipline and the
+   every-frame UI draw lock stay intact. Shared by the URL window's
+   Enter and a URL typed into the file-browser path field. */
+static void url_play_transient(Player *p, const char *url) {
+    Playlist np;
+    pl_init(&np);
+    pl_add_file(&np, url);
+    if (np.count == 0) { pl_clear(&np); return; } /* OOM: play nothing */
+    pthread_mutex_lock(&p->mtx);
+    pl_clear(p->pl);
+    p->pl->items = np.items;
+    p->pl->count = np.count;
+    p->pl->cap = np.cap;
+    pthread_mutex_unlock(&p->mtx);
+    pl_post(p, CMD_PLAY, 0);
+}
+
+/* Park the URL window flush above main — the BOTTOM of the above-stack
+   (layout: URL between main and EQ) — and push every window
+   already snapped above one level up. The height is read from the live
+   window (48 normal, 64 with the no-ffmpeg notice), never URL_H.
+   x left-aligns to main like the flush-above snap rule (URL_W=320 rides
+   5 px over main's right edge, accepted geometry). */
+static void url_dock_above_main(void) {
+    int mx, my, uw, uh;
+    SDL_GetWindowPosition(ui.wmain, &mx, &my);
+    SDL_GetWindowSize(ui.wurl, &uw, &uh);
+    SDL_SetWindowPosition(ui.wurl, mx, my - uh);
+    ui.snap[SNAP_URL].w = ui.wurl;
+    ui.snap[SNAP_URL].dx = 0;
+    ui.snap[SNAP_URL].dy = -uh;
+    reflow_above(ui.wurl, my - uh);
+}
+
+static void url_close(void) {
+    ui.url_visible = 0;
+    ui.url_focus = 0;
+    /* leaving the above-stack merges everything snapped above it down
+       (closing URL while docked to EQ merges EQ to main) */
+    int was_above = ui.snap[SNAP_URL].w == ui.wurl && ui.snap[SNAP_URL].dy < 0;
+    ui.snap[SNAP_URL].w = NULL;
+    if (ui.wurl) SDL_HideWindow(ui.wurl);
+    if (was_above) {
+        int mx, my;
+        SDL_GetWindowPosition(ui.wmain, &mx, &my);
+        reflow_above(NULL, my);
+    }
+}
+
+static void urlwin_open(void) {
+    if (!ui.wurl) {
+        int mx, my;
+        SDL_GetWindowPosition(ui.wmain, &mx, &my);
+        ui.wurl = SDL_CreateWindow("levari - url", mx + MAIN_W + 4, my + 40,
+                                   URL_W, URL_H, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
+        if (!ui.wurl) return;
+        SDL_Surface *icon = skin_app_icon(32);
+        if (icon) {
+            SDL_SetWindowIcon(ui.wurl, icon);
+            SDL_FreeSurface(icon);
+        }
+        ui.surl = SDL_GetWindowSurface(ui.wurl);
+    }
+    /* The window must tell the USER that streaming cannot work without the
+       libav* backend (probe: 1 loadable, 2 missing, 0 not compiled in — all
+       non-1 states are inert): a terminal line is invisible to a GUI launch.
+       Re-probed per open — the answer is cached inside ff_syms, so this is
+       a flag read once ffmpeg has ever loaded. */
+    ui.url_ff_code = dec_ffmpeg_probe_info(ui.url_ff_ver, sizeof ui.url_ff_ver, NULL, 0);
+    ui.url_ff_ok = ui.url_ff_code == 1;
+    if (!ui.url_ff_ok) {
+        SDL_SetWindowSize(ui.wurl, URL_W, URL_H_NOFF);
+        ui.surl = SDL_GetWindowSurface(ui.wurl);
+    } else if (ui.surl && ui.surl->h != URL_H) {
+        SDL_SetWindowSize(ui.wurl, URL_W, URL_H);
+        ui.surl = SDL_GetWindowSurface(ui.wurl);
+    }
+    /* LAZY prefill on open (D5): text only, inert — NOTHING probes or
+       GETs here; whatever urlIndex holds (including tampered bytes) is
+       re-validated by the Enter gate at play time */
+    char banked[LV_MAX_PATH];
+    if (lib_url_index_load(banked, sizeof banked) == 0)
+        lv_strlcpy(ui.url_field, banked, sizeof ui.url_field);
+    else
+        ui.url_field[0] = 0;
+    ui.url_tf.buf = ui.url_field;
+    ui.url_tf.cap = sizeof ui.url_field;
+    ui.url_tf.caret = (int)strlen(ui.url_field);
+    ui.url_tf.selall = 0;
+    ui.url_focus = 1;
+    ui.url_err = 0;
+    ui.url_visible = 1;
+    /* every open docks the window above main (2026-11-07 layout):
+       flush above main, below anything already snapped there, which is
+       pushed up. Dock AFTER the 48/64 resize above — the live size decides
+       the geometry. */
+    url_dock_above_main();
+    SDL_ShowWindow(ui.wurl);
+    raise_all();
+}
+
+/* Enter = open + play, then close. The scheme gate + allowlist re-check
+   EVERYTHING regardless of source (typed/pasted/prefilled-from-tampered-
+   file): rejection is the file_err pattern — red field text ~1 s, the
+   entry survives so it can be corrected, the window stays open. */
+static void url_enter(void) {
+    if (!ui.url_field[0]) return;
+    if (!lv_is_url(ui.url_field) ||
+        !lv_url_scheme_allowed(ui.url_field, LV_URL_SCHEMES)) {
+        ui.url_err = 1;
+        ui.url_err_at = SDL_GetTicks();
+        return;
+    }
+    if (!ui.url_ff_ok) return; /* streaming cannot work at all: the red
+                                  notice in the window is the explanation,
+                                  and swapping in a doomed row would only
+                                  confuse (no shape error — that is a
+                                  different message) */
+    url_play_transient(ui.pl, ui.url_field);
+    url_close();
+}
+
+/* file-browser style: while the window is open EVERY key belongs to the
+   field, so typing must never fire global playback shortcuts */
+static int url_key(SDL_Event *e) {
+    int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
+    switch (e->key.keysym.sym) {
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        url_enter();
+        break;
+    case SDLK_ESCAPE:
+        url_close();
+        break;
+    case SDLK_LEFT:      tf_left(&ui.url_tf);  break;
+    case SDLK_RIGHT:     tf_right(&ui.url_tf); break;
+    case SDLK_HOME:      tf_home(&ui.url_tf);  break;
+    case SDLK_END:       tf_end(&ui.url_tf);   break;
+    case SDLK_BACKSPACE: tf_backspace(&ui.url_tf); break;
+    case SDLK_DELETE:    tf_del(&ui.url_tf);   break;
+    case SDLK_a: if (ctrl) tf_selectall(&ui.url_tf); break;
+    case SDLK_c: if (ctrl) tf_copy(&ui.url_tf); break;
+    case SDLK_x: if (ctrl) tf_cut(&ui.url_tf); break;
+    case SDLK_v: if (ctrl) tf_paste(&ui.url_tf); break; /* tf_sanitize_paste:
+        CRLF/quote/control hygiene exactly like the file field — the paste
+        hygiene rule of the streaming plan */
+    default: break;
+    }
+    return 1;
+}
+
+static void url_text(const char *text) {
+    if (ui.url_focus) tf_insert(&ui.url_tf, text);
+}
+
+/* Red notice under the field, by probe state: absent (2) and ABI-mismatch
+   (3) get different sentences — a machine with a real ffmpeg that merely
+   predates this build must not be told "not found" (Ubuntu
+   6.1.1 vs a 7.x-built binary, 2026-11-07). Enter is inert for both. */
+static const char *url_ff_notice(int code) {
+    return code == 3 ? "ffmpeg found but incompatible - see options"
+                     : "ffmpeg not found - install it or set libav.dir";
+}
+
+static void draw_url(void) {
+    SDL_Surface *s = ui.surl;
+    if (!s) return;
+    skin_window_bg(s, URL_W, s->h);   /* grows with the no-ffmpeg notice */
+    font_puts(s, 10, 6, "URL", col(s, 0, 224, 255));
+    { Rect x = close_rect(URL_W); draw_x(s, &x, ui.pressed == B_URLX); }
+    URL_FLD_RECT;
+    SDL_Rect fb = { fld.x, fld.y, fld.w, fld.h };
+    SDL_FillRect(s, &fb, col(s, 0, 0, 0));
+    SDL_Rect t = { fld.x, fld.y, fld.w, 1 }, b = { fld.x, fld.y + fld.h - 1, fld.w, 1 };
+    SDL_Rect l = { fld.x, fld.y, 1, fld.h }, r = { fld.x + fld.w - 1, fld.y, 1, fld.h };
+    int fwin_focused = ui.app_focused && ui.wurl &&
+                       ui.focus_wid == SDL_GetWindowID(ui.wurl);
+    Uint32 bc = (ui.url_focus && fwin_focused) ? col(s, 0, 224, 255) : col(s, 90, 90, 90);
+    SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+    SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+    if (ui.url_err) {
+        font_puts16(s, fld.x + 3, fld.y + 1, "url not allowed", col(s, 255, 60, 60));
+    } else {
+        int blink = (SDL_GetTicks() / 500) % 2 == 0;
+        draw_field_text(s, fld, ui.url_field, &ui.url_tf,
+                        ui.url_focus && fwin_focused, blink);
+    }
+    if (!ui.url_ff_ok)
+        font_puts(s, fld.x, URL_H + 3, url_ff_notice(ui.url_ff_code),
+                  col(s, 255, 60, 60));
+}
+
+static void handle_url_mouse(SDL_Event *e) {
+    int x = e->motion.x, y = e->motion.y;
+    URL_FLD_RECT;
+    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
+        Rect xc = close_rect(URL_W);
+        if (in_rect(&xc, x, y)) { ui.pressed = B_URLX; return; }
+        if (in_rect(&fld, x, y)) {
+            ui.url_focus = 1;
+            ui.url_err = 0;
+            ui.url_tf.caret = (int)strlen(ui.url_field);
+            ui.url_tf.selall = 0;
+            return;
+        }
+        if (y < 22) { ui.drag = 13; drag_begin(ui.wurl); }
+    } else if (e->type == SDL_MOUSEBUTTONUP) {
+        Rect xc = close_rect(URL_W);
+        if (ui.pressed == B_URLX && in_rect(&xc, x, y)) url_close();
+        ui.pressed = B_NONE;
+        if (ui.drag == 13) {
+            ui_drag_bounce(ui.wurl, ui.drag_wxlo, ui.drag_wxhi,
+                           ui.drag_wylo, ui.drag_wyhi);
+            ui.drag = 0;
+        }
+    } else if (e->type == SDL_MOUSEMOTION && ui.drag == 13) {
+        /* live side/above snap like EQ/options: the above branch inserts
+           at the bottom of the above-stack (ui_snap_next_to_main) */
+        drag_move_snap(ui.wurl);
+    }
+}
+#endif /* LV_URL_ENABLED */
+
 /* ---------- options window ---------- */
 
 static const struct { const char *lbl; int y; } OPT_ROWS[OPTF_N] = {
@@ -1637,10 +2010,11 @@ static Rect opt_save_rect(void)  { Rect r = { OPT_W - 142, 224, 60, 14 }; return
 static Rect opt_close_rect(void) { Rect r = { OPT_W - 72,  224, 60, 14 }; return r; }
 static Rect opt_clear_rect(void) { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBIDX].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_tog_rect(int i)  { Rect r = { OPT_FLD_X + i * 52, 190, 48, 14 }; return r; }
-/* BASIC/ADVANCED tab buttons: small tabs in the title bar, right of the
-   "OPTIONS" label (ends at x=52); visible on both tabs */
+/* BASIC/ADVANCED/ABOUT tab buttons: small tabs in the title bar, right of
+   the "OPTIONS" label (ends at x=52); visible on all three pages */
 static Rect opt_tab_basic_rect(void) { Rect r = { 60, 4, 38, 14 }; return r; }
 static Rect opt_tab_adv_rect(void)   { Rect r = { 102, 4, 26, 14 }; return r; }
+static Rect opt_tab_about_rect(void) { Rect r = { 132, 4, 38, 14 }; return r; }
 /* LARGE toggle (ADV page): beside its description text — the lines at
    y=52/66 end at x=178, so the button sits right of them, vertically
    centered on the two-line block */
@@ -1648,6 +2022,48 @@ static Rect opt_large_rect(void)     { Rect r = { 186, 56, 48, 14 }; return r; }
 /* 10FPS toggle (ADV page): same column, below the LARGE block */
 static Rect opt_fps_rect(void)       { Rect r = { 186, 114, 48, 14 }; return r; }
 static Rect opt_enc_rect(void)       { Rect r = { 186, 150, 72, 14 }; return r; }
+
+/* ffmpeg detection status for the ADV page (streaming substrate): the
+   probe dlopens-and-closes per call, so it runs ONCE at opt_open into
+   ui.opt_ff — same restart semantics as the libav.dir field beside it.
+   Detected == dec_ffmpeg_probe()==1; anything else (2 = built but
+   libav* missing at runtime, 0 = backend not compiled in) reads
+   "unavailable" honestly. The version suffix is the release of the
+   library the loader ACTUALLY resolved (probe_info) — the versioned
+   soname candidates stop at 62, so a bare-name hit can be a newer
+   major and the number is the only way to see which one is running. */
+static const char *opt_ff_label(int ok, const char *ver, int *red) {
+    static char buf[96];
+    if (ok == 1) {
+        *red = 0;
+        if (ver && ver[0]) {
+            snprintf(buf, sizeof buf, "ffmpeg: detected %s", ver);
+            return buf;
+        }
+        return "ffmpeg: detected";
+    }
+    *red = 1;
+    if (ok == 3) { /* found, but a different libav major than this
+                      binary's headers — a mismatched layout would be
+                      read as garbage fields, so ffmpeg formats stay off */
+        if (ver && ver[0]) {
+            snprintf(buf, sizeof buf, "ffmpeg: found %s - incompatible build", ver);
+            return buf;
+        }
+        return "ffmpeg: found - incompatible build";
+    }
+    return "ffmpeg: not found - streaming unavailable";
+}
+/* Prefill a BLANK libav.dir field with the directory the probe resolved
+   the libraries from (master 2026-11-07: detected -> show where). Field
+   only — cfg keeps its value until the usual save — and a filled field
+   is the user's decision, never overwritten. A pinned dir can make
+   loading no worse than an empty one: ff_dlopen falls back to the keg
+   paths and the bare soname search when the configured dir misses. */
+static void ff_prefill_libav(int probe_ok, const char *dir) {
+    if ((probe_ok == 1 || probe_ok == 3) && dir && dir[0] && !ui.opt_field[OPTF_LIBAV][0])
+        lv_strlcpy(ui.opt_field[OPTF_LIBAV], dir, LV_MAX_PATH);
+}
 static Rect opt_scan_rect(void)  { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBDIRS].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_chk_rect(void)   { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP + OPT_SCAN_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBDIRS].y, OPT_CHK_W, OPT_FLD_H }; return r; }
 
@@ -1669,6 +2085,7 @@ static void opt_open(void) {
         }
         ui.sopt = SDL_GetWindowSurface(ui.wopt);
     }
+    char ffdir[LV_MAX_PATH];
     ui.opt_field[OPTF_LIBDIRS][0] = 0;
     for (int i = 0; i < cfg.lib_dir_n; i++) {
         if (i) strncat(ui.opt_field[OPTF_LIBDIRS], ";", LV_MAX_PATH - strlen(ui.opt_field[OPTF_LIBDIRS]) - 1);
@@ -1691,7 +2108,10 @@ static void opt_open(void) {
     ui.opt_f10 = cfg.ui_always10 > 0;
     ui.opt_enc = cfg.tag_legacy_enc + 1;   /* LV_ENC_AUTO(-1) -> cycle 0 */
     if (ui.opt_enc < 0 || ui.opt_enc > 4) ui.opt_enc = 0;
-    ui.opt_adv = 0;
+    ui.opt_ff = dec_ffmpeg_probe_info(ui.opt_ff_ver, sizeof ui.opt_ff_ver,
+                                      ffdir, sizeof ffdir);
+    ff_prefill_libav(ui.opt_ff, ffdir);
+    ui.opt_tab = 0;
     ui.opt_hover = -1;
     ui.opt_focus = -1;
     ui.opt_caret = 0;
@@ -1812,6 +2232,46 @@ static void opt_clear_index(void) {
     lv_strlcpy(ui.opt_status, "index cleared", sizeof ui.opt_status);
 }
 
+/* ABOUT page graphic: the levari logo (assets/levari.svg) as a 24x24
+   pixel-art record, painted at 2x. Grid chars: '.' transparent, F rim +
+   specular, G body, D groove, B label edge, K spindle hole — the colors
+   are sampled from the SVG. Swap the rows for different art. */
+static const char *ABOUT_ART[] = {
+    ".........FFFFFF.........",
+    ".......FFGGGGGGFF.......",
+    ".....FFGFFFFFGGGGFF.....",
+    "....FGFFGDDDDDDGGGGF....",
+    "...FGFFDDGGGGGGDDGGGF...",
+    "..FGGGDGGDDDDDDGGDGGGF..",
+    "..FGGDGGDDGGGGDDGGDGGF..",
+    ".FGGDGGDGGDDDDGGDGGDGGF.",
+    ".FGGDGDGDDGGGGDDGDGDGGF.",
+    "FGGDGDDGDGGBBGGDGDDGDGGF",
+    "FGGDGDGDGGBGGBGGDGDGDGGF",
+    "FGGDGDGDGBGKKGBGDGDGDGGF",
+    "FGGDGDGDGBGKKGBGDGDGDGGF",
+    "FGGDGDGDGGBGGBGGDGDGDGGF",
+    "FGGDGDDGDGGBBGGDGDDGDGGF",
+    ".FGGDGDGDDGGGGDDGDGDGGF.",
+    ".FGGDGGDGGDDDDGGDGGDGGF.",
+    "..FGGDGGDDGGGGDDGGDGGF..",
+    "..FGGGDGGDDDDDDGGDGGGF..",
+    "...FGGGDDGGGGGGDDGGGF...",
+    "....FGGGGDDDDDDGGGGF....",
+    ".....FFGGGGGGGGGGFF.....",
+    ".......FFGGGGGGFF.......",
+    ".........FFFFFF.........",
+};
+static Uint32 about_art_col(SDL_Surface *s, char ch) {
+    switch (ch) {
+    case 'F': return col(s, 0xf2, 0xc9, 0x63);
+    case 'G': return col(s, 0xd9, 0xa4, 0x41);
+    case 'D': return col(s, 0xa8, 0x7f, 0x2f);
+    case 'B': return col(s, 0x7a, 0x5c, 0x20);
+    default:  return col(s, 0x2e, 0x24, 0x10); /* K + anything else */
+    }
+}
+
 static void draw_opt(void) {
     SDL_Surface *s = ui.sopt;
     if (!s) return;
@@ -1822,17 +2282,20 @@ static void draw_opt(void) {
                 LV_ARCH " v" LV_VERSION, col(s, 150, 150, 150));
       draw_x(s, &x, ui.pressed == OPTB_X); }
 
-    /* BASIC / ADVANCED tabs: small buttons in the title bar, visible on
-       both pages; the active tab is lit green */
-    { Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect();
-      skin_button(s, &tb, ui.pressed == OPTB_TABB, !ui.opt_adv);
+    /* BASIC / ADV / ABOUT tabs: small buttons in the title bar, visible on
+       all pages; the active tab is lit green */
+    { Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect(), tu = opt_tab_about_rect();
+      skin_button(s, &tb, ui.pressed == OPTB_TABB, !ui.opt_tab);
       font_puts(s, tb.x + (tb.w - font_w("BASIC")) / 2, tb.y + 3, "BASIC",
-                ui.opt_adv ? col(s, 220, 220, 220) : col(s, 0, 255, 0));
-      skin_button(s, &ta, ui.pressed == OPTB_TABA, ui.opt_adv);
+                ui.opt_tab ? col(s, 220, 220, 220) : col(s, 0, 255, 0));
+      skin_button(s, &ta, ui.pressed == OPTB_TABA, ui.opt_tab == 1);
       font_puts(s, ta.x + (ta.w - font_w("ADV")) / 2, ta.y + 3, "ADV",
-                ui.opt_adv ? col(s, 0, 255, 0) : col(s, 220, 220, 220)); }
+                ui.opt_tab == 1 ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
+      skin_button(s, &tu, ui.pressed == OPTB_TABU, ui.opt_tab == 2);
+      font_puts(s, tu.x + (tu.w - font_w("ABOUT")) / 2, tu.y + 3, "ABOUT",
+                ui.opt_tab == 2 ? col(s, 0, 255, 0) : col(s, 220, 220, 220)); }
 
-    if (!ui.opt_adv)
+    if (!ui.opt_tab)
     for (int i = 0; i < OPTF_N; i++) {
         font_puts(s, 10, OPT_ROWS[i].y + 5, OPT_ROWS[i].lbl, col(s, 150, 150, 150));
         Rect f = opt_field_rect(i);
@@ -1853,7 +2316,7 @@ static void draw_opt(void) {
         ui.opt_caret = tf.caret;   /* the helper clamps a stale caret */
     }
 
-    if (!ui.opt_adv) {
+    if (!ui.opt_tab) {
     Rect sc = opt_scan_rect();
     skin_button(s, &sc, ui.pressed == OPTB_SCAN && !ui.opt_scanning, 0);
     const char *sl = ui.opt_scanning ? "BUSY" : "SCAN";
@@ -1881,7 +2344,7 @@ static void draw_opt(void) {
               ui.opt_tags ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
     }
 
-    if (!ui.opt_adv) {
+    if (!ui.opt_tab) {
     static const struct { int id; const char *l; } TOG[6] = {
         { OPTB_TPL, "UI PL" }, { OPTB_TEQ, "UI EQ" },
         { OPTB_TVIS, "UI VIS" }, { OPTB_TSRCH, "UI SRCH" },
@@ -1897,7 +2360,7 @@ static void draw_opt(void) {
         font_puts(s, r.x + (r.w - font_w(TOG[i].l)) / 2, r.y + 3, TOG[i].l,
                   on ? col(s, 0, 255, 0) : col(s, 220, 220, 220));
     }
-    } else {
+    } else if (ui.opt_tab == 1) {
         /* ADVANCED page: LARGE = allow ingest of files over the 256 MB
            decode cap (OOM guard for the slurp-based decoders) */
         font_puts(s, 10, 30, "ADVANCED", col(s, 150, 150, 150));
@@ -1924,6 +2387,45 @@ static void draw_opt(void) {
         const char *el = ENCL[ui.opt_enc % 5];
         font_puts(s, r3.x + (r3.w - font_w(el)) / 2, r3.y + 3, el,
                   ui.opt_enc ? col(s, 0, 224, 255) : col(s, 220, 220, 220));
+        /* ffmpeg substrate status (streaming + aac/m4a/wma): tells the
+           user here whether installing/pointing libav.dir is needed at all */
+        int ffred;
+        const char *ffl = opt_ff_label(ui.opt_ff, ui.opt_ff_ver, &ffred);
+        font_puts(s, 10, 186, ffl,
+                  ffred ? col(s, 255, 60, 60) : col(s, 0, 255, 0));
+    } else {
+        /* ABOUT page: static credits, no controls — centered title/icon/
+           creator block over a left-aligned thanks list */
+        font_puts_big(s, (OPT_W - font_w_big("Levari")) / 2, 28, "Levari", col(s, 0, 224, 255));
+        /* pixel-art record at 2x, centered under the title */
+        int ax = (OPT_W - 48) / 2, ay = 48;
+        for (int y = 0; y < (int)(sizeof ABOUT_ART / sizeof *ABOUT_ART); y++)
+            for (int x = 0; ABOUT_ART[y][x]; x++) {
+                if (ABOUT_ART[y][x] == '.') continue;
+                SDL_Rect p = { ax + x * 2, ay + y * 2, 2, 2 };
+                SDL_FillRect(s, &p, about_art_col(s, ABOUT_ART[y][x]));
+            }
+        {
+            const char *lbl = "created by ", *nm = "Purkkaviritys";
+            int cw = font_w(lbl) + 1 + font_w(nm);
+            int cx = (OPT_W - cw) / 2;
+            font_puts(s, cx, 106, lbl, col(s, 150, 150, 150));
+            font_puts(s, cx + font_w(lbl) + 1, 106, nm, col(s, 0, 255, 0));
+        }
+        font_puts(s, 10, 126, "with thanks to", col(s, 150, 150, 150));
+        static const char *THANKS[] = {
+            "SDL2",
+            "libmodplug",
+            "snes_spc (blargg)",
+            "stb_vorbis (Sean Barrett)",
+            "dr_wav, dr_flac (David Reid)",
+            "minimp3 (lieff)",
+            "cJSON (Dave Gamble)",
+            "GNU Unifont",
+            "ffmpeg",
+        };
+        for (int i = 0; i < (int)(sizeof THANKS / sizeof *THANKS); i++)
+            font_puts(s, 10, 138 + i * 9, THANKS[i], col(s, 220, 220, 220));
     }
 
     Rect sv = opt_save_rect(), cl = opt_close_rect();
@@ -1932,7 +2434,7 @@ static void draw_opt(void) {
     skin_button(s, &cl, ui.pressed == OPTB_CLOSE, 0);
     font_puts(s, cl.x + (cl.w - font_w("CLOSE")) / 2, cl.y + 3, "CLOSE", col(s, 220, 220, 220));
 
-    if (!ui.opt_adv) {
+    if (!ui.opt_tab) {
     Rect cr = opt_clear_rect();
     skin_button(s, &cr, ui.pressed == OPTB_CLEAR && !ui.opt_scanning, 0);
     font_puts(s, cr.x + (cr.w - font_w("CLEAR")) / 2, cr.y + 3, "CLEAR", col(s, 220, 220, 220));
@@ -1980,16 +2482,19 @@ static void handle_opt_mouse(SDL_Event *e) {
         Rect sv = opt_save_rect(), cl = opt_close_rect();
         if (in_rect(&sv, x, y)) { ui.pressed = OPTB_SAVE; return; }
         if (in_rect(&cl, x, y)) { ui.pressed = OPTB_CLOSE; return; }
-        Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect();
+        Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect(), tu = opt_tab_about_rect();
         if (in_rect(&tb, x, y)) { ui.pressed = OPTB_TABB; return; }
         if (in_rect(&ta, x, y)) { ui.pressed = OPTB_TABA; return; }
-        if (ui.opt_adv) {
-            Rect tg = opt_large_rect();
-            if (in_rect(&tg, x, y)) { ui.pressed = OPTB_TLARGE; return; }
-            Rect tf = opt_fps_rect();
-            if (in_rect(&tf, x, y)) { ui.pressed = OPTB_TFPS; return; }
-            Rect te = opt_enc_rect();
-            if (in_rect(&te, x, y)) { ui.pressed = OPTB_TENC; return; }
+        if (in_rect(&tu, x, y)) { ui.pressed = OPTB_TABU; return; }
+        if (ui.opt_tab) {
+            if (ui.opt_tab == 1) {
+                Rect tg = opt_large_rect();
+                if (in_rect(&tg, x, y)) { ui.pressed = OPTB_TLARGE; return; }
+                Rect tf = opt_fps_rect();
+                if (in_rect(&tf, x, y)) { ui.pressed = OPTB_TFPS; return; }
+                Rect te = opt_enc_rect();
+                if (in_rect(&te, x, y)) { ui.pressed = OPTB_TENC; return; }
+            }
             if (y < 22) { ui.drag = 11; drag_begin(ui.wopt); ui.opt_focus = -1; }
             return;
         }
@@ -2020,10 +2525,11 @@ static void handle_opt_mouse(SDL_Event *e) {
             Rect xc = close_rect(OPT_W);
             Rect sv = opt_save_rect(), cl = opt_close_rect();
             Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect(), tg0 = opt_large_rect();
-            Rect tf0 = opt_fps_rect(), te0 = opt_enc_rect();
+            Rect tf0 = opt_fps_rect(), te0 = opt_enc_rect(), tu = opt_tab_about_rect();
             if (ui.pressed == OPTB_X && in_rect(&xc, x, y)) opt_close();
-            else if (ui.pressed == OPTB_TABB && in_rect(&tb, x, y)) { ui.opt_adv = 0; ui.opt_focus = -1; }
-            else if (ui.pressed == OPTB_TABA && in_rect(&ta, x, y)) { ui.opt_adv = 1; ui.opt_focus = -1; }
+            else if (ui.pressed == OPTB_TABB && in_rect(&tb, x, y)) { ui.opt_tab = 0; ui.opt_focus = -1; }
+            else if (ui.pressed == OPTB_TABA && in_rect(&ta, x, y)) { ui.opt_tab = 1; ui.opt_focus = -1; }
+            else if (ui.pressed == OPTB_TABU && in_rect(&tu, x, y)) { ui.opt_tab = 2; ui.opt_focus = -1; }
             else if (ui.pressed == OPTB_TLARGE && in_rect(&tg0, x, y)) ui.opt_large = !ui.opt_large;
             else if (ui.pressed == OPTB_TFPS && in_rect(&tf0, x, y)) ui.opt_f10 = !ui.opt_f10;
             else if (ui.pressed == OPTB_TENC && in_rect(&te0, x, y)) {
@@ -2063,13 +2569,15 @@ static void handle_opt_mouse(SDL_Event *e) {
     } else if (e->type == SDL_MOUSEMOTION && ui.drag == 11) {
         drag_move_snap(ui.wopt);
     } else if (e->type == SDL_MOUSEMOTION) {
-        if (ui.opt_adv) {
+        if (ui.opt_tab == 1) {
             Rect te = opt_enc_rect();
             ui.opt_hover = in_rect(&te, x, y) ? OPTB_TENC : -1;
-        } else {
+        } else if (!ui.opt_tab) {
             Rect f = opt_field_rect(OPTF_LIBDIRS);
             ui.opt_hover = (x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
                            ? OPTF_LIBDIRS : -1;
+        } else {
+            ui.opt_hover = -1;
         }
     }
 }
@@ -2129,6 +2637,12 @@ static void action(int id) {
     case B_SHUF: p->shuffle = !p->shuffle; shuffle_persist(); break;
     case B_REPEAT: p->repeat = p->repeat == 1 ? 0 : 1; break;
     case B_RPT1: p->repeat = p->repeat == 2 ? 0 : 2; break;
+#ifdef LV_URL_ENABLED
+    case B_URL:
+        if (ui.url_visible) url_close();
+        else urlwin_open();
+        break;
+#endif
     case B_ABA:
         if (p->state != ST_STOP) p->ab_a = p->pos_frames;
         break;
@@ -2226,7 +2740,7 @@ static void action(int id) {
         ui.msg[0] = 0;                      /* a fresh attempt clears the old error */
         if (ui.pl_selall || ui.pl_multi_n == 0) break;
         if (ui.opt_scanning) { ui_msg("  scan running, wait"); break; }
-        int fails = 0;
+        int fails = 0, refused = 0;
         for (int k = 0; k < ui.pl_multi_n; k++) {
             int sel = ui.pl_multi[k];
             char path[LV_MAX_PATH];
@@ -2236,9 +2750,25 @@ static void action(int id) {
                 lv_strlcpy(path, p->pl->items[sel].path, sizeof path);
             pthread_mutex_unlock(&p->mtx);
             if (!path[0]) continue;         /* stale index / virtual row */
+            if (lv_is_url(path)) {          /* the index must NEVER see a
+                URL row (plan guard; hygiene even in LV_STREAMING=OFF
+                builds — transient rows are playable but rescannable-
+                index material they are not) */
+                printf("levari: scan skips URL row: %s\n", path);
+                continue;
+            }
             Tags nt;
             int ndur = 0, nnotag = 0;
-            if (lib_index_rescan(path, &nt, &ndur, &nnotag) != 0) {
+            int rrc = lib_index_rescan(path, &nt, &ndur, &nnotag);
+            if (rrc == -3) {          /* pre-v2 index, un-migratable: the
+                batch refuses, the file is untouched — never silently
+                half-reset the cache (only a full scan rewrites) */
+                fprintf(stderr, "levari: rescan refused, index needs a full"
+                                " scan: %s\n", path);
+                refused = 1;
+                continue;
+            }
+            if (rrc != 0) {
                 fprintf(stderr, "levari: cannot rescan %s\n", path);
                 fails = 1;
                 continue;
@@ -2253,7 +2783,8 @@ static void action(int id) {
             }
             pthread_mutex_unlock(&p->mtx);
         }
-        if (fails) ui_msg("  cannot rescan");
+        if (refused) ui_msg("  index: run full scan");
+        else if (fails) ui_msg("  cannot rescan");
         break;
     }
     case B_OPEN: case PB_ADD: file_open(); break;
@@ -2307,10 +2838,8 @@ static void handle_main_mouse(SDL_Event *e) {
         }
         if (y < 22) {
             ui.drag = 3; drag_begin(ui.wmain);
-            /* follow bookkeeping is drag-scoped too: re-baseline every
-               carried window on its first follow step (follow_move) */
-            ui.follow_pl.valid = 0;
-            for (int i = 0; i < 4; i++) ui.follow_snap[i].valid = 0;
+            /* follow bookkeeping is drag-scoped too: drag_begin
+               re-baselines every carried window */
         }
     } else if (e->type == SDL_MOUSEBUTTONUP && ui.drag == 0 && ui.pressed != B_NONE) {
         Rect xc = close_rect(MAIN_W);
@@ -2337,7 +2866,7 @@ static void handle_main_mouse(SDL_Event *e) {
             SDL_GetWindowPosition(ui.wmain, &wx, &wy);
             if (ui.pl_docked && ui.pl_visible)
                 follow_move(ui.wpl, &ui.follow_pl, wx, wy + MAIN_H);
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < SNAP_NSLOT; i++)
                 if (ui.snap[i].w)
                     follow_move(ui.snap[i].w, &ui.follow_snap[i], wx + ui.snap[i].dx, wy + ui.snap[i].dy);
         }
@@ -2487,9 +3016,14 @@ static void pl_saveas_open(void) {
     file_open();
 }
 
+static void info_open(void);
+
 static void pl_menu_action(int act) {
     Player *p = ui.pl;
     switch (act) {
+    case PM_INFO:
+        info_open();
+        break;
     case PM_SAVEAS:
         pl_saveas_open();
         break;
@@ -3024,8 +3558,190 @@ static Uint32 ev_win(const SDL_Event *e) {
 #define D_FILE 8u
 #define D_OPT  16u
 #define D_SRCH 32u
-#define D_ALL  (D_MAIN | D_PL | D_EQ | D_FILE | D_OPT | D_SRCH)
+#define D_URL  64u
+#define D_INFO 128u
+#define D_ALL  (D_MAIN | D_PL | D_EQ | D_FILE | D_OPT | D_SRCH | D_URL | D_INFO)
 static unsigned ui_dirty;
+
+/* ---- song-info window (edit menu PM_INFO) ---------------------------------
+   ONE row's tags, read fresh from disk at invocation — deliberately NOT
+   the library index: the user sees what the file carries now (tags edited
+   after the last scan, files never scanned; the extended dump is
+   tag_read_full, the ID3v2/Vorbis-comment set on top of tag_probe's four
+   basics). A
+   virtual CUE row keeps the sheet-parsed tags instead: its on-disk file
+   is the .cue sheet and re-reading that would show nothing of the track.
+   The row is the single selected row, else the shift anchor, else the
+   playing row; none of those -> refused with the ui_msg line.
+   Values render in click-to-select copy boxes (the shared field chrome:
+   draw_field_text + TField + tf_copy — the house selection contract is
+   whole-buffer, so there is nothing to edit: click, Ctrl+C, paste). The
+   location splits LOCATION(dir)+FILE: LV_MAX_PATH is 4096 and the values
+   are one-liners, so the split keeps the file NAME visible. */
+#define INFO_W 360
+#define INFO_H 276
+#define INFO_TOP 28
+#define INFO_PITCH 22
+#define INFO_BOX_X 86
+enum { INFOI_TITLE, INFOI_ARTIST, INFOI_AARTIST, INFOI_COMPOSER, INFOI_ALBUM,
+       INFOI_TRACK, INFOI_YEAR, INFOI_GENRE, INFOI_COMMENT,
+       INFOI_DIR, INFOI_FILE, INFOI_N };
+static const char *const INFO_LBL[INFOI_N] = {
+    "TITLE", "ARTIST", "ALBUM ARTIST", "COMPOSER", "ALBUM",
+    "TRACK", "YEAR", "GENRE", "COMMENT", "LOCATION", "FILE"
+};
+static Rect info_row_rect(int i) {
+    Rect r = { INFO_BOX_X, INFO_TOP + i * INFO_PITCH, INFO_W - INFO_BOX_X - 10, 18 };
+    return r;
+}
+/* LOCATION/FILE show their tail (paths end in what matters); the tag
+   fields show their head */
+static int info_row_tail(int i) { return i >= INFOI_DIR; }
+static const char *info_row_text(int i) {
+    switch (i) {
+    case INFOI_TITLE:    return ui.info_full.title;
+    case INFOI_ARTIST:   return ui.info_full.artist;
+    case INFOI_AARTIST:  return ui.info_full.album_artist;
+    case INFOI_COMPOSER: return ui.info_full.composer;
+    case INFOI_ALBUM:    return ui.info_full.album;
+    case INFOI_TRACK:    return ui.info_full.track;
+    case INFOI_YEAR:     return ui.info_full.year;
+    case INFOI_GENRE:    return ui.info_full.genre;
+    case INFOI_COMMENT:  return ui.info_full.comment;
+    case INFOI_DIR:      return ui.info_dir;
+    case INFOI_FILE:     return ui.info_file;
+    default:             return "";
+    }
+}
+
+static void info_close(void) {
+    ui.info_visible = 0;
+    ui.info_focus = -1;
+    if (ui.winfo) SDL_HideWindow(ui.winfo);
+    ui_dirty |= D_INFO;
+}
+
+/* the focused box's whole value onto the clipboard (selection == buffer is
+   the textedit contract; empty boxes copy nothing) */
+static int info_copy_sel(void) {
+    if (ui.info_focus < 0 || ui.info_focus >= INFOI_N) return 0;
+    char *buf = (char *)info_row_text(ui.info_focus);   /* tf_copy only reads */
+    if (!buf[0]) return 0;
+    TField tf = { buf, 0, 0, 1 };
+    return tf_copy(&tf);
+}
+
+static void info_open(void) {
+    Player *p = ui.pl;
+    char path[LV_MAX_PATH];
+    Tags stored;
+    int cue = 0, have = 0;
+    pthread_mutex_lock(&p->mtx);
+    {
+        int row = (!ui.pl_selall && ui.pl_multi_n == 1) ? ui.pl_multi[0] : ui.pl_sel;
+        if (row < 0 || row >= p->pl->count) row = p->cur;
+        if (row >= 0 && row < p->pl->count) {
+            Track *t = &p->pl->items[row];
+            lv_strlcpy(path, t->path, sizeof path);
+            stored = t->tags;
+            cue = pl_ext_kind(path) == PL_CUE;
+            have = 1;
+        }
+    }
+    pthread_mutex_unlock(&p->mtx);
+    if (!have) { ui_msg("  no song selected"); return; }
+    tag_full_init(&ui.info_full);
+    if (cue) {                        /* CUE rows keep the sheet's parsed tags */
+        lv_strlcpy(ui.info_full.title, stored.title, sizeof ui.info_full.title);
+        lv_strlcpy(ui.info_full.artist, stored.artist, sizeof ui.info_full.artist);
+        lv_strlcpy(ui.info_full.album, stored.album, sizeof ui.info_full.album);
+        if (stored.track)
+            snprintf(ui.info_full.track, sizeof ui.info_full.track, "%d", stored.track);
+    } else {
+        tag_read_full(path, &ui.info_full);   /* fresh disk read, off the lock */
+    }
+    lv_strlcpy(ui.info_path, path, sizeof ui.info_path);
+    char *slash = lv_strrsep(ui.info_path);
+    if (slash) {
+        size_t dlen = (size_t)(slash - ui.info_path);
+        if (dlen >= sizeof ui.info_dir) dlen = sizeof ui.info_dir - 1;
+        memcpy(ui.info_dir, ui.info_path, dlen);
+        ui.info_dir[dlen] = 0;
+        lv_strlcpy(ui.info_file, slash + 1, sizeof ui.info_file);
+    } else {
+        ui.info_dir[0] = 0;
+        lv_strlcpy(ui.info_file, ui.info_path, sizeof ui.info_file);
+    }
+    if (!ui.winfo) {
+        int mx, my;
+        SDL_GetWindowPosition(ui.wmain, &mx, &my);
+        ui.winfo = SDL_CreateWindow("levari - song info", mx + MAIN_W + 4, my + 40,
+                                    INFO_W, INFO_H, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
+        if (!ui.winfo) return;
+        SDL_Surface *icon = skin_app_icon(32);
+        if (icon) {
+            SDL_SetWindowIcon(ui.winfo, icon);
+            SDL_FreeSurface(icon);
+        }
+        ui.sinfo = SDL_GetWindowSurface(ui.winfo);
+    }
+    ui.info_focus = -1;               /* a re-open never inherits a stale focus */
+    ui.info_visible = 1;
+    SDL_ShowWindow(ui.winfo);
+    raise_all();
+    ui_dirty |= D_INFO;
+}
+
+static void draw_info(void) {
+    SDL_Surface *s = ui.sinfo;
+    if (!s) return;
+    skin_window_bg(s, INFO_W, INFO_H);
+    font_puts(s, 10, 6, "SONG INFO", col(s, 0, 224, 255));
+    { Rect x = close_rect(INFO_W); draw_x(s, &x, ui.pressed == IB_X); }
+    int win_focused = ui.app_focused && ui.winfo &&
+                      ui.focus_wid == SDL_GetWindowID(ui.winfo);
+    for (int i = 0; i < INFOI_N; i++) {
+        Rect b = info_row_rect(i);
+        int foc = win_focused && ui.info_focus == i;
+        font_puts(s, 10, b.y + 5, INFO_LBL[i], col(s, 160, 160, 160));
+        /* the shared read-only field chrome: black box, gray border
+           (cyan when focused, the file-field pairing), then the shared
+           renderer for value/selection — caret pinned off (no editing) */
+        SDL_Rect rb = { b.x, b.y, b.w, b.h };
+        SDL_FillRect(s, &rb, col(s, 0, 0, 0));
+        Uint32 bc = foc ? col(s, 0, 224, 255) : col(s, 90, 90, 90);
+        SDL_Rect t = { b.x, b.y, b.w, 1 }, bot = { b.x, b.y + b.h - 1, b.w, 1 };
+        SDL_Rect l = { b.x, b.y, 1, b.h }, r = { b.x + b.w - 1, b.y, 1, b.h };
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &bot, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        const char *txt = info_row_text(i);
+        TField tf = { 0, 0, info_row_tail(i) ? (int)strlen(txt) : 0, 1 };
+        draw_field_text(s, b, txt[0] ? txt : "-", &tf, foc, 0);
+    }
+}
+
+static void handle_info_mouse(SDL_Event *e) {
+    int x = e->motion.x, y = e->motion.y;
+    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
+        Rect xc = close_rect(INFO_W);
+        if (in_rect(&xc, x, y)) { ui.pressed = IB_X; return; }
+        for (int i = 0; i < INFOI_N; i++) {
+            Rect b = info_row_rect(i);
+            if (in_rect(&b, x, y)) { ui.info_focus = i; return; }
+        }
+        if (y < 22) { ui.drag = 14; drag_begin(ui.winfo); }
+    } else if (e->type == SDL_MOUSEBUTTONUP) {
+        Rect xc = close_rect(INFO_W);
+        if (ui.pressed == IB_X && in_rect(&xc, x, y)) info_close();
+        ui.pressed = B_NONE;
+        if (ui.drag == 14) {
+            ui_drag_bounce(ui.winfo, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
+            ui.drag = 0;
+        }
+    } else if (e->type == SDL_MOUSEMOTION && ui.drag == 14) {
+        drag_move_snap(ui.winfo);
+    }
+}
 
 static void win_present(SDL_Window *w) {
     if (w && !(SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED))
@@ -3124,9 +3840,9 @@ int ui_run(Player *p, int show_pl) {
     ui_dirty = D_ALL;
     int wake = 1;   /* one-shot unfocused repaint after EXPOSED/SHOWN; 1 = paint once at startup */
     struct pollsnap { int state, cur, count; long long pos_s;
-                      int pl_vis, eq_vis, file_vis, opt_vis, search_open; };
+                      int pl_vis, eq_vis, file_vis, opt_vis, url_vis, search_open; };
     struct pollsnap snap_prev =
-        { -99, -99, -99, -9999, -1, -1, -1, -1, -1 };
+        { -99, -99, -99, -9999, -1, -1, -1, -1, -1, -1 };
     int running = 1;
     while (running) {
         if (ui_deadline_ms && SDL_GetTicks() >= ui_deadline_ms) break;
@@ -3147,6 +3863,10 @@ int ui_run(Player *p, int show_pl) {
             if (ui.weq && e.window.windowID == SDL_GetWindowID(ui.weq)) ui.seq = SDL_GetWindowSurface(ui.weq);
             if (ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) ui.sfile = SDL_GetWindowSurface(ui.wfile);
             if (ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) ui.sopt = SDL_GetWindowSurface(ui.wopt);
+            if (ui.winfo && e.window.windowID == SDL_GetWindowID(ui.winfo)) ui.sinfo = SDL_GetWindowSurface(ui.winfo);
+#ifdef LV_URL_ENABLED
+            if (ui.wurl && e.window.windowID == SDL_GetWindowID(ui.wurl)) ui.surl = SDL_GetWindowSurface(ui.wurl);
+#endif
             if (search_window() && e.window.windowID == search_window_id())
                 search_surface_refresh();
             /* whichever of our windows gets focus, bring the whole set forward
@@ -3168,6 +3888,9 @@ int ui_run(Player *p, int show_pl) {
                 if (search_is_open() && e.window.windowID == search_window_id()) SDL_StartTextInput();
                 else if (ui.opt_visible && ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) SDL_StartTextInput();
                 else if (ui.file_visible && ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) SDL_StartTextInput();
+#ifdef LV_URL_ENABLED
+                else if (ui.url_visible && ui.wurl && e.window.windowID == SDL_GetWindowID(ui.wurl)) SDL_StartTextInput();
+#endif
                 else SDL_StopTextInput();
                 /* the set surfaces as a unit: when focus arrives from another
                    app, raise every visible window, not just the one the WM
@@ -3189,6 +3912,35 @@ int ui_run(Player *p, int show_pl) {
             case SDLK_AUDIOPLAY: pl_post(p, CMD_TOGGLE_PAUSE, 0); break;
             case SDLK_AUDIOSTOP: pl_post(p, CMD_STOP, 0); break;
             default:
+                if (ui.info_visible && ui.winfo && ui.focus_wid == SDL_GetWindowID(ui.winfo)) {
+                    /* Esc closes the info window (pl_menu precedent). The
+                       value boxes are read-only: Ctrl+C (or Ctrl+Insert)
+                       copies the focused box wholesale — the textedit
+                       selection contract is whole-buffer, so Ctrl+A is
+                       already the state. Every other key keeps the global
+                       hotkey behaviour, same as when the EQ window holds
+                       focus — the window has no fields, so it must not
+                       eat text */
+                    const Uint8 *iks = SDL_GetKeyboardState(NULL);
+                    int ictrl = iks[SDL_SCANCODE_LCTRL] || iks[SDL_SCANCODE_RCTRL];
+                    SDL_Keycode isym = e.key.keysym.sym;
+                    if (isym == SDLK_ESCAPE) { info_close(); ui_dirty |= D_INFO; }
+                    else if (ictrl && (isym == SDLK_c || isym == SDLK_INSERT)) { info_copy_sel(); }
+                    else if (ictrl && isym == SDLK_a) { ui_dirty |= D_INFO; }
+                    else handle_key(&e);
+                }
+                else
+#ifdef LV_URL_ENABLED
+                if (ui.url_visible && ui.wurl && ui.focus_wid == SDL_GetWindowID(ui.wurl)) {
+                    /* the URL field eats EVERY key while its window holds
+                       focus (file-browser style): global playback hotkeys
+                       must not fire mid-paste */
+                    url_key(&e);
+                    ui_dirty |= D_URL;
+                    next = SDL_GetTicks(); /* paint the edit now */
+                }
+                else
+#endif
                 if (search_is_open() && ui.focus_wid == search_window_id()) search_key(&e);
                 else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_key(&e);
                 else if (ui.file_visible && ui.wfile && ui.focus_wid == SDL_GetWindowID(ui.wfile)) {
@@ -3208,6 +3960,14 @@ int ui_run(Player *p, int show_pl) {
         case SDL_TEXTINPUT:
             if (search_is_open() && ui.focus_wid == search_window_id()) search_text(e.text.text);
             else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) opt_text(e.text.text);
+#ifdef LV_URL_ENABLED
+            else if (ui.url_visible && ui.wurl && ui.focus_wid == SDL_GetWindowID(ui.wurl) &&
+                     ui.url_focus) {
+                url_text(e.text.text);
+                ui_dirty |= D_URL;
+                next = SDL_GetTicks();
+            }
+#endif
             else if (ui.file_visible && ui.wfile && ui.focus_wid == SDL_GetWindowID(ui.wfile) &&
                      ui.file_focus) {
                 file_text(e.text.text);
@@ -3250,6 +4010,10 @@ int ui_run(Player *p, int show_pl) {
             else if (ui.weq && wid == SDL_GetWindowID(ui.weq)) { handle_eq_mouse(&e); ui_dirty |= D_EQ; }
             else if (ui.wfile && wid == SDL_GetWindowID(ui.wfile)) { handle_file_mouse(&e); ui_dirty |= D_FILE; }
             else if (ui.wopt && wid == SDL_GetWindowID(ui.wopt)) { handle_opt_mouse(&e); ui_dirty |= D_OPT; }
+            else if (ui.winfo && wid == SDL_GetWindowID(ui.winfo)) { handle_info_mouse(&e); ui_dirty |= D_INFO; }
+#ifdef LV_URL_ENABLED
+            else if (ui.wurl && wid == SDL_GetWindowID(ui.wurl)) { handle_url_mouse(&e); ui_dirty |= D_URL; }
+#endif
             else if (search_is_open() && wid == search_window_id()) { search_mouse(&e); ui_dirty |= D_SRCH; }
             /* a latched press must paint its pressed frame NOW: the 100 ms
                coalesce below would swallow the animation of a fast click
@@ -3290,11 +4054,16 @@ int ui_run(Player *p, int show_pl) {
         if (now >= next) {
             int playing = p->state == ST_PLAY;
             int so = search_is_open();
+#ifdef LV_URL_ENABLED
+            int uvo = ui.url_visible;
+#else
+            int uvo = 0;
+#endif
             struct pollsnap sn = {
                 p->state, p->cur, p->pl->count,
                 p->rate ? p->pos_frames / p->rate : 0,
                 ui.pl_visible, ui.eq_visible, ui.file_visible,
-                ui.opt_visible, so };
+                ui.opt_visible, uvo, so };
             if (sn.state != snap_prev.state || sn.cur != snap_prev.cur ||
                 sn.count != snap_prev.count)
                 ui_dirty |= D_MAIN | D_PL;
@@ -3303,6 +4072,7 @@ int ui_run(Player *p, int show_pl) {
             if (sn.eq_vis != snap_prev.eq_vis) ui_dirty |= D_EQ;
             if (sn.file_vis != snap_prev.file_vis) ui_dirty |= D_FILE;
             if (sn.opt_vis != snap_prev.opt_vis) ui_dirty |= D_OPT;
+            if (sn.url_vis != snap_prev.url_vis) ui_dirty |= D_URL;
             if (sn.search_open != snap_prev.search_open) ui_dirty |= D_SRCH;
             snap_prev = sn;
             if (ui.opt_scanning) ui_dirty |= D_OPT;
@@ -3322,6 +4092,20 @@ int ui_run(Player *p, int show_pl) {
                 ui.file_err = 0;
                 ui_dirty |= D_FILE;
             }
+#ifdef LV_URL_ENABLED
+            /* the URL field caret blinks on the same 500 ms cadence when
+               its window holds the caret; "url not allowed" shows ~1 s
+               (file_err precedent — expiry repaint marks it dirty) */
+            int url_focused = ui.url_visible && ui.app_focused &&
+                              ui.url_focus && ui.wurl &&
+                              ui.focus_wid == SDL_GetWindowID(ui.wurl);
+            if (ui.url_err && now - ui.url_err_at >= 1000) {
+                ui.url_err = 0;
+                ui_dirty |= D_URL;
+            }
+#else
+            int url_focused = 0;
+#endif
             /* the title-strip rescan message lasts 10 s; D_MAIN below makes
                the expiry repaint immediate (file_err precedent) */
             if (ui.msg[0] && now - ui.msg_at >= 10000) {
@@ -3344,6 +4128,10 @@ int ui_run(Player *p, int show_pl) {
                 if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
                 if (((ui_dirty & D_FILE) || file_focused) && ui.file_visible && ui.sfile) { draw_file(); win_present(ui.wfile); }
                 if ((ui_dirty & D_OPT) && ui.opt_visible && ui.sopt) { draw_opt(); win_present(ui.wopt); }
+                if ((ui_dirty & D_INFO) && ui.info_visible && ui.sinfo) { draw_info(); win_present(ui.winfo); }
+#ifdef LV_URL_ENABLED
+                if (((ui_dirty & D_URL) || url_focused) && ui.url_visible && ui.surl) { draw_url(); win_present(ui.wurl); }
+#endif
                 if (((ui_dirty & D_SRCH) || srch_focused) && so && search_window()) { search_draw(); win_present(search_window()); }
                 ui_dirty = 0;
             } else if (vis_live || f10_live || playing || (wake && ui_dirty)) {
@@ -3356,6 +4144,10 @@ int ui_run(Player *p, int show_pl) {
                 if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
                 if ((ui_dirty & D_FILE) && ui.file_visible && ui.sfile) { draw_file(); win_present(ui.wfile); }
                 if ((ui_dirty & D_OPT) && ui.opt_visible && ui.sopt) { draw_opt(); win_present(ui.wopt); }
+                if ((ui_dirty & D_INFO) && ui.info_visible && ui.sinfo) { draw_info(); win_present(ui.winfo); }
+#ifdef LV_URL_ENABLED
+                if ((ui_dirty & D_URL) && ui.url_visible && ui.surl) { draw_url(); win_present(ui.wurl); }
+#endif
                 if ((ui_dirty & D_SRCH) && so && search_window()) { search_draw(); win_present(search_window()); }
                 ui_dirty = 0;
                 wake = 0;
@@ -3369,7 +4161,7 @@ int ui_run(Player *p, int show_pl) {
                position slider keep pace instead of jumping on refocus;
                unfocused idle sleeps on events. */
             if (anim) next = now + 100;
-            else if (srch_focused || file_focused) next = now + (unsigned)(500 - (int)(now % 500));
+            else if (srch_focused || file_focused || url_focused) next = now + (unsigned)(500 - (int)(now % 500));
             else if (ui.app_focused) next = now + 1000;
             else if (playing) next = now + 1000;
             else next = 0;   /* unfocused, nothing playing: sleep on events */
@@ -3392,26 +4184,28 @@ int ui_run(Player *p, int show_pl) {
             snprintf(f, sizeof f, "%s-file.bmp", ui_dump_path);
             SDL_SaveBMP(ui.sfile, f);
         }
+#ifdef LV_URL_ENABLED
+        if (ui.url_visible && ui.surl) {
+            snprintf(f, sizeof f, "%s-url.bmp", ui_dump_path);
+            SDL_SaveBMP(ui.surl, f);
+        }
+#endif
+        if (ui.info_visible && ui.sinfo) {
+            snprintf(f, sizeof f, "%s-info.bmp", ui_dump_path);
+            SDL_SaveBMP(ui.sinfo, f);
+        }
         ui_dump_path = NULL;
     }
     search_shutdown();
     if (ui.wopt) SDL_DestroyWindow(ui.wopt);
     if (ui.wfile) SDL_DestroyWindow(ui.wfile);
+    if (ui.winfo) SDL_DestroyWindow(ui.winfo);
+#ifdef LV_URL_ENABLED
+    if (ui.wurl) SDL_DestroyWindow(ui.wurl);
+#endif
     SDL_DestroyWindow(ui.weq);
     SDL_DestroyWindow(ui.wpl);
     SDL_DestroyWindow(ui.wmain);
     SDL_Quit();
     return 0;
-}
-
-void ui_open_playlist(void) {
-    if (ui.wpl) {
-        ui.pl_visible = 1;
-        if (ui.pl_docked) {
-            int dx, dy;
-            pl_dock_pos(&dx, &dy);
-            SDL_SetWindowPosition(ui.wpl, dx, dy);
-        }
-        SDL_ShowWindow(ui.wpl);
-    }
 }

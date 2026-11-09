@@ -242,13 +242,3 @@ void ao_close(void) {
     if (pa_lib) { dlclose(pa_lib); pa_lib = NULL; }
     backend = 0;
 }
-
-const char *ao_backend(void) {
-    switch (backend) {
-    case 1: return "ALSA";
-    case 2: return "PulseAudio";
-    case 3: return "null";
-    case 4: return "SDL";
-    }
-    return "none";
-}

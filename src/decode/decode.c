@@ -1,3 +1,9 @@
+/* dladdr (probe path reporting) needs the GNU feature macro on glibc
+   before any system header; harmless elsewhere, macOS exposes it by
+   default, and the MinGW branch never calls it */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #ifdef LEVAR_DECODE_SUFFIX
 #include "tier_rename.h"
 #endif
@@ -31,10 +37,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <time.h>
 
 #ifdef HAVE_FFMPEG
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
+#include "ffabi.h"
+#include "ffload.h"
 #endif
 
 enum { F_UNKNOWN, F_MP3, F_OGG, F_OPUS, F_FLAC, F_OGGFLAC, F_WAV, F_FFMPEG, F_MOD, F_SPC };
@@ -250,188 +257,125 @@ static unsigned char *oggflac_demux(const unsigned char *raw, size_t n,
 }
 
 /* ---- aac / wma / anything else via libav* (optional, HAVE_FFMPEG) ----
-   the libav* shared libraries are loaded at runtime (same pattern as
-   libopus above): dev headers are only needed to build, and a machine
-   without the .so files simply loses the ffmpeg formats instead of
-   failing to start. */
+   DISPATCH ONLY. The libav* calls and every struct-field read live in
+   ffab.c, compiled once per supported libav major against that major's
+   vendored headers (vendor/ffmpeg — the layout rule is documented there).
+   This file dlopens solely to read avutil_version()/avcodec_version()
+   (plain functions, no structs: safe against ANY runtime libav), matches
+   the runtime pair against each variant's compiled pair, and drives the
+   winner through its FFApi — plain ints and opaque pointers only, so no
+   libav type crosses and no field is ever misread across majors. */
 #ifdef HAVE_FFMPEG
-static int ff_state; /* 0 = not tried, 1 = ok, -1 = unavailable */
+#define FF_API_PTR(n) &LV_JOIN(LV_JOIN(ff, n), _api),
+static const FFApi *const FF_APIS[] = { LV_FFAPI_LIST(FF_API_PTR) };
+#undef FF_API_PTR
+static const FFApi *ff_api;  /* picked once: libav cannot swap under a running
+                                process (libav.dir changes restart by contract) */
+static int ff_api_tried;     /* 0 untried, 1 matched, -1 no variant matched */
 
-static void (*p_av_log_set_level)(int);
-/* av_rescale_q returns int64_t: an int prototype truncates the value at
-   2^31 — at fine stream time bases (mp3 uses 1/14112000) that is under
-   half an hour of audio, corrupting duration and seek targets */
-static int64_t (*p_av_rescale_q)(int64_t, AVRational, AVRational);
-static int (*p_av_sample_fmt_is_planar)(enum AVSampleFormat);
-static int (*p_av_get_bytes_per_sample)(enum AVSampleFormat);
-static const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID);
-static AVCodecContext *(*p_avcodec_alloc_context3)(const AVCodec *);
-static int (*p_avcodec_parameters_to_context)(AVCodecContext *, const AVCodecParameters *);
-static int (*p_avcodec_open2)(AVCodecContext *, const AVCodec *, AVDictionary **);
-static void (*p_avcodec_free_context)(AVCodecContext **);
-static int (*p_avcodec_send_packet)(AVCodecContext *, const AVPacket *);
-static int (*p_avcodec_receive_frame)(AVCodecContext *, AVFrame *);
-static void (*p_avcodec_flush_buffers)(AVCodecContext *);
-static AVPacket *(*p_av_packet_alloc)(void);
-static void (*p_av_packet_free)(AVPacket **);
-static void (*p_av_packet_unref)(AVPacket *);
-static AVFrame *(*p_av_frame_alloc)(void);
-static void (*p_av_frame_free)(AVFrame **);
-static void (*p_av_frame_unref)(AVFrame *);
-static int (*p_avformat_open_input)(AVFormatContext **, const char *, const AVInputFormat *, AVDictionary **);
-static int (*p_avformat_find_stream_info)(AVFormatContext *, AVDictionary **);
-static void (*p_avformat_close_input)(AVFormatContext **);
-static int (*p_av_read_frame)(AVFormatContext *, AVPacket *);
-static int (*p_av_find_best_stream)(AVFormatContext *, enum AVMediaType, int, int, const AVCodec **, int);
-static int (*p_av_seek_frame)(AVFormatContext *, int, int64_t, int);
-
-/* tries <dir>/<base> plus versioned variants; empty dir = bare soname.
-   Linux: libfoo.so, libfoo.so.N. macOS: libfoo.dylib, libfoo.N.dylib. */
-static void *ff_try_dir(const char *dir, const char *base) {
-    char nm[LV_MAX_PATH];
-    int p = (dir && *dir) ? snprintf(nm, sizeof nm, "%s/", dir) : 0;
-    if (p < 0 || (size_t)p >= sizeof nm) return NULL;
-    void *h;
-#ifdef __APPLE__
-    snprintf(nm + p, sizeof nm - p, "%s.dylib", base);
-    h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
-    if (h) return h;
-    for (int v = 62; v >= 54; v--) {
-        snprintf(nm + p, sizeof nm - p, "%s.%d.dylib", base, v);
-        h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
-        if (h) return h;
-    }
-#else
-    snprintf(nm + p, sizeof nm - p, "%s.so", base);
-    h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
-    if (h) return h;
-    for (int v = 62; v >= 54; v--) {
-        snprintf(nm + p, sizeof nm - p, "%s.so.%d", base, v);
-        h = dlopen(nm, RTLD_NOW | RTLD_LOCAL);
-        if (h) return h;
-    }
-#endif
+static const FFApi *ff_match(unsigned ru, unsigned rc) {
+    for (size_t i = 0; i < sizeof FF_APIS / sizeof FF_APIS[0]; i++)
+        if ((unsigned)FF_APIS[i]->lavu_major == ru &&
+            (unsigned)FF_APIS[i]->lavc_major == rc)
+            return FF_APIS[i];
     return NULL;
 }
-
-static void *ff_dlopen(const char *base) {
-    if (cfg.libav_dir[0]) { /* config-provided directory first */
-        char ld[LV_MAX_PATH];
-        lv_expand_home(cfg.libav_dir, ld, sizeof ld);
-        void *h = ff_try_dir(ld, base);
-        if (h) return h;
-    }
-#ifdef __APPLE__
-    /* Homebrew's ffmpeg keg is not on dyld's bare-soname search path */
-    static const char *KEGS[] = { "/opt/homebrew/opt/ffmpeg/lib", "/usr/local/opt/ffmpeg/lib" };
-    for (size_t i = 0; i < sizeof KEGS / sizeof KEGS[0]; i++) {
-        void *h = ff_try_dir(KEGS[i], base);
-        if (h) return h;
-    }
-#endif
-    return ff_try_dir("", base);
+static unsigned ff_major(void *h, const char *fn) {
+    unsigned (*v)(void) = (unsigned (*)(void))dlsym(h, fn);
+    return v ? v() >> 16 : 0;
 }
-
-static int ff_syms(void) {
-    if (ff_state) return ff_state == 1 ? 0 : -1;
+static const FFApi *ff_pick(void) {
+    if (ff_api_tried) return ff_api;
+    ff_api_tried = -1;
     void *hu = ff_dlopen("libavutil");
     void *hc = ff_dlopen("libavcodec");
-    void *hf = ff_dlopen("libavformat");
-    if (!hu || !hc || !hf) { ff_state = -1; return -1; }
-#define FFSYM(h, fn) do { p_##fn = (__typeof__(p_##fn))dlsym(h, #fn); \
-    if (!p_##fn) { ff_state = -1; return -1; } } while (0)
-    FFSYM(hu, av_log_set_level);
-    FFSYM(hu, av_rescale_q);
-    FFSYM(hu, av_sample_fmt_is_planar);
-    FFSYM(hu, av_get_bytes_per_sample);
-    FFSYM(hc, avcodec_find_decoder);
-    FFSYM(hc, avcodec_alloc_context3);
-    FFSYM(hc, avcodec_parameters_to_context);
-    FFSYM(hc, avcodec_open2);
-    FFSYM(hc, avcodec_free_context);
-    FFSYM(hc, avcodec_send_packet);
-    FFSYM(hc, avcodec_receive_frame);
-    FFSYM(hc, avcodec_flush_buffers);
-    FFSYM(hc, av_packet_alloc);
-    FFSYM(hc, av_packet_free);
-    FFSYM(hc, av_packet_unref);
-    FFSYM(hc, av_frame_alloc);
-    FFSYM(hc, av_frame_free);
-    FFSYM(hc, av_frame_unref);
-    FFSYM(hf, avformat_open_input);
-    FFSYM(hf, avformat_find_stream_info);
-    FFSYM(hf, avformat_close_input);
-    FFSYM(hf, av_read_frame);
-    FFSYM(hf, av_find_best_stream);
-    FFSYM(hf, av_seek_frame);
-#undef FFSYM
-    ff_state = 1;
-    return 0;
+    if (hu && hc) {
+        ff_api = ff_match(ff_major(hu, "avutil_version"),
+                          ff_major(hc, "avcodec_version"));
+        if (ff_api) ff_api_tried = 1;
+    }
+    if (hu) dlclose(hu);
+    if (hc) dlclose(hc);
+    return ff_api;
 }
 
 /* startup availability check that does not keep libav* mapped: dlopen
    the three, then dlclose them right away (their whole dep chain gets
    unmapped again); the first real ffmpeg-format open does the full
-   symbol-resolving ff_syms() load. ff_state is left untouched. */
-int dec_ffmpeg_probe(void) {
+   symbol-resolving ff_syms() load. ff_state is left untouched.
+   dec_ffmpeg_probe_info additionally REPORTS (out params optional):
+   ver = the release of the library actually found (av_version_info,
+   which every libav we probe exports; the lavf numeric version as
+   fallback), dir = the directory of the resolved libavformat file
+   ("" when it cannot be reported). dladdr lives in <dlfcn.h> on both
+   Linux and macOS; on the MinGW shim the module path comes from
+   GetModuleFileNameA on the handle. The version string is the answer
+   to "which ffmpeg is this app actually running against" — the
+   options ADV line shows it, and the soname-probe range (79..54, see
+   ffload.h) means a bare-name hit can be a newer major than the versioned
+   candidates would ever load. State 1 requires the runtime pair to equal
+   the compiled pair of one of the vendored ABI variants (ffabi.h);
+   anything else found is the honest state 3. */
+static void ff_probe_report(void *hu, void *hf, char *ver_out, size_t ver_n,
+                            char *dir_out, size_t dir_n) {
+    if (ver_out && ver_n) {
+        ver_out[0] = 0;
+        const char *(*avi)(void) =
+            (const char *(*)(void))dlsym(hu, "av_version_info");
+        int (*avf)(void) = (int (*)(void))dlsym(hf, "avformat_version");
+        if (avi && avi()[0])
+            lv_strlcpy(ver_out, avi(), ver_n);
+        else if (avf) {
+            int v = avf();
+            snprintf(ver_out, ver_n, "lavf %d.%d.%d", v >> 16, (v >> 8) & 0xFF, v & 0xFF);
+        }
+    }
+    if (dir_out && dir_n) {
+        dir_out[0] = 0;
+#ifdef _WIN32
+        char mp[LV_MAX_PATH];
+        DWORD n = GetModuleFileNameA((HMODULE)hf, mp, sizeof mp);
+        if (n > 0 && n < sizeof mp) {
+            if (lv_dirname(mp)) lv_strlcpy(dir_out, mp, dir_n);
+        }
+#else
+        void (*avg)(void) = dlsym(hf, "avformat_version");
+        Dl_info di;
+        if (avg && dladdr(avg, &di) && di.dli_fname) {
+            char mp[LV_MAX_PATH];
+            lv_strlcpy(mp, di.dli_fname, sizeof mp);
+            if (lv_dirname(mp)) lv_strlcpy(dir_out, mp, dir_n);
+        }
+#endif
+    }
+}
+
+int dec_ffmpeg_probe_info(char *ver_out, size_t ver_n, char *dir_out, size_t dir_n) {
     void *hu = ff_dlopen("libavutil");
     void *hc = ff_dlopen("libavcodec");
     void *hf = ff_dlopen("libavformat");
     int ok = hu && hc && hf;
+    int rc = !ok ? 2 : (ff_match(ff_major(hu, "avutil_version"),
+                                 ff_major(hc, "avcodec_version")) ? 1 : 3);
+    if (ok) ff_probe_report(hu, hf, ver_out, ver_n, dir_out, dir_n);
+    else {
+        /* never leave a previous open's report standing */
+        if (ver_out && ver_n) ver_out[0] = 0;
+        if (dir_out && dir_n) dir_out[0] = 0;
+    }
     if (hu) dlclose(hu);
     if (hc) dlclose(hc);
     if (hf) dlclose(hf);
-    return ok ? 1 : 2;
+    return rc;
 }
 
-typedef struct {
-    AVFormatContext *ic;
-    AVCodecContext *cc;
-    AVPacket *pkt;
-    AVFrame *fr;
-    int si;            /* audio stream index */
-    int pkt_done;      /* demuxer exhausted, decoder draining */
-    int fr_valid;      /* fr holds samples, fr_i is the read cursor */
-    int fr_i;
-    int seek_pending;  /* next decoded frame decides the discard count */
-    long long seek_target, skip;
-} FF;
-
-static int16_t f2s(float v) {
-    float x = v * 32767.5f;
-    if (x > 32767.0f) return 32767;
-    if (x < -32768.0f) return -32768;
-    return (int16_t)x;
-}
-
-/* any libav sample format -> interleaved s16 */
-static void ff_copy(AVFrame *fr, int from, int n, int ch, int16_t *out) {
-    enum AVSampleFormat fmt = (enum AVSampleFormat)fr->format;
-    int planar = p_av_sample_fmt_is_planar(fmt);
-    int bps = p_av_get_bytes_per_sample(fmt);
-    for (int r = 0; r < n; r++)
-        for (int c = 0; c < ch; c++) {
-            /* ch comes from the codec context at open time; a decoder that
-               shrinks its channel layout mid-stream leaves data[c] NULL for
-               the extra channels: keep those samples silent instead of
-               dereferencing NULL */
-            if (!fr->data[planar ? c : 0]) continue;
-            const unsigned char *p = planar
-                ? fr->data[c] + (size_t)(from + r) * (size_t)bps
-                : fr->data[0] + ((size_t)(from + r) * (size_t)ch + (size_t)c) * (size_t)bps;
-            int16_t v = 0;
-            switch (fmt) {
-            case AV_SAMPLE_FMT_U8:  case AV_SAMPLE_FMT_U8P:  v = (int16_t)(((int)*p - 128) << 8); break;
-            case AV_SAMPLE_FMT_S16: case AV_SAMPLE_FMT_S16P: v = *(const int16_t *)p; break;
-            case AV_SAMPLE_FMT_S32: case AV_SAMPLE_FMT_S32P: v = (int16_t)(*(const int32_t *)p >> 16); break;
-            case AV_SAMPLE_FMT_FLT: case AV_SAMPLE_FMT_FLTP: v = f2s(*(const float *)p); break;
-            case AV_SAMPLE_FMT_DBL: case AV_SAMPLE_FMT_DBLP: v = f2s((float)*(const double *)p); break;
-            default: break;
-            }
-            out[(size_t)r * (size_t)ch + (size_t)c] = v;
-        }
-}
+int dec_ffmpeg_probe(void) { return dec_ffmpeg_probe_info(NULL, 0, NULL, 0); }
 #else
+int dec_ffmpeg_probe_info(char *ver_out, size_t ver_n, char *dir_out, size_t dir_n) {
+    if (ver_out && ver_n) ver_out[0] = 0;
+    if (dir_out && dir_n) dir_out[0] = 0;
+    return 0;
+}
 int dec_ffmpeg_probe(void) { return 0; }
 #endif
 
@@ -472,9 +416,13 @@ struct Decoder {
         ModPlugFile *mp;
         Spc *sp;
 #ifdef HAVE_FFMPEG
-        FF *ff;
+        void *ff;           /* FFContext * — opaque here (see ffabi.h) */
 #endif
     } u;
+#ifdef HAVE_FFMPEG
+    const FFApi *ffapi;     /* the ABI variant that produced u.ff — MUST be
+                               outside the union: it lives beside u.ff, not over it */
+#endif
 };
 
 /* validate an mpeg audio frame header as a layer-iii frame and return its
@@ -569,7 +517,39 @@ static int sniff(const char *path, int *fmt) {
 
 Decoder *dec_open(const char *path) {
     int fmt = F_UNKNOWN;
-    if (sniff(path, &fmt) != 0) return NULL;
+    /* URL boundary (P0 gate): lv_is_url is the ONE place the string's
+       shape decides; only the allowlisted schemes reach libavformat.
+       A URL never touches sniff() or the large-file stat: both are
+       filesystem concerns that would false-reject it. */
+    int url = lv_is_url(path);
+    if (url) {
+#if defined(LV_URL_ENABLED) && defined(HAVE_FFMPEG)
+        if (!lv_url_scheme_allowed(path, LV_URL_SCHEMES)) {
+            char sch[34];
+            size_t i = 0;
+            while (i < sizeof sch - 1 && path[i] && path[i] != ':') { sch[i] = path[i]; i++; }
+            sch[i] = 0; /* LOG THE SCHEME ONLY: never echo the full URL
+                           (userinfo/credentials must not reach logs) */
+            fprintf(stderr, "levari: URL scheme '%s' not allowed (http/https/icecast only)\n", sch);
+            return NULL;
+        }
+        fmt = F_FFMPEG;
+#elif defined(LV_URL_ENABLED)
+        fprintf(stderr, "levari: URL playback needs the ffmpeg backend\n");
+        return NULL;
+#else
+        /* LV_STREAMING=OFF (the per-user no-streaming build): a URL is a
+           plain, nonexistent file — sniff's fopen fails it clean. The
+           lv_is_url checks OUTSIDE this branch (pl_add_file, loaders,
+           daemon add) are playlist hygiene and stay live in OFF builds. */
+        static int url_off_warned;
+        if (!url_off_warned++)
+            fprintf(stderr, "levari: URL playback not compiled in (LV_STREAMING=OFF)\n");
+        if (sniff(path, &fmt) != 0) return NULL;
+#endif
+    } else if (sniff(path, &fmt) != 0) {
+        return NULL;
+    }
     /* large-file ingest policy (options window ADVANCED tab, LARGE toggle):
        the slurp-based decoders (minimp3 builds a whole-file seek table,
        modplug/ogg-flac buffer the stream) would happily OOM on a
@@ -805,47 +785,22 @@ Decoder *dec_open(const char *path) {
 #ifdef HAVE_FFMPEG
     case F_FFMPEG: {
     ffmpeg:
-        if (ff_syms() != 0) goto fail;
-        FF *a = calloc(1, sizeof *a);
-        if (!a) goto fail;
-        p_av_log_set_level(AV_LOG_QUIET);
-        if (p_avformat_open_input(&a->ic, path, NULL, NULL) != 0) { free(a); goto fail; }
-        if (p_avformat_find_stream_info(a->ic, NULL) < 0) { p_avformat_close_input(&a->ic); free(a); goto fail; }
-        a->si = p_av_find_best_stream(a->ic, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-        if (a->si < 0) { p_avformat_close_input(&a->ic); free(a); goto fail; }
-        AVStream *st = a->ic->streams[a->si];
-        AVCodecContext *cc = p_avcodec_alloc_context3(p_avcodec_find_decoder(st->codecpar->codec_id));
-        if (!cc || p_avcodec_parameters_to_context(cc, st->codecpar) < 0 || p_avcodec_open2(cc, NULL, NULL) < 0) {
-            if (cc) p_avcodec_free_context(&cc);
-            p_avformat_close_input(&a->ic);
-            free(a);
-            goto fail;
+        {
+        /* one dispatch: the runtime pair matched an ABI variant in
+           ff_pick; that variant owns every libav touch from here on
+           (session shape, whitelist, interrupt cb — see ffab.c) */
+        const FFApi *api = ff_pick();
+        if (!api) goto fail;
+        int rate = 0, ch = 0;
+        long long total = 0;
+        FFContext *fx = api->open(path, url, &rate, &ch, &total);
+        if (!fx) goto fail;
+        d->ffapi = api;
+        d->u.ff = fx;
+        d->rate = rate;
+        d->ch = ch;
+        d->total = total;
         }
-        a->cc = cc;
-        a->pkt = p_av_packet_alloc();
-        a->fr = p_av_frame_alloc();
-        if (!a->pkt || !a->fr) {
-            p_av_packet_free(&a->pkt);
-            p_av_frame_free(&a->fr);
-            p_avcodec_free_context(&cc);
-            p_avformat_close_input(&a->ic);
-            free(a);
-            goto fail;
-        }
-        d->rate = cc->sample_rate;
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
-        d->ch = cc->ch_layout.nb_channels;
-#else
-        d->ch = cc->channels;
-#endif
-        /* rate > 0: a crafted container can carry codecpar.sample_rate == 0,
-           and a {1,0} rational makes av_rescale_q divide by zero before the
-           validity gate at the end of dec_open ever sees the decoder */
-        if (st->duration > 0 && st->time_base.num > 0 && d->rate > 0)
-            d->total = p_av_rescale_q(st->duration, st->time_base, (AVRational){1, d->rate});
-        else if (a->ic->duration > 0)
-            d->total = a->ic->duration * d->rate / AV_TIME_BASE;
-        d->u.ff = a;
         break;
     }
 #endif
@@ -864,6 +819,19 @@ fail:
 int dec_rate(const Decoder *d) { return d->rate; }
 int dec_channels(const Decoder *d) { return d->ch; }
 long long dec_total_frames(const Decoder *d) { return d->total; }
+
+/* take the latest ICY StreamTitle (1 = fresh string copied out): the
+   player polls this after each chunk; the read loop marks dirty only on
+   a CHANGED non-empty StreamTitle, so dirty means NEW. */
+int dec_take_title(Decoder *d, char *out, size_t n) {
+#ifdef HAVE_FFMPEG
+    if (d->fmt == F_FFMPEG && d->ffapi->take_title(d->u.ff, out, n))
+        return 1;
+#else
+    (void)d; (void)out; (void)n;
+#endif
+    return 0;
+}
 
 int dec_read(Decoder *d, int16_t *out, int frames) {
     switch (d->fmt) {
@@ -958,61 +926,7 @@ int dec_read(Decoder *d, int16_t *out, int frames) {
     }
     case F_FFMPEG: {
 #ifdef HAVE_FFMPEG
-        FF *a = d->u.ff;
-        int copied = 0;
-        while (copied < frames) {
-            if (!a->fr_valid) {
-                for (;;) {
-                    if (!a->pkt_done) {
-                        if (p_av_read_frame(a->ic, a->pkt) < 0) {
-                            a->pkt_done = 1;
-                            p_avcodec_send_packet(a->cc, NULL);
-                        } else {
-                            if (a->pkt->stream_index == a->si)
-                                p_avcodec_send_packet(a->cc, a->pkt);
-                            p_av_packet_unref(a->pkt);
-                        }
-                    }
-                    int r = p_avcodec_receive_frame(a->cc, a->fr);
-                    if (r == 0) {
-                        a->fr_valid = 1;
-                        a->fr_i = 0;
-                        if (a->seek_pending) {
-                            int64_t fpts = a->fr->pts;
-                            long long start = a->seek_target;
-                            if (fpts != AV_NOPTS_VALUE)
-                                start = p_av_rescale_q(fpts, a->ic->streams[a->si]->time_base,
-                                                       (AVRational){1, d->rate});
-                            a->skip = a->seek_target - start;
-                            if (a->skip < 0) a->skip = 0;
-                            a->seek_pending = 0;
-                        }
-                        break;
-                    }
-                    if (r == AVERROR_EOF) return copied;
-                    if (r == AVERROR(EAGAIN)) {
-                        if (a->pkt_done) return copied;
-                        continue;
-                    }
-                    return copied > 0 ? copied : -1;
-                }
-            }
-            if (a->skip > 0) {
-                int avail = a->fr->nb_samples - a->fr_i;
-                int sk = a->skip < avail ? (int)a->skip : avail;
-                a->fr_i += sk;
-                a->skip -= sk;
-                if (a->fr_i >= a->fr->nb_samples) { a->fr_valid = 0; p_av_frame_unref(a->fr); }
-                continue;
-            }
-            int avail = a->fr->nb_samples - a->fr_i;
-            int take = frames - copied < avail ? frames - copied : avail;
-            ff_copy(a->fr, a->fr_i, take, d->ch, out + (size_t)copied * d->ch);
-            a->fr_i += take;
-            copied += take;
-            if (a->fr_i >= a->fr->nb_samples) { a->fr_valid = 0; p_av_frame_unref(a->fr); }
-        }
-        return copied;
+        return d->ffapi->read(d->u.ff, out, frames);
 #endif
         return -1;
     }
@@ -1077,19 +991,7 @@ int dec_seek(Decoder *d, long long frame) {
     }
     case F_FFMPEG: {
 #ifdef HAVE_FFMPEG
-        FF *a = d->u.ff;
-        AVStream *st = a->ic->streams[a->si];
-        int64_t ts = p_av_rescale_q(frame, (AVRational){1, d->rate}, st->time_base);
-        if (p_av_seek_frame(a->ic, a->si, ts, AVSEEK_FLAG_BACKWARD) < 0) return -1;
-        p_avcodec_flush_buffers(a->cc);
-        a->pkt_done = 0;
-        a->fr_valid = 0;
-        a->fr_i = 0;
-        p_av_frame_unref(a->fr);
-        a->seek_pending = 1;
-        a->seek_target = frame;
-        a->skip = 0;
-        return 0;
+        return d->ffapi->seek(d->u.ff, frame);
 #endif
         return -1;
     }
@@ -1123,12 +1025,7 @@ void dec_close(Decoder *d) {
     }
     case F_FFMPEG: {
 #ifdef HAVE_FFMPEG
-        FF *a = d->u.ff;
-        p_av_frame_free(&a->fr);
-        p_av_packet_free(&a->pkt);
-        p_avcodec_free_context(&a->cc);
-        p_avformat_close_input(&a->ic);
-        free(a);
+        d->ffapi->close(d->u.ff);
 #endif
         break;
     }

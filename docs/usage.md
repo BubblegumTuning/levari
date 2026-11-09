@@ -11,7 +11,8 @@ backend),
 entries resolve against the list's own folder; `.pls` is the Winamp INI
 format, `FileN`/`TitleN`/`LengthN` read case-insensitively), or `.cue`
 sheets (virtual tracks with INDEX offsets). The first file starts playing
-automatically.
+automatically. An `http://`/`https://`/`icecast://` URL is accepted too
+and plays as a network stream — see [Streaming](#streaming).
 
 Flags:
 
@@ -53,7 +54,9 @@ starting a new one:
     eq on|off
     status                 current track, state, position
     pl                     print the playlist
-    add <file>             append one path without playing (spaces kept)
+    add <file>             append one path without playing (spaces kept);
+                           a URL is refused — URLs are never playlist rows,
+                           use `play <url>` (transient, see Streaming)
 
 ## MPRIS (Linux)
 
@@ -118,7 +121,22 @@ drive letters — survive intact); each dir is scanned recursively.
 `libav.dir` points at the libav* **shared libraries** (libavformat/
 libavcodec/libavutil .so files), not the ffmpeg binary; they are searched
 in that directory before the system paths. Takes effect on restart, as
-does `daemon.socket`.
+does `daemon.socket`. The options ADVANCED page shows the detected ffmpeg
+**version** on its status line (the release of the library actually
+loaded — a bare-soname hit can be a newer major than the versioned
+candidates), and when the libraries resolve but `libav.dir` is empty,
+the field is prefilled with the directory they were found in (the field
+is shown only — saving keeps it; your own value is never overwritten).
+The status line also carries the ABI story: the binary reads libav
+struct fields directly, so it ships ready for the ffmpeg majors listed
+in its release notes (the current builds carry 6, 7 and 9) — install any
+of those and streaming works out of the box. A runtime library from a
+major outside that set is refused rather than half-loaded: the line goes
+red with `ffmpeg: found <version> - incompatible build` and ffmpeg
+formats stay off. On such a machine install a supported major, or build
+levari there (a build compiled on the machine always matches its own
+ffmpeg). The version readout and the `libav.dir` prefill say exactly
+what was found and where, whichever way the check lands.
 
 ## Media library
 
@@ -168,6 +186,66 @@ A `TAGS` checkbox next to it toggles whether the scan also reads tags +
 duration (on) or indexes filenames only (off, faster). A `CLEAR` button
 deletes the index so the next scan rebuilds it. The CLI `library scan`
 also skips files already in the index, and always reads tags.
+
+## Streaming
+
+`http://`, `https://` and `icecast://` URLs play through the optional
+libav* backend (the same one that brings aac/m4a/wma): the decoder
+needs it at runtime — a machine without libav* refuses URLs cleanly
+(`URL playback needs the ffmpeg backend`). A build configured
+`-DLV_STREAMING=OFF` compiles URL support out entirely (the `URL`
+window and button are absent, URLs fail as nonexistent files; see
+[build.md](build.md)); release builds always ship the default, on.
+
+Those three schemes are the whole allowlist, enforced at one boundary
+for every entry point (argv, the URL window, the daemon, pasted text):
+`file://`, `pipe://` and every other scheme are rejected before any
+decoder opens, and a CR, LF, space or DEL byte anywhere in the argument
+makes it a malformed plain filename (a clean reject — request-line
+injection dies by shape, not by escaping).
+
+Live streams have no known length: the seek slider and seek keys go
+inert, and the daemon `seek` verb answers
+`ERR live or unknown length: seek not available`. ICY `StreamTitle`
+updates ride onto the scrolling title, the daemon `status` and MPRIS as
+they arrive.
+
+URL rows are transient by design and never persist. The `--save` flag,
+the playlist `SAVE AS`, `.m3u`/`.pls` loading and the daemon
+`add <url>` all skip or refuse them (each says so on stdout; `add`
+names `play <url>` as the door). Playing a URL — from the URL window,
+argv, or a URL typed into the file browser's path field — replaces the
+playlist with that single row, the same off-lock swap the daemon's
+`play` uses. The playlist's `SCAN` button skips URL rows (nothing to
+re-probe on disk).
+
+The URL window (the `URL` button) opens with the last **working** URL
+prefilled: one inert row at `~/.levari/urlIndex`, kept beside the
+library index (its override moves it along). It is banked only once
+playback has demonstrably started (open ok + first decoded chunk), so
+a failed stream never overwrites it. The file is never acted upon —
+Enter re-validates the field (typed, pasted or prefilled) against the
+same allowlist; a rejected row shows `url not allowed` in red for about
+a second with the text kept for correction. If the ffmpeg backend is
+unavailable — libav* not loadable (install ffmpeg, or point `libav.dir`
+at its shared libraries and restart), found but a major this build
+carries no variant for (the options line says so), or a build without
+the backend — the window grows one line and says so in red under the
+field
+(`ffmpeg not found - install it or set libav.dir`, or `ffmpeg found but
+incompatible - see options` for the version mismatch), and `Enter` stays
+inert: streaming cannot work, and a doomed playlist row would only
+confuse. The backend is re-checked on every window open. The field
+swallows all
+keys while open (no global hotkeys mid-typing), Ctrl+V sanitizes the
+clipboard (CR/LF/control bytes stripped, one quote pair peeled),
+`Esc` or `X` closes, and the title strip drags. Every open docks the
+window flush ABOVE the main window, and the edge above main is a stack:
+the EQ docks above the URL window (opening either while the other holds
+the edge pushes/pulls it into place), and closing the URL window merges
+a stacked EQ back down flush onto main. Dragging the URL window snaps
+it beside main like the other windows; its own snap pulls it free at
+normal speeds.
 
 ## MCP server (optional build)
 

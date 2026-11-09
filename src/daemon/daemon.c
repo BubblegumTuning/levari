@@ -122,7 +122,10 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
                 while (*s == ' ') s++;
                 if (!*tok) continue;
                 PlKind kind = pl_ext_kind(tok);
-                if (kind == PL_M3U) pl_load_m3u(&np, tok);
+                if (lv_is_url(tok)) pl_add(&np, tok);   /* transient row:
+                    an URL ending in .m3u is still a stream, not a local
+                    playlist to fopen (D3, same guard as main.c argv) */
+                else if (kind == PL_M3U) pl_load_m3u(&np, tok);
                 else if (kind == PL_PLS) pl_load_pls(&np, tok);
                 else if (kind == PL_CUE) pl_load_cue(&np, tok);
                 else pl_add(&np, tok);
@@ -163,9 +166,14 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         double target = cur;
         if (*v == '+' || *v == '-') target = cur + atof(v);
         else target = atof(v);
-        if (endf > base)
+        if (endf > base) {
             pl_post_seek(p, (target * p->rate) / (double)(endf - base));
-        lv_strlcpy(resp, "OK", rn);
+            lv_strlcpy(resp, "OK", rn);
+        } else {
+            /* live stream / unknown length: house polite refusal (D-total
+               policy) — pl_post_seek would be inert anyway */
+            lv_strlcpy(resp, "ERR live or unknown length: seek not available", rn);
+        }
     } else if (!strcmp(cmd, "vol")) {
         char *v = line + 3;
         while (*v == ' ') v++;
@@ -278,14 +286,21 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
             *w = 0;
         }
         if (*rest) {
-            LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
-            pthread_mutex_lock(&p->mtx);
-            pl_add(p->pl, rest);
-            lib_fill_playlist_ix(p->pl, &ix);
-            pthread_mutex_unlock(&p->mtx);
-            lib_index_free(&ix);
-        }
-        lv_strlcpy(resp, "OK", rn);
+            if (lv_is_url(rest)) {
+                /* D3 (master ruling): URLs are never playlist rows — the
+                   transient play verb above is the sanctioned door; the
+                   house polite refusal mirrors the live-seek wording */
+                snprintf(resp, rn, "ERR url rows are not allowed in playlists: use play <url> (transient)");
+            } else {
+                LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
+                pthread_mutex_lock(&p->mtx);
+                pl_add(p->pl, rest);
+                lib_fill_playlist_ix(p->pl, &ix);
+                pthread_mutex_unlock(&p->mtx);
+                lib_index_free(&ix);
+                lv_strlcpy(resp, "OK", rn);
+            }
+        } else lv_strlcpy(resp, "OK", rn);
     } else {
         snprintf(resp, rn, "ERR unknown command '%s'", cmd);
     }

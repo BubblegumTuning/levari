@@ -10,7 +10,7 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.3.4"
+#define LV_VERSION "0.3.5"
 #endif
 
 /* build architecture, shown in the options title bar before the version
@@ -126,6 +126,55 @@ static inline int lv_is_abs(const char *p) {
     return p[0] == '/';
 #endif
 }
+
+/* URL boundary check (streaming gate, ONE place — see internal_docs/
+   streaming-plan.md): 1 only for scheme://rest shapes with a non-empty
+   rest free of control bytes and space. Hygiene failures (CR/LF/space/DEL
+   anywhere in the string) return 0 — a clean reject, since a local path
+   never carries "://" either. The protocol allowlist is a security
+   constant kept in decode.c, not user config. */
+static inline int lv_is_url(const char *s) {
+    const char *p = s;
+    if (!p || !((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))) return 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (c == ':') break;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'))
+            return 0;
+    }
+    if (p[0] != ':' || p[1] != '/' || p[2] != '/') return 0;
+    if (p - s < 2 || p - s > 31) return 0; /* scheme length bound */
+    p += 3;
+    if (!*p) return 0;
+    for (; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= ' ' || c == 0x7F) return 0; /* CR/LF/tab/space/DEL class */
+    }
+    return 1;
+}
+
+/* true when url's scheme appears in the comma-separated allowlist
+   (case-insensitive; full-field compare — no prefix passes) */
+static inline int lv_url_scheme_allowed(const char *url, const char *allowed) {
+    const char *colon = strstr(url, "://");
+    if (!colon) return 0;
+    size_t n = (size_t)(colon - url);
+    const char *a = allowed;
+    while (*a) {
+        const char *e = a;
+        while (*e && *e != ',') e++;
+        if ((size_t)(e - a) == n && !lv_strncasecmp(a, url, n)) return 1;
+        while (*e == ',') e++;
+        a = e;
+    }
+    return 0;
+}
+
+/* the ONE protocol allowlist (streaming-plan D1): the URL-window Enter
+   gate checks it in the UI, dec_open enforces it before libavformat.
+   A security constant — never user config. */
+#define LV_URL_SCHEMES "http,https,icecast"
 
 /* cut the last component in place. "/" stays "/", "C:\file" becomes "C:\"
    (a bare "C:" is drive-relative, not the drive root). 1 if a separator

@@ -10,11 +10,18 @@
    the I/O interposers) — and drives the real handle_pl_mouse /
    handle_file_mouse paths plus the exact latched-drag guard line from the
    ui_run loop. Technique otherwise as in test/optenc: #include ui.c, link
-   every object EXCEPT main.c.o, ui.c.o AND dispatch.c.o:
+   every object EXCEPT main.c.o, ui.c.o and the stale tier-split leftovers
+   (decode.c.o, stb_vorbis.c.o) + the dec_*.dir tier objects (canonical
+   shape per test/snapwin; the pre-split leftovers carry no
+   dec_ffmpeg_probe_info and dispatch.c.o is not linked — linking them
+   leaves that symbol undefined):
      SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/tpd \
-       test/pldock/testpldock.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL \
+       -o build/testpldock test/pldock/testpldock.c \
+       $(find build/CMakeFiles/levari.dir -name '*.o' \
+         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
+         ! -name stb_vorbis.c.o) \
+       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
    Coverage note: the search window's own copy of the drag arithmetic is
    NOT exercised here (its window lives inside search.c); the fix there is

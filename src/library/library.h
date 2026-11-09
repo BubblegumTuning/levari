@@ -42,10 +42,6 @@ typedef struct {
     int notag;  /* 1 = scan probed the file and found no tags at all */
 } LibEntry;
 
-/* call fn(entry, ud) for every row in the index, in file order.
-   returns the number of rows visited, or -1 if the index can't be opened. */
-int lib_foreach_entry(void (*fn)(const LibEntry *e, void *ud), void *ud);
-
 /* whole index in memory, sorted by path. ALL file I/O happens in load,
    so callers that touch a shared playlist can hold their lock only for
    the apply step (the UI locks the player mutex every draw frame). */
@@ -67,8 +63,24 @@ void lib_fill_playlist(Playlist *p);
    and this runs on the UI thread; a probe that yields 0 KEEPS the stored
    duration. The header line (creation marker) is preserved byte-identically.
    Returns 0 on success; -1 if the file cannot be opened for probing (index
-   untouched); -2 on index read/write failure. Out params may be NULL. */
+   untouched); -2 on index read/write failure; -3 if the on-disk index
+   predates the v2 header AND cannot be migrated without guessing — the
+   index is left byte-identical and only a full library scan may rewrite
+   it. Out params may be NULL. */
 int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
                      int *out_notag);
+
+/* urlIndex (streaming-plan D5, master ruling): ONE row = the last
+   WORKING url, stored next to the library index (same exposure class —
+   the index already carries every path). Written ONLY by the player
+   thread when playback demonstrably works (open ok + first decoded
+   chunk advanced pos), so failed opens never clobber the banked row.
+   The read path treats the file as UNTRUSTED (hand-editable): no scheme
+   validation, no auto-open — the caller displays it inert and the
+   Enter gate re-validates. load: 0 = a row was copied (may be tampered:
+   inert by contract), -1 = none/empty/oversize. save: 0 written,
+   -1 rejected (shape via lv_is_url, length < LV_MAX_PATH) or IO fail. */
+int lib_url_index_load(char *out, size_t n);
+int lib_url_index_save(const char *url);
 
 #endif

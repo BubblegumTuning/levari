@@ -815,11 +815,94 @@ static size_t utf16be_to_utf8(char *dst, size_t dn, const unsigned char *v, size
     return utf16_to_utf8(dst, dn, sw + bo, k - bo);
 }
 
-static void text_frame(Tags *t, LegacyBlock *lb, const char *id, const unsigned char *p, size_t n) {
+/* ---- extended frame reader (song-info window) ---------------------------
+   The display struct for the info window: the common user-facing text
+   frames of the ID3v2 family. Deliberately SEPARATE from Tags: Tags is
+   the cached library/playlist shape (index rows, MPRIS) and growing it
+   grows every Track — at 30k rows that is megabytes of resident memory
+   for a window one song is open at a time. Decoding per-field: trusted
+   enc=1/2/3 exactly like text_frame, enc=0/invalid through copy_legacy —
+   the block verdict machinery stays owned by the four display fields
+   (tagcheck pins it); the dump shows the honest per-frame decode.
+   COMM: language + NUL-terminated short description are skipped. */
+void tag_full_init(TagFull *f) {
+    memset(f, 0, sizeof *f);
+}
+
+static void full_fill(TagFull *f, const char *id, unsigned enc,
+                      const unsigned char *v, size_t vn) {
+    char *dst = 0; size_t cap = 0;
+    int comm = 0;
+    if      (!strcmp(id, "TIT2") || !strcmp(id, "TT2")) { dst = f->title;  cap = sizeof f->title; }
+    else if (!strcmp(id, "TPE1") || !strcmp(id, "TP1")) { dst = f->artist; cap = sizeof f->artist; }
+    else if (!strcmp(id, "TPE2") || !strcmp(id, "TP2")) { dst = f->album_artist; cap = sizeof f->album_artist; }
+    else if (!strcmp(id, "TCOM") || !strcmp(id, "TCM")) { dst = f->composer; cap = sizeof f->composer; }
+    else if (!strcmp(id, "TALB") || !strcmp(id, "TAL")) { dst = f->album;  cap = sizeof f->album; }
+    else if (!strcmp(id, "TRCK") || !strcmp(id, "TRK")) { dst = f->track;  cap = sizeof f->track; }
+    else if (!strcmp(id, "TCON") || !strcmp(id, "TCO")) { dst = f->genre;  cap = sizeof f->genre; }
+    else if (!strcmp(id, "TYER") || !strcmp(id, "TDRC")) { dst = f->year;  cap = sizeof f->year; }
+    else if (!memcmp(id, "COM", 3)) { dst = f->comment; cap = sizeof f->comment; comm = 1; }  /* COMM + v2.2 COM */
+    if (!dst) return;
+    if (comm) {
+        if (vn < 4) return;
+        v += 3; vn -= 3;                          /* language */
+        if (enc == 1 || enc == 2) {               /* 16-bit NUL-terminated description */
+            size_t i = 0;
+            while (i + 1 < vn && (v[i] || v[i + 1])) i += 2;
+            if (i + 1 >= vn) return;              /* no text follows the description */
+            v += i + 2; vn -= i + 2;
+        } else {                                  /* 8-bit charset */
+            size_t i = 0;
+            while (i < vn && v[i]) i++;
+            if (i >= vn) return;
+            v += i + 1; vn -= i + 1;
+        }
+    }
+    if (enc == 1) {
+        if (vn >= 2 && v[0] == 0xFF && v[1] == 0xFE) { v += 2; vn -= 2; }
+        utf16_to_utf8(dst, cap, v, vn);
+    } else if (enc == 2) {
+        if (vn >= 2 && v[0] == 0xFE && v[1] == 0xFF) { v += 2; vn -= 2; }
+        utf16be_to_utf8(dst, cap, v, vn);
+    } else {
+        int m = (int)(vn < 65000 ? vn : 65000);
+        size_t clamped = 0;
+        int mb = 0;
+        if (enc == 3 && utf8_scan(v, m, &clamped, &mb)) copy_utf8(dst, cap, v, (int)clamped);
+        else copy_legacy(dst, cap, v, m);
+    }
+}
+
+/* Vorbis-comment KEY -> extended dump field (the song-info set): the same
+   nine boxes the ID3v2 walk fills. Values are UTF-8 per spec, so they ride
+   copy_utf8 exactly like the four basics in vorbis_comment below. TRACKNUMBER
+   stays RAW text (keeps "3/12", the TRCK rule). Multi-valued keys: the last
+   occurrence overwrites, matching the basics walk. */
+static void full_fill_vorbis(TagFull *f, const char *key,
+                             const unsigned char *val, size_t vl) {
+    char *dst = 0; size_t cap = 0;
+    if      (!strcmp(key, "TITLE"))        { dst = f->title;        cap = sizeof f->title; }
+    else if (!strcmp(key, "ARTIST"))       { dst = f->artist;       cap = sizeof f->artist; }
+    else if (!strcmp(key, "ALBUMARTIST") ||
+             !strcmp(key, "ALBUM ARTIST")) { dst = f->album_artist; cap = sizeof f->album_artist; }
+    else if (!strcmp(key, "COMPOSER"))     { dst = f->composer;     cap = sizeof f->composer; }
+    else if (!strcmp(key, "ALBUM"))        { dst = f->album;        cap = sizeof f->album; }
+    else if (!strcmp(key, "TRACKNUMBER"))  { dst = f->track;        cap = sizeof f->track; }
+    else if (!strcmp(key, "GENRE"))        { dst = f->genre;        cap = sizeof f->genre; }
+    else if (!strcmp(key, "DATE") ||
+             !strcmp(key, "YEAR"))         { dst = f->year;         cap = sizeof f->year; }
+    else if (!strcmp(key, "COMMENT") ||
+             !strcmp(key, "DESCRIPTION")) { dst = f->comment;      cap = sizeof f->comment; }
+    if (!dst) return;
+    copy_utf8(dst, cap, val, (int)(vl < 65000 ? vl : 65000));
+}
+
+static void text_frame(Tags *t, LegacyBlock *lb, TagFull *full, const char *id, const unsigned char *p, size_t n) {
     if (n < 1) return;
     unsigned enc = p[0];
     const unsigned char *v = p + 1;
     size_t vn = n - 1;
+    if (full) full_fill(full, id, enc, v, vn);   /* extended dump rides the same walk */
     int slot = -1, bucket = -1, nulsafe = 0;
     if (!strcmp(id, "TIT2") || !strcmp(id, "TT2")) slot = LF_TITLE;
     else if (!strcmp(id, "TPE1") || !strcmp(id, "TP1")) slot = LF_ARTIST;
@@ -903,7 +986,7 @@ static unsigned be32(const unsigned char *p) {
 
 /* walk ID3v2 frames (ver 2/3/4) from a memory buffer; legacy text frames
    are stashed into lb, decoded as one block by the caller */
-static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t, LegacyBlock *lb) {
+static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t, LegacyBlock *lb, TagFull *full) {
     size_t i = 0;
     /* extended header (flag 0x40): without skipping it the frame walk
        starts inside the ext header and loses every frame. v3: 4 plain
@@ -945,8 +1028,96 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags
            matches v2.3+ COMM for evidence purposes). */
         if (id[0] == 'T' || !memcmp(id, "COMM", 4) ||
             (ver == 2 && !memcmp(id, "COM", 3)))
-            text_frame(t, lb, id, buf + i, fsz);
+            text_frame(t, lb, full, id, buf + i, fsz);
         i += fsz;
+    }
+}
+
+/* Full-tag dump for the song-info window: one open, one walk of the ID3v2
+   block riding the SHARED frame iterator (so extended headers, v2.2/v2.3/
+   v2.4 sizes and the alias set behave exactly like the pinned reader), or —
+   for anything carrying Vorbis comments (Ogg Opus/Vorbis/FLAC, native FLAC)
+   — one walk of the comment block through the SHARED vorbis_comment parser,
+   filling the same nine fields.
+   Files that carry neither fall back to tag_probe's four display fields
+   (RIFF INFO extended frames are out of scope for the dump — the
+   basics still show). The tag block read is capped at 16 MB: cover-art
+   tags above that are vanishingly rare and the info window must not
+   slurp the world; basics fall back for them too. */
+#define TAG_FULL_MAX (16u << 20)
+/* Ogg stream clock for the end-of-stream-granule duration: the sample rate
+   the granulepos counts in (Opus is ALWAYS 48000, granules are PCM samples
+   for vorbis/FLAC at their own rate) plus Opus's encoder-delay preskip,
+   which the real duration must subtract. */
+typedef struct { int rate; int preskip; int is_opus; } OggClock;
+static int read_ogg(const unsigned char *buf, size_t n, Tags *t, TagFull *full,
+                    OggClock *clk);
+static int flac_blocks(const unsigned char *b, size_t n, Tags *t,
+                       TagFull *full, int *rate_out);
+/* did any dump field arrive? decides the tag_probe-basics fallback */
+static int full_any(const TagFull *f) {
+    return f->title[0] || f->artist[0] || f->album[0] || f->album_artist[0] ||
+           f->composer[0] || f->track[0] || f->year[0] || f->genre[0] ||
+           f->comment[0];
+}
+void tag_read_full(const char *path, TagFull *f) {
+    tag_full_init(f);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return;
+    unsigned char h[10];
+    int parsed = 0;
+    if (fread(h, 1, 10, fp) == 10) {
+        if (!memcmp(h, "ID3", 3) && h[3] >= 2 && h[3] <= 4) {
+            size_t sz = ((size_t)h[6] << 21) | ((size_t)h[7] << 14) |
+                        ((size_t)h[8] << 7) | h[9];
+            if (sz && sz <= TAG_FULL_MAX) {
+                unsigned char *b = malloc(sz);
+                if (b && fread(b, 1, sz, fp) == sz) {
+                    Tags basic = {{0}, {0}, {0}, 0};
+                    LegacyBlock lb = {0};
+                    id3v2_frames(b, sz, h[3], h[5], &basic, &lb, f);
+                    parsed = 1;          /* lb_finish intentionally NOT run */
+                }
+                free(b);
+            }
+        } else if (!memcmp(h, "OggS", 4)) {
+            /* every Ogg flavour: the comment packet sits right behind the
+               identification packet(s), so tag_probe's 128 KB head window
+               reaches it. If no comment packet yielded (untagged, or a
+               malformed stream) fall through to the basics. */
+            unsigned char *b = malloc(TAG_HEAD);
+            if (b) {
+                size_t n = fread(b, 1, TAG_HEAD, fp);
+                Tags basic = {{0}, {0}, {0}, 0};
+                read_ogg(b, n, &basic, f, NULL);
+                if (full_any(f)) parsed = 1;
+                free(b);
+            }
+        } else if (!memcmp(h, "fLaC", 4)) {
+            /* native FLAC: the metadata chain (VORBIS_COMMENT included)
+               lives right behind the magic, inside the same head window.
+               REWIND required: the 10-byte header probe above consumed the
+               magic — unlike the Ogg path, which resyncs on OggS, the
+               chain walk must start exactly at byte 0. */
+            unsigned char *b = malloc(TAG_HEAD);
+            if (b && fseek(fp, 0, SEEK_SET) == 0) {
+                size_t n = fread(b, 1, TAG_HEAD, fp);
+                Tags basic = {{0}, {0}, {0}, 0};
+                flac_blocks(b + 4, n > 4 ? n - 4 : 0, &basic, f, NULL);
+                if (full_any(f)) parsed = 1;
+            }
+            free(b);
+        }
+    }
+    fclose(fp);
+    if (!parsed) {                   /* no usable ID3v2: the four basics */
+        Tags t;
+        tag_init(&t);
+        tag_probe(path, 0, &t);
+        lv_strlcpy(f->title, t.title, sizeof f->title);
+        lv_strlcpy(f->artist, t.artist, sizeof f->artist);
+        lv_strlcpy(f->album, t.album, sizeof f->album);
+        if (t.track) snprintf(f->track, sizeof f->track, "%d", t.track);
     }
 }
 
@@ -979,7 +1150,7 @@ static int tags_complete(const Tags *t) {
     return t->title[0] && t->artist[0];
 }
 
-static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
+static void vorbis_comment(Tags *t, TagFull *full, const unsigned char *p, size_t n) {
     /* p points after 0x03 "vorbis" */
     if (n < 8) return;
     unsigned rd = p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24);
@@ -1011,6 +1182,7 @@ static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
             memcpy(b, val, k);
             t->track = atoi(b);
         }
+        if (full) full_fill_vorbis(full, key, val, vl);
         p += cl; n -= cl;
     }
 }
@@ -1019,10 +1191,12 @@ static void vorbis_comment(Tags *t, const unsigned char *p, size_t n) {
    then sample rate 20b | channels-1 3b | bitsample-1 5b | total samples 36b
    (fields byte-aligned as libFLAC/ffmpeg write them: sr spans p[10..12]
    upper nibble, total samples spans p[13] lower nibble through p[17]).
-   Returns seconds, 0 = unusable. */
-static int flac_streaminfo_dur(const unsigned char *p, size_t n) {
+   Returns seconds, 0 = unusable; rate_out gets the sample rate whenever
+   it is valid, even if the sample count is zero (ffmpeg's Ogg FLAC). */
+static int flac_streaminfo_dur(const unsigned char *p, size_t n, int *rate_out) {
     if (n < 18) return 0;
     unsigned sr = ((unsigned)p[10] << 12) | ((unsigned)p[11] << 4) | (p[12] >> 4);
+    if (rate_out && sr) *rate_out = (int)sr;
     unsigned long long ns = ((unsigned long long)(p[13] & 0x0F) << 32) |
                             ((unsigned)p[14] << 24) | ((unsigned)p[15] << 16) |
                             ((unsigned)p[16] << 8) | p[17];
@@ -1031,9 +1205,13 @@ static int flac_streaminfo_dur(const unsigned char *p, size_t n) {
 }
 
 /* walk a FLAC metadata block chain (b points after the "fLaC" magic):
-   4B header = last|type, 24-bit BE length. Fills tags from the VORBIS_COMMENT
-   block (type 4), returns duration from STREAMINFO (type 0), 0 = unknown. */
-static int flac_blocks(const unsigned char *b, size_t n, Tags *t) {
+   4B header = last|type, 24-bit BE length. Fills tags (and, if full, the
+   song-info dump) from the VORBIS_COMMENT block (type 4), returns duration
+   from STREAMINFO (type 0), 0 = unknown; rate_out receives the sample rate
+   whenever STREAMINFO carries one (the Ogg-granule duration fallback needs
+   it even when total_samples is zero, as ffmpeg writes it). */
+static int flac_blocks(const unsigned char *b, size_t n, Tags *t,
+                       TagFull *full, int *rate_out) {
     size_t i = 0;
     int dur = 0;
     for (;;) {
@@ -1043,8 +1221,8 @@ static int flac_blocks(const unsigned char *b, size_t n, Tags *t) {
         size_t blen = ((size_t)b[i + 1] << 16) | ((size_t)b[i + 2] << 8) | b[i + 3];
         i += 4;
         if (blen > n - i) break;
-        if (type == 0) dur = flac_streaminfo_dur(b + i, blen);
-        else if (type == 4) vorbis_comment(t, b + i, blen);
+        if (type == 0) dur = flac_streaminfo_dur(b + i, blen, rate_out);
+        else if (type == 4) vorbis_comment(t, full, b + i, blen);
         i += blen;
         if (last || (dur && tags_complete(t))) break;
     }
@@ -1055,9 +1233,15 @@ static int flac_blocks(const unsigned char *b, size_t n, Tags *t) {
    0x03 "vorbis" packet, Opus in "OpusTags" (identical framing after the
    magic); Ogg FLAC opens with 0x7F "FLAC" and then one metadata block per
    packet, same block types as native FLAC (ffmpeg additionally embeds the
-   fLaC magic + first blocks inside the marker packet). Returns duration
-   seconds (only FLAC can provide it here), 0 = unknown. */
-static int read_ogg(const unsigned char *buf, size_t n, Tags *t) {
+   fLaC magic + first blocks inside the marker packet). full != NULL asks
+   every Vorbis-comment packet for the extended song-info dump too (the
+   Vorbis-comment mirror of the ID3v2 walk). clk != NULL captures the
+   stream clock from the identification packets (they always precede the
+   comment packet) so the caller can derive a duration from the last page's
+   granulepos when the headers carry none.
+   Returns duration seconds (only FLAC STREAMINFO provides it here), 0 = unknown. */
+static int read_ogg(const unsigned char *buf, size_t n, Tags *t, TagFull *full,
+                    OggClock *clk) {
     size_t i = 0;
     unsigned char pkt[65536];
     size_t pn = 0;
@@ -1079,23 +1263,33 @@ static int read_ogg(const unsigned char *buf, size_t n, Tags *t) {
             bo += sl;
             if (sl < 255) {
                 /* packet complete */
-                if (pn > 7 && pkt[0] == 0x03 && memcmp(pkt + 1, "vorbis", 6) == 0) {
-                    vorbis_comment(t, pkt + 7, pn - 7);
+                if (pn >= 19 && memcmp(pkt, "OpusHead", 8) == 0) {
+                    if (clk) {
+                        clk->rate = 48000;          /* granules: 48k, ALWAYS */
+                        clk->is_opus = 1;
+                        clk->preskip = pkt[10] | (pkt[11] << 8);
+                    }
+                } else if (pn >= 16 && pkt[0] == 0x01 && memcmp(pkt + 1, "vorbis", 6) == 0) {
+                    if (clk)                          /* ident: ver u32, ch u8, rate u32 */
+                        clk->rate = pkt[12] | (pkt[13] << 8) | (pkt[14] << 16) | ((unsigned)pkt[15] << 24);
+                } else if (pn > 7 && pkt[0] == 0x03 && memcmp(pkt + 1, "vorbis", 6) == 0) {
+                    vorbis_comment(t, full, pkt + 7, pn - 7);
                     return dur;
                 } else if (pn >= 8 && memcmp(pkt, "OpusTags", 8) == 0) {
-                    vorbis_comment(t, pkt + 8, pn - 8);
+                    vorbis_comment(t, full, pkt + 8, pn - 8);
                     return dur;
                 } else if (pn >= 5 && pkt[0] == 0x7F && memcmp(pkt + 1, "FLAC", 4) == 0) {
                     flac = 1;
                     /* marker = 0x7F "FLAC" + major + minor + 2B header-packet
                        count; ffmpeg embeds the fLaC magic + first blocks here */
                     if (pn >= 13 && memcmp(pkt + 9, "fLaC", 4) == 0)
-                        dur = flac_blocks(pkt + 13, pn - 13, t);
+                        dur = flac_blocks(pkt + 13, pn - 13, t, full, clk ? &clk->rate : NULL);
                 } else if (flac && pn >= 4) {
                     unsigned type = pkt[0] & 0x7F;
-                    if (type == 0) dur = flac_streaminfo_dur(pkt + 4, pn - 4);
+                    if (type == 0)
+                        dur = flac_streaminfo_dur(pkt + 4, pn - 4, clk ? &clk->rate : NULL);
                     else if (type == 4) {
-                        vorbis_comment(t, pkt + 4, pn - 4);
+                        vorbis_comment(t, full, pkt + 4, pn - 4);
                         return dur;
                     }
                 }
@@ -1105,6 +1299,36 @@ static int read_ogg(const unsigned char *buf, size_t n, Tags *t) {
         i = page_body + body;
     }
     return dur;
+}
+
+/* Duration for an Ogg stream whose headers carry no length: scan back from
+   EOF within one 64 KB window (>= the largest possible single page) for the
+   last page header — magic plus stream-version byte 0 — and take its
+   cumulative granulepos (-1 = "no packet ended here": keep scanning back).
+   The classic false positive is the magic inside compressed audio followed
+   by a 0 byte; rare, and the rate/sanity gate below rejects absurd results. */
+static int ogg_tail_duration(FILE *f, unsigned char *win, long long size_hint,
+                             const OggClock *clk) {
+    long long size = size_hint;
+    if (size <= 0) {
+        if (fseek(f, 0, SEEK_END) != 0) return 0;
+        size = ftell(f);
+        if (size <= 0) return 0;
+    }
+    long long back = size < 65536 ? size : 65536;
+    if (back < 27 || fseek(f, (off_t)(size - back), SEEK_SET) != 0) return 0;
+    size_t n = fread(win, 1, (size_t)back, f);
+    for (long long i = (long long)n - 27; i >= 0; i--) {
+        if (memcmp(win + i, "OggS", 4) || win[i + 4] != 0) continue;
+        long long g = 0;
+        for (int k = 7; k >= 0; k--) g = (g << 8) | win[i + 6 + k];   /* LE64, signed */
+        if (g < 0) continue;                    /* -1: this page ends no packet */
+        g -= clk->is_opus ? clk->preskip : 0;   /* Opus granules include preskip */
+        if (g <= 0) return 0;
+        long long secs = g / clk->rate;
+        return (secs > 86400) ? 0 : (int)secs;
+    }
+    return 0;
 }
 
 /* RIFF stays FILE-based: LIST INFO usually sits after the data chunk, so
@@ -1312,13 +1536,13 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
             if (sz <= (1u << 24)) {
                 LegacyBlock lb = {0};
                 if (10 + sz <= n) {
-                    id3v2_frames(b + 10, sz, b[3], b[5], t, &lb);
+                    id3v2_frames(b + 10, sz, b[3], b[5], t, &lb, NULL);
                 } else {
                     /* tag larger than the head buffer: one follow-up read */
                     unsigned char *tb = malloc(sz);
                     if (tb && fseek(f, 10, SEEK_SET) == 0 &&
                         fread(tb, 1, sz, f) == sz)
-                        id3v2_frames(tb, sz, b[3], b[5], t, &lb);
+                        id3v2_frames(tb, sz, b[3], b[5], t, &lb, NULL);
                     free(tb);
                 }
                 lb_finish(&lb, t, 0);   /* one verdict for the whole v2 block */
@@ -1341,9 +1565,15 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
         dur = mp3_head_duration(b, n, tagend, skip, size_hint, f);
         if (!tags_complete(t)) read_id3v1(f, t);
     } else if (n >= 4 && b[0]=='O' && b[1]=='g' && b[2]=='g' && b[3]=='S') {
-        dur = read_ogg(b, n, t);
+        OggClock clk = {0, 0, 0};
+        dur = read_ogg(b, n, t, NULL, &clk);
+        /* Opus and Vorbis carry no length in their headers (and ffmpeg
+           zeroes STREAMINFO's total_samples in Ogg FLAC): the end-of-stream
+           granulepos holds it. Only pays the tail seek when the walk found
+           a usable clock but no duration. */
+        if (!dur && clk.rate) dur = ogg_tail_duration(f, b, size_hint, &clk);
     } else if (n >= 4 && b[0]=='f' && b[1]=='L' && b[2]=='a' && b[3]=='C') {
-        dur = flac_blocks(b + 4, n - 4, t);
+        dur = flac_blocks(b + 4, n - 4, t, NULL, NULL);
     } else if (n >= 4 && b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F') {
         fseek(f, 0, SEEK_SET);
         read_riff(f, t);

@@ -3,7 +3,10 @@
    append-if-absent (decision A), notag certification + clearance, duration
    preservation when the probe goes blind, missing file -> rc -1 with the
    index file byte-identical (decision F: index untouched), escaped-path
-   rows replace-not-shadow (backslash filename).
+   rows replace-not-shadow (backslash filename), headerless legacy indexes
+   (2026-11-07 GH-line): safe file keeps EVERY entry (two directories, one
+   rescan, all unrelated rows survive under a stamped header), ambiguous
+   file -> rc -3 with the index byte-identical, full scan still rebuilds.
    Compile (from the repo root, after `cmake --build build`); run with a
    scratch HOME/XDG_CONFIG_HOME set by the caller. LINK CAVEAT: this test
    exercises the scan/probe path, so it must NOT pull the stale pre-split
@@ -21,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "library.h"
 #include "config.h"
 #include "tag.h"
@@ -124,13 +128,22 @@ int main(void) {
     chk("index carries the new title", strstr(b, "Second") != NULL, 1);
     chk("index dropped the old title", strstr(b, "First") == NULL, 1);
 
-    /* 2) duration preservation: a probe that yields 0 keeps the stored dur */
+    /* 2) duration preservation: a probe that yields 0 keeps the stored dur.
+       The row is rewritten PRESERVING the field layout (dur=123, notag=0):
+       an in-place merge (writing "123" over "0\t0") would silently lean on
+       the row parser tolerating a short row. */
     long len = slurp(idx, b, sizeof b);
     char *row1 = strstr(b, "one.mp3");
     char *p5 = row1 ? strstr(row1, "\t0\t0\n") : NULL;
     if (!p5) { fails++; printf("FAIL dur inject: no \\t0\\t0 row for one.mp3\n"); }
-    else { memcpy(p5 + 1, "123", 3);
-           FILE *w = fopen(idx, "w"); fwrite(b, 1, (size_t)len, w); fclose(w); }
+    else {
+        size_t pre = (size_t)(p5 - b);
+        FILE *w = fopen(idx, "w");
+        fwrite(b, 1, pre, w);
+        fputs("\t123\t0\n", w);
+        fwrite(p5 + 5, 1, (size_t)len - pre - 5, w);
+        fclose(w);
+    }
     chk("rescan ok (dur pin)", lib_index_rescan(one, &t, &dur, &notag), 0);
     chk("probe-blind dur preserved", dur, 123);
     slurp(idx, b, sizeof b);
@@ -175,6 +188,56 @@ int main(void) {
     /* header marker must survive every rewrite (b6cb2ea) */
     slurp(idx, b, sizeof b);
     chk("header preserved", strncmp(b, "#levari-index v2 ", 17) == 0, 1);
+
+    /* 7) headerless legacy index (2026-11-07 GH-line ruling): rows from
+       TWO directories; a safely-readable one keeps EVERY entry through a
+       single-track rescan; an ambiguous one (lone backslash: escaped-vs-
+       raw undecidable) refuses the partial rescan byte-identically and
+       only a full scan rebuilds. A rescan must NEVER silently become a
+       full index reset. */
+    char d1[LV_MAX_PATH], d2[LV_MAX_PATH], f1[LV_MAX_PATH], f2[LV_MAX_PATH],
+         r1[LV_MAX_PATH], r2[LV_MAX_PATH], before2[1 << 17];
+    snprintf(d1, sizeof d1, "%s/alpha", home);
+    snprintf(d2, sizeof d2, "%s/beta", home);
+    mkdir(d1, 0755); mkdir(d2, 0755);
+    snprintf(f1, sizeof f1, "%s/a.mp3", d1);
+    snprintf(f2, sizeof f2, "%s/b.mp3", d2);
+    write_tagged(f1, "A1");
+    write_tagged(f2, "B_KEEP");
+    if (!realpath(f1, r1) || !realpath(f2, r2)) {
+        fails++; printf("FAIL realpath fixtures\n");
+    }
+    char ixb[8192];
+    /* safe legacy file: no backslash bytes -> both readings byte-identical */
+    snprintf(ixb, sizeof ixb,
+             "%s\t\tA old\t\t0\t0\n%s\t\tB_KEEP old\t\t0\t0\n", r1, r2);
+    FILE *w2 = fopen(idx, "w"); fputs(ixb, w2); fclose(w2);
+    chk("headerless safe: rescan succeeds", lib_index_rescan(f1, &t, &dur, &notag), 0);
+    slurp(idx, b, sizeof b);
+    chk("header stamped by safe migration", strncmp(b, "#levari-index v2 ", 17) == 0, 1);
+    chk("unrelated directory entry survives", strstr(b, "beta/b.mp3\t") != NULL, 1);
+    chk("unrelated row verbatim (tags intact)", strstr(b, "B_KEEP old") != NULL, 1);
+    chk("rescanned row replaced", strstr(b, "A old") == NULL && strstr(b, "A1") != NULL, 1);
+    chk("safe migration row count", row_count(idx), 2);
+    /* ambiguous legacy file: a lone backslash (raw path) proves nothing */
+    snprintf(ixb, sizeof ixb,
+             "%s\t\tA old\t\t0\t0\nC:\\raw\\x.mp3\t\tx\t\t0\t0\n", r1);
+    w2 = fopen(idx, "w"); fputs(ixb, w2); fclose(w2);
+    slurp(idx, before2, sizeof before2);
+    chk("ambiguous index refuses partial rescan",
+        lib_index_rescan(f1, &t, &dur, &notag), -3);
+    slurp(idx, b, sizeof b);
+    chk("refusal leaves index byte-identical", strcmp(before2, b) == 0, 1);
+    /* only the full scan may rewrite it: discard-and-rebuild stands */
+    char sdirs[1][LV_MAX_PATH];
+    lv_strlcpy(sdirs[0], d1, sizeof sdirs[0]);
+    added = seen = skipped = 0;
+    chk("full scan rebuilds after ambiguity",
+        lib_scan_add(sdirs, 1, 1, &added, &seen, &skipped), 0);
+    slurp(idx, b, sizeof b);
+    chk("rebuilt index has header", strncmp(b, "#levari-index v2 ", 17) == 0, 1);
+    chk("rebuilt index holds only what was scanned",
+        strstr(b, "alpha/a.mp3\t") != NULL && strstr(b, "beta/b.mp3") == NULL, 1);
 
     printf(fails ? "FAILURES: %d\n" : "all rescan checks pass\n", fails);
     return fails != 0;

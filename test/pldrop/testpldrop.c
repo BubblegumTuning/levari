@@ -11,6 +11,7 @@
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/td \
        test/pldrop/testpldrop.c $(find build/CMakeFiles/levari.dir -name '*.o' \
          ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
    Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller
    (lib_index_load resolves the index under the config dir; a missing
@@ -20,6 +21,7 @@
 */
 #include "../../src/ui/ui.c"
 #include <stdlib.h>
+#include <sys/stat.h>
 
 static Player fake_pl;
 static Playlist list;
@@ -56,9 +58,11 @@ int main(int argc, char **argv) {
     pl_player_init(&fake_pl, &list); /* inits mtx/wake for pl_post */
     ui.pl = &fake_pl;
 
-    chk("m3u_name .M3U case-insensitive", m3u_name("x.M3U"), 1);
-    chk("m3u_name .cue is not m3u", m3u_name("album.cue"), 0);
-    chk("m3u_name no extension", m3u_name("noext"), 0);
+    /* Shared extension classifier (5095b07 replaced m3u_name with
+       pl_ext_kind, which is exactly what drop_add routes on): */
+    chk("pl_ext_kind .M3U case-insensitive", pl_ext_kind("x.M3U"), PL_M3U);
+    chk("pl_ext_kind .cue is not m3u", pl_ext_kind("album.cue"), PL_CUE);
+    chk("pl_ext_kind no extension", pl_ext_kind("noext"), PL_NONE);
 
     /* 1: single audio file appends, absolute, play the new row */
     drop_open = 1;
@@ -82,6 +86,21 @@ int main(int argc, char **argv) {
     chk("m3u play arg = first new row", (long)atomic_load(&fake_pl.cmd_arg), old);
 
     /* 3: folder drop recurses, audio extensions only */
+    /* fixture-completeness guard first: the count pin below asserts the
+       whole fixture dir — if a fixture file went missing the honest
+       reading is 'fixtures changed', not 'the drop engine regressed' */
+    {
+        static const char *fx[7] = { "a.wav", "b.wav", "example.ogg",
+                                     "sample.flac", "sample.mp3", "tone.wav", "tone2.wav" };
+        int all = 1;
+        for (int i = 0; i < 7; i++) {
+            char p[LV_MAX_PATH];
+            snprintf(p, sizeof p, "%s/%s", tdir, fx[i]);
+            struct stat st;
+            if (stat(p, &st) != 0) { all = 0; printf("MISSING fixture %s\n", fx[i]); }
+        }
+        chk("fixture set complete (7 audio files)", all, 1);
+    }
     pl_clear(&list);
     drop_add(tdir);
     drop_flush();

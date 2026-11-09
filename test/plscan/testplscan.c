@@ -5,10 +5,15 @@
    and a real title change preempts the message (refresh_title).
    Technique: #include ui.c (see testoptenc for the rationale); run with a
    scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
+   Link shape (canonical tier form — the stale pre-split decode.c.o
+   leftovers carry no dec_ffmpeg_probe_info; dispatch.c.o + the
+   dec_*.dir glob resolve the plain symbols, same fix as test/plmultisel):
      SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/tps \
+     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/tps \
        test/plscan/testplscan.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
+         ! -name stb_vorbis.c.o) \
+       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
        -lz -lm -lpthread -ldl -lstdc++
 */
@@ -21,6 +26,15 @@ static int fails;
 static void chk(const char *what, long got, long want) {
     if (got != want) { fails++; printf("FAIL %s: got %ld want %ld\n", what, got, want); }
     else printf("PASS %s\n", what);
+}
+
+/* SCAN drives the SELECTED set (c1aa561 multi-selection contract: PB_SCAN
+   no-ops on an empty ui.pl_multi). pl_sel_add is the engine's own grow-and-
+   insert (ui.pl_multi is a realloc'd array — direct writes would SEGV
+   before the first growth); the anchor mirrors test/plmultisel's pins. */
+static void pl_select1(int row) {
+    pl_sel_add(row);
+    ui.pl_sel = row;
 }
 
 /* id3v2.3 TIT2-only fixture (same shape as testoptenc/testrescan) */
@@ -55,7 +69,7 @@ int main(void) {
     snprintf(one, sizeof one, "%s/scanme.mp3", home);
     write_tagged(one, "ScanMe");
     pl_add_file(&pl, one);
-    ui.pl_sel = 0;
+    pl_select1(0);
 
     /* happy path: Track updated + index row appended (no index existed) */
     action(PB_SCAN);
@@ -72,18 +86,27 @@ int main(void) {
         chk("index row carries the title", strstr(b, "ScanMe") != NULL, 1);
     }
 
-    /* CUE virtual row: end_sec set -> deliberate no-op, no message */
+    /* CUE virtual row: end_sec set -> deliberate no-op: silent AND the
+       row's tags AND the index both verifiably untouched */
     ui.msg[0] = 0;
+    lv_strlcpy(pl.items[0].tags.title, "SENTINEL", sizeof pl.items[0].tags.title);
+    long n0 = lib_index_load().n;
     pl.items[0].end_sec = 100;
     action(PB_SCAN);
-    chk("virtual row: no message, untouched", ui.msg[0] == 0, 1);
+    chk("virtual row: silent", ui.msg[0] == 0, 1);
+    chk("virtual row: row tags untouched", strcmp(pl.items[0].tags.title, "SENTINEL") == 0, 1);
+    chk("virtual row: index untouched", lib_index_load().n == n0, 1);
     pl.items[0].end_sec = 0;
 
-    /* select-all state: no-op (multi-select comes later) */
+    /* select-all state: no-op (multi-select comes later) — silent AND
+       the row/index verifiably untouched */
     ui.pl_selall = 1;
     action(PB_SCAN);
-    chk("select-all is a no-op", ui.msg[0] == 0, 1);
+    chk("select-all: silent", ui.msg[0] == 0, 1);
+    chk("select-all: row tags untouched", strcmp(pl.items[0].tags.title, "SENTINEL") == 0, 1);
+    chk("select-all: index untouched", lib_index_load().n == n0, 1);
     ui.pl_selall = 0;
+    lv_strlcpy(pl.items[0].tags.title, "ScanMe", sizeof pl.items[0].tags.title);
 
     /* background scan running: refusal message, index not touched again */
     ui.opt_scanning = 1;
@@ -95,7 +118,7 @@ int main(void) {
     char gone[LV_MAX_PATH];
     snprintf(gone, sizeof gone, "%s/gone.mp3", home);
     pl_add_file(&pl, gone);
-    ui.pl_sel = 1;
+    pl_select1(1);
     ui.msg[0] = 0;
     action(PB_SCAN);
     chk("missing file -> red message", strstr(ui.msg, "cannot rescan") != NULL, 1);

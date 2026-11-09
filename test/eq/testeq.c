@@ -10,6 +10,7 @@
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/teq \
        test/eq/testeq.c $(find build/CMakeFiles/levari.dir -name '*.o' \
          ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
 */
 #include "../../src/ui/ui.c"
@@ -100,7 +101,7 @@ int main(void) {
     int zero = 1;
     for (int i = 0; i < EQ_BANDS; i++) if (fp.eq.band_db[i] != 0.0f) zero = 0;
     chk("RESET zeroes all ten bands", zero, 1);
-    chk("RESET leaves the preamp alone", (long)fp.eq.preamp_db, 5);
+    chk("RESET leaves the preamp alone", fp.eq.preamp_db > 4.99f && fp.eq.preamp_db < 5.01f, 1);
 
     printf(fails ? "%d FAILURES\n" : "all pass\n", fails ? fails : 0);
     return fails != 0;

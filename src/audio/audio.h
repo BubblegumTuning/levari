@@ -10,6 +10,5 @@ void ao_pause(void);
 void ao_resume(void);
 void ao_flush(void);
 void ao_close(void);
-const char *ao_backend(void);
 
 #endif

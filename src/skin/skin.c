@@ -12,6 +12,8 @@ const Rect R_VOL     = {29, 62, 121, 12};
 const Rect R_PAN     = {185, 62, 122, 12};
 const Rect R_EQ      = {8, 78, 26, 12};
 const Rect R_LIST    = {38, 78, 26, 12};
+/* URL button beside LST (row 4, the free slot right after it) */
+const Rect R_URL     = {68, 78, 26, 12};
 /* row 5: timeline slider, full width (8px margins like R_INFO) */
 const Rect R_SEEK    = {8, 94, MAIN_W - 16, 12};
 const Rect R_PREV    = {8, 110, 45, 18};

@@ -170,19 +170,6 @@ int cli_request(const char *cmd, char *resp, size_t rn) {
     return resp[0] == 'E' && resp[1] == 'R' ? 1 : 0;
 }
 
-int cli_send_line(const char *cmd) {
-    char resp[8192];
-    int rc = cli_request(cmd, resp, sizeof resp);
-    if (rc == 2) {
-        char path[512];
-        sock_resolve(path, sizeof path);
-        fprintf(stderr, "levari: no running instance (no socket at %s)\n", path);
-        return 2;
-    }
-    fputs(resp, stdout);
-    return rc;
-}
-
 /* append " arg": args with a space or a double quote travel quoted, with
    embedded " and \ escaped as \" and \\ (the daemon's play tokenizer and
    add handler unescape inside quotes). -1 = no room in cmd, nothing

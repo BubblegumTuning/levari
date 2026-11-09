@@ -106,7 +106,10 @@ int pl_add(Playlist *p, const char *path) {
 int pl_add_file(Playlist *p, const char *path) {
     if (ensure(p, p->count + 1) != 0) return -1;
     Track *t = &p->items[p->count++];
-    if (lv_is_abs(path)) {
+    if (lv_is_abs(path) || lv_is_url(path)) {
+        /* URLs are already fully qualified — cwd-absolutizing them would
+           mangle the scheme into a bogus relative path (P0 gate caught
+           exactly this: dec_open would never see the URL) */
         lv_strlcpy(t->path, path, sizeof t->path);
     } else {
         char cwd[PATH_MAX];
@@ -134,17 +137,6 @@ void pl_insert(Playlist *p, int idx, const char *path) {
     t->duration = 0;
     t->notag = 0;
     t->start_sec = t->end_sec = 0;
-}
-
-/* full-row insert: path + tags + duration + CUE bounds travel with the
-   row — the primitive paste needs (pl_insert only takes a path) */
-void pl_insert_track(Playlist *p, int idx, const Track *src) {
-    if (idx < 0) idx = 0;
-    if (idx > p->count) idx = p->count;
-    if (ensure(p, p->count + 1) != 0) return;
-    memmove(&p->items[idx + 1], &p->items[idx], (size_t)(p->count - idx) * sizeof(Track));
-    p->count++;
-    p->items[idx] = *src;
 }
 
 void pl_remove(Playlist *p, int idx) {
@@ -187,6 +179,14 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
             continue;
         }
         if (*s == '#') continue;
+        if (lv_is_url(s)) {
+            /* D3: URLs never enter playlist files. A remote .m3u would
+               need fetching — not our job (explicit-playback posture);
+               the row is skipped loudly, not silently */
+            printf("levari: m3u skips URL row: %s\n", s);
+            pending_dur = 0;
+            continue;
+        }
         char full[LV_MAX_PATH];
         if (lv_is_abs(s)) lv_strlcpy(full, s, sizeof full);
         else lv_path_join(full, sizeof full, dir, s);
@@ -225,6 +225,21 @@ typedef struct {
     int dur;
 } PlsEnt;
 
+/* hard ceiling on PLS entry numbers (FileN/TitleN/LengthN): num arrives
+   as an unbounded long and the index below narrows it to int — File3221225472
+   casts to a negative 'at', skips the grow branch entirely and writes
+   ent[at] ~4 GB below the heap (ASan-confirmed wild write, 2026-11-07 GH-line
+   report), while File2147483648 wraps 'at' to a huge positive that overflows
+   the int cap-doubling loop. 65536 keeps a 2x headroom over the real
+   30k+ song playlists (entry numbers run to the song count — a .pls ceiling
+   must NOT be a playlist-size cap; anything under it grows on demand and
+   empty slots cost nothing to the playlist itself). Memory of the sparse
+   index is max_index * sizeof(PlsEnt) (~4.3 KB) — the same transient the
+   pre-fix reader already spent on a real 65k list; only a FILE that
+   literally numbers an entry that high pays it, so this is not corruption,
+   and .pls files are only parsed on explicit user load. */
+#define PLS_MAX_ENT 65536
+
 int pl_load_pls(Playlist *p, const char *pls) {
     FILE *f = fopen(pls, "r");
     if (!f) return -1;
@@ -257,7 +272,7 @@ int pl_load_pls(Playlist *p, const char *pls) {
         char *endp;
         long num = strtol(q, &endp, 10);
         while (*endp == ' ' || *endp == '\t') endp++;
-        if (*endp || num < 1) continue;
+        if (*endp || num < 1 || num > PLS_MAX_ENT) continue;
         while (*eq == ' ' || *eq == '\t') eq++;
         int is_file   = !lv_strcasecmp(alpha, "file");
         int is_title  = !lv_strcasecmp(alpha, "title") || !lv_strcasecmp(alpha, "label");
@@ -274,7 +289,9 @@ int pl_load_pls(Playlist *p, const char *pls) {
             ent = ne; ent_cap = cap; ent_n = at + 1;
         }
         if (is_file) {
-            if (lv_is_abs(eq)) lv_strlcpy(ent[at].path, eq, sizeof ent[at].path);
+            if (lv_is_url(eq)) {          /* D3: URL rows skipped, like m3u */
+                printf("levari: pls skips URL row: %s\n", eq);
+            } else if (lv_is_abs(eq)) lv_strlcpy(ent[at].path, eq, sizeof ent[at].path);
             else lv_path_join(ent[at].path, sizeof ent[at].path, dir, eq);
         } else if (is_title) {
             lv_strlcpy(ent[at].title, eq, sizeof ent[at].title);
@@ -303,6 +320,12 @@ int pl_save_m3u(Playlist *p, const char *m3u) {
     fputs("#EXTM3U\n", f);
     for (int i = 0; i < p->count; i++) {
         Track *t = &p->items[i];
+        if (lv_is_url(t->path)) {
+            /* D3: transient URL rows are never persisted (the urlIndex
+               file is the sanctioned single-row memory) */
+            printf("levari: save skips URL row: %s\n", t->path);
+            continue;
+        }
         if (t->tags.title[0] || t->tags.artist[0])
             fprintf(f, "#EXTINF:%d,%s - %s\n", t->duration,
                     t->tags.artist[0] ? t->tags.artist : "?",

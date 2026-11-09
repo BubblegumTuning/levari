@@ -1,5 +1,6 @@
 #include "player.h"
 #include "../audio/audio.h"
+#include "../library/library.h"
 #include <unistd.h>
 #include <time.h>
 
@@ -86,6 +87,7 @@ static void load_track_locked(Player *p, int idx) {
     p->pos_frames = 0;
     p->track_start = 0;
     p->track_end = 0;
+    p->url_checked = 0;
     p->state = ST_PLAY;
     eq_set_rate(&p->eq, p->rate);
     ws_init(&p->ws, p->speed / 100.0);
@@ -239,6 +241,18 @@ static void *player_thread(void *arg) {
         if (p->state == ST_PLAY && p->dec) {
             /* stereo at the 0.5x floor: ch * (CHUNK/0.5 + WS_FRAME) samples */
             static int16_t obuf[2 * (CHUNK * 2 + WS_FRAME)];
+            char icy[256];
+            if (dec_take_title(p->dec, icy, sizeof icy)) {
+                /* live StreamTitle onto the playing row: every title
+                   reader (marquee, status verb, mpris) re-reads the row
+                   under p->mtx, so the write under it is all the plumbing
+                   needed */
+                pthread_mutex_lock(&p->mtx);
+                if (p->cur >= 0 && p->cur < p->pl->count)
+                    lv_strlcpy(p->pl->items[p->cur].tags.title, icy,
+                               sizeof p->pl->items[p->cur].tags.title);
+                pthread_mutex_unlock(&p->mtx);
+            }
             int got = dec_read(p->dec, buf, CHUNK);
             if (got > 0) {
                 eq_process(&p->eq, buf, got, p->ch);
@@ -261,6 +275,20 @@ static void *player_thread(void *arg) {
                 apply_pan(toput, tout, p->ch, p->pan);
                 ao_write(toput, tout);
                 p->pos_frames += got;
+                if (!p->url_checked) {
+                    /* the urlIndex bank point (D5): open succeeded AND the
+                       first decoded chunk advanced pos — failed opens never
+                       reach here, so they can never clobber the row. The
+                       path is read under the lock; the file write is off it */
+                    p->url_checked = 1;
+                    char upath[LV_MAX_PATH] = "";
+                    pthread_mutex_lock(&p->mtx);
+                    if (p->cur >= 0 && p->cur < p->pl->count)
+                        lv_strlcpy(upath, p->pl->items[p->cur].path, sizeof upath);
+                    pthread_mutex_unlock(&p->mtx);
+                    if (lv_is_url(upath))
+                        lib_url_index_save(upath);
+                }
                 if (p->ab_b >= 0 && p->pos_frames >= p->ab_b) {
                     long long a = p->ab_a >= 0 ? p->ab_a : p->track_start;
                     dec_seek(p->dec, a);

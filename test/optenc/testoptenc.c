@@ -7,6 +7,7 @@
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/to \
        test/optenc/testoptenc.c $(find build/CMakeFiles/levari.dir -name '*.o' \
          ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
        -lz -lm -lpthread -ldl -lstdc++
    Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
@@ -50,40 +51,40 @@ int main(void) {
     cfg_load();
     ui.pl = &fake_pl;                 /* opt_save writes fade_stop through it */
     ui.opt_visible = 1;
-    ui.opt_adv = 1;                   /* the LEGACY button lives on the ADV tab */
+    ui.opt_tab = 1;                   /* the LEGACY button lives on the ADV tab */
     ui.pressed = B_NONE;
     ui.opt_enc = cfg.tag_legacy_enc + 1;
     chk("opens at AUTO", ui.opt_enc, 0);
 
     Rect r = opt_enc_rect();
-    click(r.x + r.w / 2, r.y + r.y / 2 + r.h / 2 - r.y / 2);  /* center */
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* center */
     chk("cycle 1 -> latin1", ui.opt_enc, 1);
     Tags t; tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live effect: latin1 decode", strcmp(t.title, "\xc3\x8d\xc2\xb3") == 0, 1);
 
-    click(186 + 36, 150 + 7);
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* same button, always via the rect — never hardcoded px */
     chk("cycle 2 -> cp1251", ui.opt_enc, 2);
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live effect: cp1251 decode", strcmp(t.title, "\xd0\x9d\xd1\x96") == 0, 1);
 
-    click(186 + 36, 150 + 7);
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* same button, always via the rect — never hardcoded px */
     chk("cycle 3 -> utf8", ui.opt_enc, 3);
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live effect: utf8 forced", strcmp(t.title, "\xcd\xb3") == 0, 1);
 
-    click(186 + 36, 150 + 7);
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* same button, always via the rect — never hardcoded px */
     chk("cycle 4 -> shiftjis", ui.opt_enc, 4);
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     /* forced shiftjis: CD B3 sit in the half-width kana band (D2 forced) */
     chk("live effect: shiftjis forced", strcmp(t.title, "\xef\xbe\x8d\xef\xbd\xb3") == 0, 1);
 
-    click(186 + 36, 150 + 7);
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* same button, always via the rect — never hardcoded px */
     chk("cycle wraps to AUTO", ui.opt_enc, 0);
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live effect: auto block verdict", strcmp(t.title, "\xd0\x9d\xd1\x96") == 0, 1);
 
-    click(186 + 36, 150 + 7);          /* land on latin1, then SAVE */
-    click(186 + 36, 150 + 7);          /* and cp1251 */
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* land on latin1, then SAVE */
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* and cp1251 */
     opt_save();
     cfg_load();
     chk("opt_save persisted cp1251", cfg.tag_legacy_enc, LV_ENC_CP1251);
@@ -96,13 +97,73 @@ int main(void) {
     /* close WITHOUT save: cfg is cp1251 (just persisted); cycle live to utf8,
        then opt_close must roll tag.c's live default back to cfg (cp1251) so
        the button re-read on next open and the decoder never disagree. */
-    click(186 + 36, 150 + 7);          /* cp1251 -> utf8, applied live */
+    click(r.x + r.w / 2, r.y + r.h / 2);  /* cp1251 -> utf8, applied live */
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live before close: utf8 forced", strcmp(t.title, "\xcd\xb3") == 0, 1);
     opt_close();
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("close-without-save reverts live default to cfg (cp1251)",
         strcmp(t.title, "\xd0\x9d\xd1\x96") == 0, 1);
+
+    /* ffmpeg detection indicator (ADV page status line): pure label —
+       detected reads green "detected" plus the version of the library
+       actually resolved (probe_info), detected-but-versionless falls
+       back to the bare word honestly, anything else reads red and says
+       streaming is unavailable; the prefill helper fills a BLANK
+       libav.dir field with the probe's resolved directory only on a
+       probe==1 with a reportable dir (a filled field is never touched). */
+    {
+        int red = -1;
+        const char *l = opt_ff_label(1, "7.1.5", &red);
+        chk("ff label detected+ver: text", strcmp(l, "ffmpeg: detected 7.1.5") == 0, 1);
+        chk("ff label detected+ver: not red", red, 0);
+        red = -1;
+        l = opt_ff_label(1, "", &red);
+        chk("ff label detected no-ver: bare text", strcmp(l, "ffmpeg: detected") == 0, 1);
+        chk("ff label detected no-ver: not red", red, 0);
+        red = -1;
+        l = opt_ff_label(0, "9.0.2", &red);
+        chk("ff label missing: names ffmpeg + unavailable",
+            strstr(l, "ffmpeg") && strstr(l, "not found") && strstr(l, "streaming"), 1);
+        chk("ff label missing: red (version irrelevant)", red, 1);
+        chk("ff label missing: version not shown", strstr(l, "9.0.2") == NULL, 1);
+        red = -1;
+        l = opt_ff_label(3, "6.1.1-3ubuntu5", &red);
+        chk("ff label ABI3: names the found release + incompatible",
+            strstr(l, "6.1.1-3ubuntu5") && strstr(l, "incompatible"), 1);
+        chk("ff label ABI3: red", red, 1);
+        chk("ff label ABI3: does not claim 'detected'", strstr(l, "detected") == NULL, 1);
+        red = -1;
+        l = opt_ff_label(3, "", &red);
+        chk("ff label ABI3 no-ver: still incompatible + red",
+            strstr(l, "incompatible") && red == 1, 1);
+        ui.opt_field[OPTF_LIBAV][0] = 0;
+        ff_prefill_libav(1, "/opt/homebrew/opt/ffmpeg/lib");
+        chk("prefill: probe ok + blank field fills",
+            strcmp(ui.opt_field[OPTF_LIBAV], "/opt/homebrew/opt/ffmpeg/lib") == 0, 1);
+        lv_strlcpy(ui.opt_field[OPTF_LIBAV], "~/my/ffmpeg", LV_MAX_PATH);
+        ff_prefill_libav(1, "/usr/lib64");
+        chk("prefill: filled field never overwritten",
+            strcmp(ui.opt_field[OPTF_LIBAV], "~/my/ffmpeg") == 0, 1);
+        ui.opt_field[OPTF_LIBAV][0] = 0;
+        ff_prefill_libav(2, "/usr/lib64");
+        chk("prefill: probe 2 (libav missing) does not fill",
+            ui.opt_field[OPTF_LIBAV][0] == 0, 1);
+        ff_prefill_libav(3, "/lib/x86_64-linux-gnu");
+        chk("prefill: probe 3 (ABI mismatch) still shows WHERE it looked",
+            strcmp(ui.opt_field[OPTF_LIBAV], "/lib/x86_64-linux-gnu") == 0, 1);
+        ui.opt_field[OPTF_LIBAV][0] = 0;
+        ff_prefill_libav(1, "");
+        chk("prefill: empty dir report does not fill",
+            ui.opt_field[OPTF_LIBAV][0] == 0, 1);
+        ui.opt_field[OPTF_LIBAV][0] = 0;
+        /* the live probe still agrees with the bare wrapper (contract:
+           probe_info's return == probe's return on this host) */
+        char vbuf[32], dbuf[LV_MAX_PATH];
+        chk("ff probe_info agrees with probe",
+            dec_ffmpeg_probe_info(vbuf, sizeof vbuf, dbuf, sizeof dbuf) ==
+            dec_ffmpeg_probe(), 1);
+    }
 
     printf(fails ? "FAILURES: %d\n" : "all LEGACY button checks pass\n", fails);
     return fails != 0;

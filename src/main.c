@@ -108,6 +108,11 @@ int main(int argc, char **argv) {
             print_usage();
             return 0;
         }
+        /* URLs bypass the extension classifiers: an argv URL ending in
+           .m3u/.pls/.cue must not be fopen'd as a local playlist
+           (remote playlist fetching is out of scope, D3) — it is a
+           transient play row exactly like every other argv entry */
+        else if (lv_is_url(argv[i])) pl_add(&playlist, argv[i]);
         else if (pl_ext_kind(argv[i]) == PL_M3U) pl_load_m3u(&playlist, argv[i]);
         else if (pl_ext_kind(argv[i]) == PL_PLS) pl_load_pls(&playlist, argv[i]);
         else if (pl_ext_kind(argv[i]) == PL_CUE) pl_load_cue(&playlist, argv[i]);

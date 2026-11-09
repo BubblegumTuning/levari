@@ -5,7 +5,8 @@
 A tiny, fast Winamp 2.95-style audio player for Linux, Windows and
 macOS, written in C11. SDL2 UI with software-rendered skinning,
 mp3/ogg/opus/flac/wav/mod/s3m/xm/it/spc (SNES SPC700 rips) decoding
-(plus aac/m4a/wma via optional libav* backend), CJK (JIS X 0208)
+(plus aac/m4a/wma and http/https/icecast network streams via the
+optional libav* backend), CJK (JIS X 0208)
 text, playlist with editing (sort/reorder/crop/cut-paste/save-as,
 `.m3u`/`.m3u8`/`.pls` load), 10-band EQ, spectrum viz, CUE sheets,
 drag & drop loading,

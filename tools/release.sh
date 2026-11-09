@@ -40,7 +40,7 @@ package() { # package <target> <arch> <builddir> <binary> [extra files...]
     echo "== $out/$stem.zip"
 }
 
-build build-rel-linux
+build build-rel-linux -DLEVAR_TIERS=avx2
 package linux x86-64 build-rel-linux levari README.md assets/levari.desktop assets/levari.svg
 
 # legacy x86-64: the "drop it anywhere" build. zig cc pins BOTH floors in one
@@ -85,7 +85,7 @@ package linux-legacy x86-64 build-rel-linux-legacy-zig levari README.md assets/l
 
 sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}
 [ -f "$sdl2/sdl2-config.cmake" ] || { echo "SDL2-mingw cmake dir not found: $sdl2 (set SDL2_DIR)" >&2; exit 1; }
-build build-rel-win -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-toolchain.cmake" -DSDL2_DIR="$sdl2"
+build build-rel-win -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-toolchain.cmake" -DSDL2_DIR="$sdl2" -DLEVAR_TIERS=avx2
 package win x86-64 build-rel-win levari.exe README.md
 
 # Pi Zero 1 / Pi 1 (ARMv6 hard-float). Wired up via tools/armv6-toolchain.cmake.

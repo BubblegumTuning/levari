@@ -18,8 +18,6 @@ int  lv_sock_pointer(char *out, size_t n);  /* published path; 0 = none */
 
 /* client side: returns process exit code; prints response */
 int  cli_run(int argc, char **argv);
-/* client side: send one prepared command line */
-int  cli_send_line(const char *line);
 /* client side: send one command line, capture response into resp;
    0 = ok, 1 = ERR response, 2 = transport error */
 int  cli_request(const char *line, char *resp, size_t rn);

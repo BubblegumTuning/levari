@@ -191,13 +191,20 @@ int main(void) {
         }
         chk("0.75x mono DC stays DC", okm && gotm > (long long)(4096 * 1.3) - 2 * WS_FRAME);
     }
-    /* trichannel input clamps to two (old contract) without blowing up */
+    /* trichannel input clamps to two (old contract) without blowing up,
+       and the DC signal survives the clamp (a single n>=0 smoke proves
+       nothing about the output) */
     {
         WS w; ws_init(&w, 1.5);
         static int16_t t3[512 * 3], to[2 * (512 * 2 + WS_FRAME)];
         for (int i = 0; i < 512 * 3; i++) t3[i] = 7;
-        int n = ws_process(&w, t3, 512, 3, to);
-        chk("3-channel input clamps to stereo", n >= 0);
+        int dcok = 1, got = 0;
+        for (int r = 0; r < 4; r++) {          /* several rounds: priming may emit 0 */
+            int n = ws_process(&w, t3, 512, 3, to);
+            for (int i = 0; i < n * 2; i++) if (to[i] != 7) dcok = 0;
+            got += n;
+        }
+        chk("3-channel input clamps to stereo (DC preserved)", dcok && got > 0);
     }
     printf("%s: %d failure(s)\n", fails ? "FAILURES" : "ALL PASS", fails);
     return fails != 0;

@@ -26,6 +26,15 @@ For a per-button reference of every control in each window, see
 - **Open browser** (`O` button or `o`) — built-in file/folder picker;
   `ADD DIR` queues a whole directory recursively.
 - **Search** (`SRCH` button) — see below.
+- **URL loader** (`URL` button) — one-line field prefilled with the last
+  working stream (inert text only; `Enter` re-validates against the
+  scheme allowlist and plays transiently, red `url not allowed` rejects
+  without losing the text; without a loadable ffmpeg backend the window
+  grows a red notice line under the field and `Enter` is inert). Every
+  key belongs to the field while the
+  window is open; `Esc`/`X` closes, the title strip drags. Compiled
+  only with `-DLV_STREAMING=ON` (the default); details in
+  [usage.md](usage.md#streaming).
 - **Options** (right-click the main window's title bar → `OPTIONS...`) —
   opens docked flush to the main window's right edge, top-aligned, as wide
   as the main+playlist stack plus a margin for the `SCAN` button.
@@ -47,7 +56,9 @@ For a per-button reference of every control in each window, see
   runs and a status line below reports `added N (M seen)`. A `TAGS` checkbox
   next to it controls whether the scan also reads tags + duration (on) or
   just filenames (off, much faster). `CLEAR` removes the index file so the
-  next `SCAN` rebuilds it from scratch.
+  next `SCAN` rebuilds it from scratch. The ADV page's bottom line reports
+the ffmpeg detection status (green detected / red not found — streaming
+and aac/m4a/wma substrate).
   `Esc` or `CLOSE` hides the window.
 
 ## Search

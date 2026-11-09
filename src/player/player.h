@@ -25,6 +25,9 @@ typedef struct {
     _Atomic int vol_prev; /* volume restored by unmute (daemon mute path) */
     _Atomic int fade_stop;/* 1: CMD_STOP fades out over 0.5s before stopping */
     int fading;            /* player-thread only: a stop fade is in progress */
+    int url_checked;       /* player-thread only: urlIndex banked/considered
+                              for the CURRENT track (set at first decoded
+                              chunk; reset on every track load) */
     long long fade_total, fade_left; /* frames of the running fade */
     _Atomic int pan;      /* -32..32 left..right balance */
     _Atomic int cmd;

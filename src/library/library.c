@@ -76,7 +76,11 @@ static int known_path(const ScanCtx *c, const char *p) {
    the first line "#levari-index v2" marks the escaped format: headerless
    (pre-0.3.0) indexes store RAW paths and must never be unescaped — a
    Windows path C:\Users\me\new would lose backslashes (\n -> newline).
-   lib_scan_add migrates a legacy index to v2 in place.
+   lib_scan_add migrates a legacy index: safely-readable headerless rows
+   are KEPT verbatim under a stamped header; an ambiguous one (lone
+   backslash: cannot prove escaped-vs-raw) is discarded and rebuilt.
+   lib_index_rescan refuses an ambiguous one outright — a partial update
+   never rewrites what it cannot read.
    since 0.3.4 the header carries a creation marker: "<version> <YYMMDD>"
    (UTC, written when the index is created — appended scans never rewrite
    it). Detection anywhere is only strncmp("#levari-index", 13), and the
@@ -158,25 +162,88 @@ int lib_idx_getline(FILE *f, char *line, size_t n) {
     return 1;
 }
 
-/* ensure the v2 format on disk: create a missing index with the header.
-   a HEADERLESS index is DISCARDED, not translated: 0.3.0 already wrote
-   escaped paths without ever writing a header, so legacy rows are
-   ambiguous (0.3.0: escaped; older: raw) and re-escaping them double-
-   escaped every backslash/tab/newline path on upgrade (C:\\Music became
-   C:\\\\Music) — lookups missed, rescans appended duplicates, play got
-   corrupt paths. the index is a cache: dropping it forces a re-scan that
-   rebuilds it correctly. */
-static void idx_migrate(const char *idx) {
+/* ensure the v2 format on disk; runs before EVERY read-modify-write of
+   the index. Returns 1 = already v2 (or freshly created), 0 = headerless
+   but SAFE to keep: the header was stamped and every row preserved
+   byte-verbatim, -1 = headerless and AMBIGUOUS: rows dropped, header-only
+   file (the full-scan caller rebuilds what it scans), -2 = headerless,
+   ambiguous, and partial=1: REFUSED — the original file is byte-identical
+   and the caller must not rewrite (lib_index_rescan maps it to -3,
+   "run a full library scan"; a single-file rescan must never silently
+   become a full index reset — 2026-11-07 GH-line ruling).
+   Headerless means AMBIGUOUS: 0.3.0 already wrote escaped paths without
+   ever writing a header, so legacy rows are escaped (0.3.0) or raw
+   (pre-0.3.0), and assuming raw re-escaped them — C:\\Music became
+   C:\\\\Music on upgrade (lookups missed, rescans appended duplicates,
+   play got corrupt paths: the 0.3.2 incident). Safe is decidable per
+   file: no backslash byte at all (both readings are then byte-identical),
+   or every backslash begins a valid escape pair — \\ \t \n, exactly what
+   esc_field emits. Such a file is ALREADY the v2 wire format under either
+   reading: stamping the header is the entire migration, no per-row
+   translation, no re-escape. One lone backslash makes it ambiguous.
+   Both write paths build the replacement in a .tmp and rename over the
+   original only after the write succeeded: a crash never leaves a
+   half-index where a whole one was. */
+static int idx_rename_tmp(const char *tmp, const char *dst) {
+    /* mingw's rename refuses an existing target: remove-retry, the
+       cfg_save/lib_index_rescan pattern */
+    if (rename(tmp, dst) != 0) {
+        remove(dst);
+        if (rename(tmp, dst) != 0) { remove(tmp); return -1; }
+    }
+    return 0;
+}
+
+static int idx_migrate(const char *idx, int partial) {
     FILE *r = fopen(idx, "r");
     if (!r) {
         FILE *w = fopen(idx, "w");
         if (w) { idx_write_header(w); fclose(w); }
-        return;
+        return 1;
     }
-    if (lib_idx_header(r)) { fclose(r); return; } /* already v2 */
-    fclose(r);
-    FILE *w = fopen(idx, "w"); /* legacy: drop rows, keep only the format */
-    if (w) { idx_write_header(w); fclose(w); }
+    if (lib_idx_header(r)) { fclose(r); return 1; } /* already v2 */
+
+    /* headerless: classify from the raw bytes, touching nothing */
+    int ambiguous = 0, c;
+    while ((c = fgetc(r)) != EOF) {
+        if (c != '\\') continue;
+        int n = fgetc(r);
+        if (n != '\\' && n != 't' && n != 'n') { ambiguous = 1; break; }
+    }
+    if (ferror(r)) ambiguous = 1; /* unreadable: never trust a guess */
+    if (fseek(r, 0, SEEK_SET) != 0) ambiguous = 1;
+
+    if (!ambiguous) {
+        /* stamp the header ahead of the verbatim rows — the whole
+           migration, atomically */
+        char tmp[LV_MAX_PATH + 8];
+        snprintf(tmp, sizeof tmp, "%s.tmp", idx);
+        FILE *w = fopen(tmp, "w");
+        int bad = !w;
+        if (w) {
+            idx_write_header(w);
+            char buf[4096];
+            size_t n;
+            while (!bad && (n = fread(buf, 1, sizeof buf, r)) > 0)
+                if (fwrite(buf, 1, n, w) != n) bad = 1;
+            if (fclose(w) != 0) bad = 1;
+        }
+        fclose(r);
+        if (!bad && idx_rename_tmp(tmp, idx) == 0) return 0;
+        /* a failed copy left the original untouched: fall through and
+           let the caller decide — refuse (partial) or discard-and-rebuild */
+    } else {
+        fclose(r);
+    }
+    if (partial) return -2;   /* byte-identical original, decision refused */
+    char tmp[LV_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", idx);
+    FILE *w = fopen(tmp, "w");
+    if (w) { idx_write_header(w); if (fclose(w) == 0)
+                 if (idx_rename_tmp(tmp, idx) == 0) return -1; }
+    remove(tmp);
+    return -1; /* best effort: even the discard failed; every reader below
+                  treats the still-headerless file as untrusted anyway */
 }
 
 static void scan_dir(const char *dir, ScanCtx *c) {
@@ -282,7 +349,7 @@ static int cmpstr(const void *a, const void *b) {
 int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen, int *skipped) {
     char idx[LV_MAX_PATH];
     lib_index_path(idx, sizeof idx);
-    idx_migrate(idx);
+    idx_migrate(idx, 0);
     char **sorted = NULL;
     int sn = 0, cap = 0;
     FILE *r = fopen(idx, "r");
@@ -333,45 +400,6 @@ int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *adde
     if (seen) *seen = c.seen;
     if (skipped) *skipped = c.toolong;
     return 0;
-}
-
-int lib_foreach_entry(void (*fn)(const LibEntry *e, void *ud), void *ud) {
-    char idx[LV_MAX_PATH];
-    lib_index_path(idx, sizeof idx);
-    FILE *f = fopen(idx, "r");
-    if (!f) return -1;
-    char line[2 * LV_MAX_PATH + 1024];
-    int v2 = lib_idx_header(f);
-    int n = 0;
-    int gr;
-    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
-        if (gr == 2) continue; /* over-long row: already drained */
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-        char *p1 = line;
-        char *p2 = strchr(p1, '\t'); if (!p2) continue; *p2++ = 0;
-        if (v2) { size_t sl = strlen(p1); unesc_field(p1, sl + 1, p1, sl); }
-        char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
-        char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
-        char *p5 = strchr(p4, '\t');
-        int dur = 0, track = 0, notag = 0;
-        if (p5) {
-            *p5++ = 0;
-            char *p6 = strchr(p5, '\t');
-            if (p6) {
-                *p6++ = 0;
-                dur = atoi(p5);
-                char *p7 = strchr(p6, '\t');
-                if (p7) { *p7++ = 0; track = atoi(p6); notag = atoi(p7); }
-                else track = atoi(p6);
-            } else dur = atoi(p5);
-        }
-        LibEntry e = { p1, p2, p3, p4, dur, track, notag };
-        fn(&e, ud);
-        n++;
-    }
-    fclose(f);
-    return n;
 }
 
 /* one pass over the index, sorted for binary search: fills tags and
@@ -518,7 +546,8 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
 
     char idx[LV_MAX_PATH];
     lib_index_path(idx, sizeof idx);
-    idx_migrate(idx);
+    if (idx_migrate(idx, 1) == -2) return -3; /* pre-v2 and ambiguous: the
+        index is untouched — only a full scan may rewrite it */
 
     char line[2 * LV_MAX_PATH + 1024]; /* house row budget */
     char *hdr = NULL;                  /* header line kept byte-identically:
@@ -607,6 +636,64 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
     if (out_tags) *out_tags = t;
     if (out_dur) *out_dur = dur;
     if (out_notag) *out_notag = notag;
+    return 0;
+}
+
+/* ---- urlIndex: one row = the last working URL (D5). Lives beside the
+   library index — derive the directory from lib_index_path (whose
+   branches both mkdir their base, so the folder exists after the call) */
+static void url_index_path(char *out, size_t n) {
+    char idx[LV_MAX_PATH];
+    lib_index_path(idx, sizeof idx);
+    if (lv_dirname(idx)) snprintf(out, n, "%s/urlIndex", idx);
+    else lv_strlcpy(out, "urlIndex", n); /* index path had no dir: same cwd */
+}
+
+int lib_url_index_load(char *out, size_t n) {
+    out[0] = 0;
+    char p[LV_MAX_PATH];
+    url_index_path(p, sizeof p);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    char line[2 * LV_MAX_PATH + 10]; /* room past the cap so an oversize
+                                        tampered row is detected, not split */
+    char *got = fgets(line, sizeof line, f);
+    fclose(f);
+    if (!got) return -1;
+    size_t len = strlen(line);
+    while (len && line[len - 1] == '\n') line[--len] = 0;
+    /* ONLY the trailing newline is trimmed: a stray CR/control byte is
+       tampering evidence and must survive so the Enter gate rejects the
+       row (inert-display contract). Oversize rows never enter the
+       caller's buffer — they simply do not prefill. */
+    if (!len || len >= n) return -1;
+    lv_strlcpy(out, line, n);
+    return 0;
+}
+
+int lib_url_index_save(const char *url) {
+    /* shape + hygiene gate (lv_is_url rejects CR/LF/space/DEL anywhere,
+       so the row can never become a multi-line or injection carrier) +
+       scheme re-check for defence in depth: only open-verified URLs are
+       ever banked (the open passed the allowlist), so this can only fire
+       on a wrong caller — a file:// shape must never reach the file */
+    if (!lv_is_url(url) || !lv_url_scheme_allowed(url, LV_URL_SCHEMES) ||
+        strlen(url) >= LV_MAX_PATH) return -1;
+    char p[LV_MAX_PATH];
+    url_index_path(p, sizeof p);
+    char tmp[LV_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", p);
+    FILE *w = fopen(tmp, "w");
+    if (!w) return -1;
+    fprintf(w, "%s\n", url);
+    if (fflush(w) || ferror(w)) { fclose(w); remove(tmp); return -1; }
+    if (fclose(w) != 0) { remove(tmp); return -1; }
+    /* mingw's rename refuses to replace an existing file: retry once
+       after removing the target (lib_index_rescan/cfg_save pattern) */
+    if (rename(tmp, p) != 0) {
+        remove(p);
+        if (rename(tmp, p) != 0) { remove(tmp); return -1; }
+    }
     return 0;
 }
 

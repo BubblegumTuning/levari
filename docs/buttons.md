@@ -29,6 +29,7 @@ hides that window (its state is kept).
 | `VIS` | Toggle the spectrum analyzer drawn over the scrolling title strip (green = on). |
 | `LST` | Show/hide the playlist window. If the playlist is docked, it re-docks flush under the main window. |
 | `SRCH` | Open/close the search window (green while open). |
+| `URL` | Open/close the URL loader window (green while open). Its field takes a stream address (`http`/`https`/`icecast`); `Enter` plays it transiently (the playlist becomes that single row), `Esc` or `X` closes. Opens docked flush above the main window: with the EQ on that edge it docks BETWEEN main and EQ (EQ pushed up); closing it merges a stacked EQ back onto main. Without a loadable ffmpeg backend the window shows a red notice line and `Enter` is inert. Absent in `-DLV_STREAMING=OFF` builds. Details: [usage.md](usage.md#streaming). |
 | `RPT1` | Toggle repeat-one mode (green = on): the current track loops endlessly. `NEXT`/`PREV` still advance to another track (shuffle-aware) and the loop follows it. Mutually exclusive with `REPEAT`. |
 | `A` | Mark **A**: set the A–B repeat start point at the current playback position (green while set). |
 | `B` | Mark **B**: set the repeat end point — only takes effect if `A` is set and playback is already past it. Playback then loops A→B. Clicking `B` a second time clears both points. |
@@ -51,7 +52,7 @@ hides that window (its state is kept).
 | `REM` | Remove the selected track(s) from the playlist (multi-selection included). If the current track is among them, playback stops first; the current-track pointer stays on the same music otherwise. `Ctrl+A` + `REM` clears the whole list. |
 | `CLO` | Hide the playlist window. |
 | `LIB` | Append every entry from the media library index to the playlist (the index built by the options window `SCAN` or `levari library scan`). Does not start playback. |
-| `SCAN` | Re-probe every **selected** track (tags + duration) and update each library-index row in place — replaced if present, appended if the file was not indexed. The fresh values land on the playlist rows immediately, so newly tagged or mistagged files no longer need a full `CLEAR` + `SCAN`. With nothing selected, or in the ctrl-a select-all state (a whole-playlist probe could stall on network shares), or on a CUE virtual row, it does nothing. While a background scan runs it refuses (the title strip notes it). A failed row leaves its index entry untouched and is reported to stdout; one `cannot rescan` flash in red over the title strip for 10 s covers the whole batch; a real title change replaces the notice sooner. |
+| `SCAN` | Re-probe every **selected** track (tags + duration) and update each library-index row in place — replaced if present, appended if the file was not indexed. The fresh values land on the playlist rows immediately, so newly tagged or mistagged files no longer need a full `CLEAR` + `SCAN`. With nothing selected, or in the ctrl-a select-all state (a whole-playlist probe could stall on network shares), or on a CUE virtual row, it does nothing. While a background scan runs it refuses (the title strip notes it). A failed row leaves its index entry untouched and is reported to stdout; one `cannot rescan` flash in red over the title strip for 10 s covers the whole batch; a real title change replaces the notice sooner. If the library index predates the v2 format AND cannot be migrated without guessing, the whole batch refuses and the index file is left untouched — the strip shows `index: run full scan` instead. |
 | `X` | Same as `CLO`. |
 
 Track list: single click selects a track (white; the *playing* track is
@@ -80,7 +81,31 @@ acts and closes):
 | `COPY` / `CUT` / `PASTE` | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Internal row clipboard (survives focus, not a restart). Paste lands below a single selected row, or appends. |
 | `MOVE UP` / `MOVE DOWN` | `Alt+Up` / `Alt+Down` | Move the selection past the rows around it. |
 | `SAVE AS...` | `Ctrl+K` | Save the whole playlist as `.m3u` (opens the browser in SAVE mode, see below). |
+| `SONG INFO` | — | Open the song-info window for one row (see below). |
 | `CLEAR` | — | Stop and empty the playlist. |
+
+**Song info** (edit-menu `SONG INFO`) opens a window listing the row's
+tags — TITLE, ARTIST, ALBUM ARTIST, COMPOSER, ALBUM, TRACK (with its
+total, when the file carries one), YEAR, GENRE, COMMENT — plus its file
+location (directory and file name on separate lines). For ID3v2 files
+all those fields are read from the tag frames at the moment of opening
+(TPE2/TCOM/TYER–TDRC/TCON/COMM on top of the core four); other formats
+fall back to the fields the library already decodes. The tags are
+re-read from the file on disk at each open — what the file carries
+*now*, not the cached library values (so re-saving tags in another
+program and re-opening shows the change without a re-scan). A virtual
+CUE track shows the tags parsed from the `.cue` sheet. The row shown is
+the single selected row, else the shift-range anchor, else the playing
+row; with none of those the menu item does nothing and flashes a red
+line in the main window.
+
+Every value sits in a read-only copy box: click it to select (the value
+highlights), then `Ctrl+C` — or `Ctrl+Insert` — puts the *whole* value on
+the clipboard, no matter how much of it fits in the box; the
+directory/name lines show their tail, so the file name stays visible in
+the split itself. Long values scroll out of sight in the box but copy in
+full. The window drags from its title strip and closes with its `X` or
+`Esc` (`Esc` also just closes it when a copy box was selected).
 
 The current track survives every edit: after a sort, shuffle or paste the
 same *music* keeps playing (or playback stops when its row was cut,
@@ -155,8 +180,8 @@ never written — `.m3u` with `#EXTINF` is the save format.
 ## Options window
 
 Opened from the main window title-bar right-click (`OPTIONS...`). The
-`BASIC` / `ADV` tab buttons (small tabs in the title bar, right of the
-`OPTIONS` label) switch the page; `SAVE` writes
+`BASIC` / `ADV` / `ABOUT` tab buttons (small tabs in the title bar, right
+of the `OPTIONS` label) switch the page; `SAVE` writes
 all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
 
 ### BASIC page
@@ -177,6 +202,11 @@ all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
 | `LARGE` | Allow ingest of files over 256 MB (green = on). Off by default: files over the cap are refused by the decoder with a message, protecting against OOM from the whole-file slurp decoders (MP3 seek table, module/Ogg-FLAC buffers). Toggling applies immediately (still press `SAVE` to persist); tag scanning is never capped. |
 | `10FPS` | Keep repainting the main window at 10 fps whenever the title is long enough to marquee (green = on). Off by default: the marquee only scrolls while playing. On, it also scrolls while paused, stopped, or unfocused — at the cost of a steady 10 fps repaint. Toggling applies immediately (still press `SAVE` to persist). |
 | `LEGACY` | 5-state **cycle button** (not a checkbox): the label shows the current setting — `AUTO`, `LATIN-1`, `CP1251`, `UTF-8` or `SHIFT-JIS`; each click cycles to the next. It forces the codepage for tag fields that carry no declared encoding (id3v2 `enc=0`/invalid marker, ID3v1, RIFF INFO): `AUTO` (default) decides per tag block from byte evidence (see `tag.legacy_encoding` in usage.md), the four forced values decode every such field through that reader. Applying takes effect immediately for future tag reads (no restart); rows already in the library index keep their old values — press `CLEAR` then `SCAN` to re-read. Press `SAVE` to persist. Hovering the button shows the same note. |
+| ffmpeg status | Static line at the page bottom: green `ffmpeg: detected`, or red `ffmpeg: not found - streaming unavailable` — whether the libav* shared libraries are loadable at runtime (network streams and aac/m4a/wma need them). Re-probed every time the window opens; installing ffmpeg or pointing `libav.dir` at it applies after a restart. |
+
+### ABOUT page
+
+Credits: created by, thanks to the third-party projects
 
 ## Search window
 
