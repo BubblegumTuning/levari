@@ -14,7 +14,8 @@ re-read; see test/ffabi/ffver.c for the link recipe):
                   distro ships 8.x) lavu 60 -> probe=1, m4a decodes
   host            native ffver          -> probe=1, m4a decodes
   debian:bullseye ffmpeg 4.3.x  lavu 56 -> probe=3, FAIL open (outside the set)
-  --mac mac112    ffmpeg 9.x    lavu 61 -> probe=1 (optional ssh leg)
+  --mac <host>    ffmpeg 9.x    lavu 61 -> probe=1 (optional ssh leg; the
+                  macOS build host is supplied by the internal runner)
 
 ffver for the container legs is linked with tools/zig-cc-2.17 against a
 glibc-floor (legacy zig) build tree so it runs on every distro here.
@@ -171,7 +172,9 @@ gcc -std=gnu11 -Isrc -o /tmp/ffver-mac test/ffabi/ffver.c \\
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mac", nargs="?", const="mac112", default=None)
+    ap.add_argument("--mac", default=None, metavar="HOST",
+                    help="optional ssh leg against the macOS build host "
+                         "(host supplied by the runner)")
     ap.add_argument("--legacy", default=f"{ROOT}/build-rel-linux-legacy-zig")
     args = ap.parse_args()
     m4a = glob_m4a()

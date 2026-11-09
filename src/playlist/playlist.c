@@ -234,10 +234,12 @@ typedef struct {
    30k+ song playlists (entry numbers run to the song count — a .pls ceiling
    must NOT be a playlist-size cap; anything under it grows on demand and
    empty slots cost nothing to the playlist itself). Memory of the sparse
-   index is max_index * sizeof(PlsEnt) (~4.3 KB) — the same transient the
-   pre-fix reader already spent on a real 65k list; only a FILE that
-   literally numbers an entry that high pays it, so this is not corruption,
-   and .pls files are only parsed on explicit user load. */
+   index is max_index * sizeof(PlsEnt): ~4.3 KB PER ENTRY (measured 4356),
+   so the ceiling's worst case is ~272 MiB (~285 MB) for a file that
+   literally numbers an entry that high — the same transient the pre-fix
+   reader already spent on a real 65k list; it is bounded, paid only by a
+   crafted/explicit .pls, and .pls files are parsed only on explicit user
+   load. */
 #define PLS_MAX_ENT 65536
 
 int pl_load_pls(Playlist *p, const char *pls) {

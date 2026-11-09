@@ -62,6 +62,20 @@ value says so on stderr and runs the floor instead of silently):
 
 ## Linux install
 
+The ffmpeg backend (aac/wma/URL formats) compiles once per supported libav
+major against pinned vendored public headers under `vendor/ffmpeg/` — the
+system's libav headers are NEVER used (struct layouts must match the
+runtime, see `vendor/ffmpeg/README.md`). Some distributions of the source
+omit those header files and ship only the generator: if configure stops
+with "vendor/ffmpeg/ff<N>/include is missing", run
+
+    tools/gen_vendor_ffmpeg.sh
+
+once at the repo root (needs network; each tarball's pinned sha256 is
+verified; `--check` proves the regenerated sets byte-identical to the
+committed ones). Then configure again. Nothing here changes runtime: the
+libraries themselves stay dlopen'd and optional.
+
     sudo cmake --install build --prefix /usr
 
 Installs the binary plus `levari.desktop` and the hicolor icon. The

@@ -39,10 +39,17 @@ static inline void lv_strlcpy(char *dst, const char *src, size_t n) {
 static inline void lv_expand_home(const char *in, char *out, size_t n) {
     const char *home = getenv("HOME");
     if (!home || !*home) home = getenv("USERPROFILE");
-    if (home && *home && in[0] == '~' && (in[1] == '/' || in[1] == 0))
-        snprintf(out, n, "%s%s", home, in + 1);
-    else
-        lv_strlcpy(out, in, n);
+    if (home && *home && in[0] == '~' && (in[1] == '/' || in[1] == 0)) {
+        /* same bytes snprintf("%s%s") would emit (home truncated to the
+           budget, then the rest strlcpy'd, NUL always written) without the
+           two-unbounded-%s format-truncation alarm */
+        size_t hl = strlen(home);
+        if (hl > n - 1) hl = n - 1;
+        memcpy(out, home, hl);
+        lv_strlcpy(out + hl, in + 1, n - hl);
+        return;
+    }
+    lv_strlcpy(out, in, n);
 }
 
 /* drop a trailing incomplete utf-8 sequence: snprintf/strlcpy into a

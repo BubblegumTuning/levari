@@ -344,6 +344,17 @@ endif()
 # LEVAR_FF_ABIS must stay in sync with LV_FFAPI_LIST in src/decode/ffabi.h.
 if(NOT WIN32)
     set(LEVAR_FF_ABIS 5 6 7 8 9)
+    # Slim checkouts (the GitHub package) ship the generator instead of the
+    # header sets — fail HERE with the fix, not at the first #include.
+    foreach(abi IN LISTS LEVAR_FF_ABIS)
+        if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/ffmpeg/ff${abi}/include/libavformat/avformat.h)
+            message(FATAL_ERROR
+                "vendor/ffmpeg/ff${abi}/include is missing: the libav* backend "
+                "compiles once per major against the pinned vendored headers. "
+                "Run 'tools/gen_vendor_ffmpeg.sh' at the repo root first "
+                "(one-time, needs network, verifies pinned sha256s) — see docs/build.md.")
+        endif()
+    endforeach()
     foreach(abi IN LISTS LEVAR_FF_ABIS)
         add_library(dec_ffab${abi} OBJECT src/decode/ffab.c)
         # OBJECT libs do NOT inherit the main target's position-independence:
