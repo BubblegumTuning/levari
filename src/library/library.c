@@ -291,7 +291,12 @@ static void scan_dir(const char *dir, ScanCtx *c) {
                     Decoder *dec = dec_open(full);
                     if (dec) {
                         long long tot = dec_total_frames(dec);
-                        if (tot > 0) dur = (int)(tot / dec_rate(dec));
+                        /* long long before the cast: a crafted container
+                           (ffmpeg's st->duration is unclamped) can report
+                           a total whose seconds exceed INT_MAX, and the
+                           old direct cast was implementation-defined */
+                        long long s = tot > 0 ? tot / dec_rate(dec) : 0;
+                        if (s > 0 && s <= LV_DUR_MAX) dur = (int)s;
                         dec_close(dec);
                     }
                 }
@@ -436,11 +441,15 @@ LibIndex lib_index_load(void) {
             char *p6 = strchr(p5, '\t');
             if (p6) {
                 *p6++ = 0;
-                dur = atoi(p5);
+                int d5 = atoi(p5);
+                dur = (d5 > 0 && d5 <= LV_DUR_MAX) ? d5 : 0;  /* clamp the number, NEVER drop the row */
                 char *p7 = strchr(p6, '\t');
                 if (p7) { *p7++ = 0; track = atoi(p6); notag = atoi(p7); }
                 else track = atoi(p6);
-            } else dur = atoi(p5);
+            } else {
+                int d5 = atoi(p5);
+                dur = (d5 > 0 && d5 <= LV_DUR_MAX) ? d5 : 0;  /* clamp the number, NEVER drop the row */
+            }
         }
         if (!p1[0]) continue;
         if (ix.n == cap) {
@@ -528,7 +537,11 @@ static int row_dur(const char *line) {
         if (!q) return 0;
         q++; /* advance PAST the tab: strchr(q,'\t') would find it again */
     }
-    return atoi(q);
+    int d = atoi(q);
+    /* same LV_DUR_MAX clamp as lib_index_load: this is the index's second
+       reader (rescan fallback when the probe goes blind) and its value
+       lands straight in Track.duration via out_dur */
+    return (d > 0 && d <= LV_DUR_MAX) ? d : 0;
 }
 
 int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,

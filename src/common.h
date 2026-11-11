@@ -10,7 +10,7 @@
 #define LV_MAX_PATH 4096
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.3.5"
+#define LV_VERSION "0.3.6"
 #endif
 
 /* build architecture, shown in the options title bar before the version

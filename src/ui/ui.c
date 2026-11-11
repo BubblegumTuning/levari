@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>      /* powf: time-normalized viz fall-off */
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,7 +26,7 @@ enum {
     PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_SCAN, PB_X, FB_ADDDIR, FB_X, B_URLX, IB_X,
     EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X, EQB_RESET,
     OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
-    OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC,
+    OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC, OPTB_VHZ,
     OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA, OPTB_TABU,
     B_NONE
 };
@@ -172,6 +173,7 @@ typedef struct {
     int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
+    int opt_vhz;                /* ADV cycle button copy: 10/24/30/60 (cfg.vis_hz) */
     int opt_enc;                 /* LEGACY button cycle: 0 auto, 1 latin1, 2 cp1251, 3 utf8, 4 shiftjis (cfg value = opt_enc - 1) */
     int opt_ff;                  /* ADV status line: ffmpeg (libav*) detected
                                     on the system — probed once at opt_open
@@ -680,93 +682,261 @@ static void fmt_time(char *buf, size_t n, long long sec) {
     else snprintf(buf, n, "%lld:%02lld", sec / 60, sec % 60);
 }
 
-static void draw_main(void) {
+/* the playlist footer total: sum in long long (durations arrive from
+   untrusted files — EXTINF/LengthN/index rows are raw atoi — and two
+   INT_MAX-sized rows wrapped the old int accumulator, so the footer
+   read 0:00), treat non-positive rows as unknown, and saturate the
+   readout at 9999:59:59+ so it stays bounded no matter the input. */
+#define PL_TOTAL_CAP (9999LL * 3600 + 59 * 60 + 59)   /* 35,999,999 s */
+static void fmt_pl_total(char *buf, size_t n, const Playlist *pl) {
+    long long total = 0;
+    for (int i = 0; i < pl->count; i++) {
+        if (pl->items[i].duration <= 0) continue;
+        total += pl->items[i].duration;
+        if (total > PL_TOTAL_CAP) break;
+    }
+    if (total > PL_TOTAL_CAP) lv_strlcpy(buf, "9999:59:59+", n);
+    else fmt_time(buf, n, total);
+}
+
+#define D_MAIN 1u
+#define D_PL   2u
+#define D_EQ   4u
+#define D_FILE 8u
+#define D_OPT  16u
+#define D_SRCH 32u
+#define D_URL  64u
+#define D_INFO 128u
+#define D_ALL  (D_MAIN | D_PL | D_EQ | D_FILE | D_OPT | D_SRCH | D_URL | D_INFO)
+/* ---- main-window draw regions (cpu_floor_hunting item 1) ------------------
+   D_MAIN (and the scheduler's window bits above) stays the conservative
+   full-window bit that every event site marks. The producer bits here let
+   the two steady-state repaint drivers mark ONLY what moves: a marquee or
+   viz tick repaints the title strip, the 1 s position poll repaints the
+   time readout + info line + seek knob. draw_main(regs) restores the
+   background inside exactly the marked rects — every skin bg primitive is
+   an SDL_FillRect, so confining clip_rect confines the whole replay (item
+   2 replaces it with a blit from a cached static surface) — then repaints
+   every widget INTERSECTING a marked rect. A widget skipped for a tick
+   must not have changed content since the last paint that covered it:
+   the audited truth is that time/strip/seek move only with the marked
+   poll/anim producers, and everything else in the window changes only on
+   events (which mark D_MAIN) or player-thread state caught by the poll
+   snapshot, which marks full. */
+#define D_M_TITLE 256u   /* title strip: marquee text / rescan message */
+#define D_M_VIZ   512u   /* viz bars — the same strip, different producer */
+#define D_M_TIME  1024u  /* time readout + info line + seek knob (poll) */
+#define D_M_BG    2048u  /* whole window (expose, press, theme-level) */
+#define D_M_ANY   (D_M_TITLE | D_M_VIZ | D_M_TIME | D_M_BG)
+#define D_M_FULL  (D_MAIN | D_M_BG)
+
+static SDL_Rect rgn_rects[4];  /* this pass's marked rects; rgn_n == 0 = full */
+static int rgn_n;
+
+static void rgn_add(const Rect *r) {
+    if (rgn_n >= (int)(sizeof rgn_rects / sizeof rgn_rects[0])) return;
+    rgn_rects[rgn_n].x = r->x; rgn_rects[rgn_n].y = r->y;
+    rgn_rects[rgn_n].w = r->w; rgn_rects[rgn_n].h = r->h;
+    rgn_n++;
+}
+
+/* does a widget rect fall inside this pass's regions? */
+static int rgn_hit(const Rect *r) {
+    if (!rgn_n) return 1;   /* full-window pass */
+    for (int i = 0; i < rgn_n; i++)
+        if (r->x < rgn_rects[i].x + rgn_rects[i].w &&
+            rgn_rects[i].x < r->x + r->w &&
+            r->y < rgn_rects[i].y + rgn_rects[i].h &&
+            rgn_rects[i].y < r->y + r->h) return 1;
+    return 0;
+}
+
+/* ui_dirty -> the region mask draw_main wants; any full bit forces all */
+static unsigned main_draw_regions(unsigned m) {
+    m &= D_MAIN | D_M_ANY;
+    return (m & D_M_FULL) ? D_M_FULL : m;
+}
+
+#ifdef LV_PROFILE
+/* Standing draw-path instrument for the low-floor CPU claims: per-producer
+   tick counts, dirty-rect pixel totals and per-stage microseconds, printed
+   to stderr at exit. Off unless -DLV_PROFILE=ON — the flag is the standing
+   instrument for all floor claims, never shipped on. */
+static struct {
+    unsigned full, title, viz, ticks_time;
+    unsigned long long px;
+    unsigned long long bg_us, txt_us, wid_us, blit_us;
+} lvprof;
+static unsigned long long lv_us(void) {
+    return SDL_GetPerformanceCounter() * 1000000ull
+           / SDL_GetPerformanceFrequency();
+}
+static void lvprof_tick(unsigned regs) {
+    if (regs & D_M_FULL) {
+        lvprof.full++;
+        lvprof.px += (unsigned long long)MAIN_W * MAIN_H;
+    } else {
+        if (regs & D_M_TITLE) lvprof.title++;
+        if (regs & D_M_VIZ) lvprof.viz++;
+        if (regs & D_M_TIME) lvprof.ticks_time++;
+        for (int i = 0; i < rgn_n; i++)
+            lvprof.px += (unsigned long long)rgn_rects[i].w * rgn_rects[i].h;
+    }
+}
+#define LV_T0 unsigned long long _lv_t = lv_us()
+#define LV_ACC(f) lvprof.f += lv_us() - _lv_t
+#else
+#define LV_T0 ((void)0)
+#define LV_ACC(f) ((void)0)
+#endif
+
+static void draw_main(unsigned regs) {
     SDL_Surface *s = ui.smain;
     Player *p = ui.pl;
-    skin_draw_main_bg(s);
 
-    font_puts(s, 10, 6, "LEVARI", col(s, 0, 224, 255));
-    { Rect x = close_rect(MAIN_W); draw_x(s, &x, ui.pressed == B_XMAIN); }
+    /* this pass's rects (TITLE and VIZ share the strip — add it once) */
+    rgn_n = 0;
+    if (!(regs & D_M_FULL)) {
+        if (regs & (D_M_TITLE | D_M_VIZ)) rgn_add(&R_TSCROLL);
+        if (regs & D_M_TIME) {
+            rgn_add(&R_TIME);
+            rgn_add(&R_INFO);
+            rgn_add(&R_SEEK);
+        }
+    }
+#ifdef LV_PROFILE
+    lvprof_tick(regs);
+#endif
 
-    /* row 1: play time in a box, 2x font, scrolling title beside it */
+    {   /* background: replay confined to the marked rects */
+        LV_T0;
+        if (rgn_n) {
+            for (int i = 0; i < rgn_n; i++) {
+                SDL_SetClipRect(s, &rgn_rects[i]);
+                skin_draw_main_bg(s);
+            }
+            SDL_SetClipRect(s, NULL);
+        } else {
+            skin_draw_main_bg(s);
+        }
+        LV_ACC(bg_us);
+    }
+
     long long base = p->track_start;
     long long endf = p->track_end > 0 ? p->track_end : p->total_frames;
     long long pos = p->rate ? (p->pos_frames - base) / p->rate : 0;
-    char tb[16];
-    fmt_time(tb, sizeof tb, p->state == ST_STOP ? 0 : pos);
-    font_puts_big(s, R_TIME.x + 6, R_TIME.y + 2, tb, col(s, 0, 255, 0));
 
-    int tx = R_TSCROLL.x + 2, tw = R_TSCROLL.w - 4;
-    ui.marquee = 0;
-    if (ui.msg[0]) {
-        /* transient rescan feedback outranks even the viz bars: the strip
-           carries the message, plain red, for its 10 s */
-        font_puts16(s, tx, R_TSCROLL.y + 1, ui.msg, col(s, 255, 60, 60));
-    } else if (ui.vis_on) {
-        static float bars[VIZ_BARS], smooth[VIZ_BARS];
-        static Uint32 viz_last;
-        int16_t snap[4096];
-        int n;
-        unsigned seq;
-        int playing = p->state == ST_PLAY;
-        pthread_mutex_lock(&p->viz_mtx);
-        n = p->viz_n;
-        if (n > 4096) n = 4096;
-        if (n < 0) n = 0;
-        seq = p->viz_seq;
-        if (n > 0) memcpy(snap, p->viz_buf, (size_t)n * sizeof snap[0]);
-        pthread_mutex_unlock(&p->viz_mtx);
-        /* paused/stopped (or no fresh chunk): feed silence so the bars
-           decay naturally instead of freezing on the last buffer */
-        if (!playing || seq == viz_last)
-            memset(snap, 0, (size_t)n * sizeof snap[0]);
-        else
-            viz_last = seq;
-        viz_spectrum(snap, n, p->rate, bars);
-        for (int b = 0; b < VIZ_BARS; b++) {
-            smooth[b] = bars[b] > smooth[b] ? bars[b] : smooth[b] * 0.85f;
-            int h = (int)(smooth[b] * 16.0f);
-            if (h > 0) {
-                int x0 = b * tw / VIZ_BARS, x1 = (b + 1) * tw / VIZ_BARS;
-                SDL_Rect r = {tx + x0, R_TSCROLL.y + R_TSCROLL.h - 1 - h, x1 - x0 - 1, h};
-                SDL_FillRect(s, &r, col(s, 0, 200, 60));
+    {   /* text sections: skipped wholesale when their rects are clean */
+        LV_T0;
+        Rect bar = { 0, 0, MAIN_W, 22 };
+        if (rgn_hit(&bar)) {
+            font_puts(s, 10, 6, "LEVARI", col(s, 0, 224, 255));
+            Rect x = close_rect(MAIN_W);
+            draw_x(s, &x, ui.pressed == B_XMAIN);
+        }
+
+        /* row 1: play time in a box, 2x font, scrolling title beside it */
+        if (rgn_hit(&R_TIME)) {
+            char tb[16];
+            fmt_time(tb, sizeof tb, p->state == ST_STOP ? 0 : pos);
+            font_puts_big(s, R_TIME.x + 6, R_TIME.y + 2, tb, col(s, 0, 255, 0));
+        }
+
+        if (rgn_hit(&R_TSCROLL)) {
+            int tx = R_TSCROLL.x + 2, tw = R_TSCROLL.w - 4;
+            ui.marquee = 0;
+            if (ui.msg[0]) {
+                /* transient rescan feedback outranks even the viz bars: the
+                   strip carries the message, plain red, for its 10 s */
+                font_puts16(s, tx, R_TSCROLL.y + 1, ui.msg, col(s, 255, 60, 60));
+            } else if (ui.vis_on) {
+                static float bars[VIZ_BARS], smooth[VIZ_BARS];
+                static Uint32 viz_last;
+                int16_t snap[4096];
+                int n;
+                unsigned seq;
+                int playing = p->state == ST_PLAY;
+                pthread_mutex_lock(&p->viz_mtx);
+                n = p->viz_n;
+                if (n > 4096) n = 4096;
+                if (n < 0) n = 0;
+                seq = p->viz_seq;
+                if (n > 0) memcpy(snap, p->viz_buf, (size_t)n * sizeof snap[0]);
+                pthread_mutex_unlock(&p->viz_mtx);
+                /* A FRESH engine chunk since the last frame? The player
+                   feeds one chunk per decode pass (~21 Hz: CHUNK 2048 at
+                   real-time pace), so above that UI rate a frame sees the
+                   same seq. Re-FFTing it would redraw identical bars;
+                   feeding silence (the old behavior) made them sawtooth.
+                   No fresh chunk -> zero bars through the same 0.85
+                   fall-off: pure decay until the next chunk (paused and
+                   stopped ride this same branch, as before). */
+                if (playing && seq != viz_last) {
+                    viz_last = seq;
+                    viz_spectrum(snap, n, p->rate, bars);
+                } else {
+                    memset(bars, 0, sizeof bars);
+                }
+                /* the 0.85 fall-off is PER 100 ms (the historical frame
+                   rate); at 24/30/60 Hz a bare 0.85 decays 2.4x..6x too
+                   fast. Normalize by real elapsed time: factor =
+                   0.85^(dt/100), exactly 0.85 at the 10 Hz default. */
+                static Uint32 viz_t;
+                Uint32 tnow = SDL_GetTicks();
+                float dt = viz_t ? (float)(tnow - viz_t) : 100.f;
+                viz_t = tnow;
+                if (dt > 500.f) dt = 500.f;   /* post-pause frame = decayed out */
+                float k = powf(0.85f, dt / 100.f);
+                for (int b = 0; b < VIZ_BARS; b++) {
+                    smooth[b] = bars[b] > smooth[b] ? bars[b] : smooth[b] * k;
+                    int h = (int)(smooth[b] * 16.0f);
+                    if (h > 0) {
+                        int x0 = b * tw / VIZ_BARS, x1 = (b + 1) * tw / VIZ_BARS;
+                        SDL_Rect r = {tx + x0, R_TSCROLL.y + R_TSCROLL.h - 1 - h, x1 - x0 - 1, h};
+                        SDL_FillRect(s, &r, col(s, 0, 200, 60));
+                    }
+                }
+            } else if (font_w16(ui.title) <= tw) {
+                font_puts16(s, tx, R_TSCROLL.y + 1, ui.title, col(s, 0, 224, 255));
+            } else {
+                ui.marquee = 1;
+                char padded[600];
+                snprintf(padded, sizeof padded, "%s   ", ui.title);
+                int len = font_w16(padded);
+                /* pause between cycles is a fixed 20 px (10 frames = 1 s at
+                   2 px per 10 Hz tick); a tw-sized pause left the strip
+                   blank ~9 s */
+                int off = ui.scroll_off % (len + 20);
+                /* draw codepoint by codepoint, hard-clipped to the title
+                   strip so glyphs can never bleed into the time box */
+                int x = tx - off;
+                const char *q = padded;
+                while (*q) {
+                    if (x >= tx + tw) break;
+                    unsigned cp;
+                    int n = font_utf8_next(q, &cp);
+                    if (x + font_cp_w16(cp) > tx)
+                        font_putcp16_clip(s, x, R_TSCROLL.y + 1, cp, col(s, 0, 224, 255), tx, tx + tw);
+                    x += font_cp_w16(cp);
+                    q += n;
+                }
+                /* advance only while the marquee is live (playing, or the
+                   10FPS override): paused/stopped repaints (hover, dirty
+                   flags) must not creep the title along a few px per mouse
+                   movement — and only while the strip is actually being
+                   repainted (region passes that skip the strip must not
+                   creep it invisibly) */
+                if (p->state == ST_PLAY || cfg.ui_always10 > 0)
+                    ui.scroll_off += 2;
             }
         }
-    } else if (font_w16(ui.title) <= tw) {
-        font_puts16(s, tx, R_TSCROLL.y + 1, ui.title, col(s, 0, 224, 255));
-    } else {
-        ui.marquee = 1;
-        char padded[600];
-        snprintf(padded, sizeof padded, "%s   ", ui.title);
-        int len = font_w16(padded);
-        /* pause between cycles is a fixed 20 px (10 frames = 1 s at 2 px
-           per 10 Hz tick); a tw-sized pause left the strip blank ~9 s */
-        int off = ui.scroll_off % (len + 20);
-        /* draw codepoint by codepoint, hard-clipped to the title strip so
-           glyphs can never bleed into the time box */
-        int x = tx - off;
-        const char *q = padded;
-        while (*q) {
-            if (x >= tx + tw) break;
-            unsigned cp;
-            int n = font_utf8_next(q, &cp);
-            if (x + font_cp_w16(cp) > tx)
-                font_putcp16_clip(s, x, R_TSCROLL.y + 1, cp, col(s, 0, 224, 255), tx, tx + tw);
-            x += font_cp_w16(cp);
-            q += n;
-        }
-        /* advance only while the marquee is live (playing, or the 10FPS
-           override): paused/stopped repaints (hover, dirty flags) must not
-           creep the title along a few px per mouse movement */
-        if (p->state == ST_PLAY || cfg.ui_always10 > 0)
-            ui.scroll_off += 2;
-    }
 
-    /* row 2: khz / kbps readout; bitrate estimated from file size over the
-       decoded length (whole file, so CUE virtual tracks stay correct) */
-    if (p->state != ST_STOP && p->rate) {
+        /* row 2: khz / kbps readout; bitrate estimated from file size over
+           the decoded length (whole file, so CUE virtual tracks stay
+           correct) */
+        if (p->state != ST_STOP && p->rate && rgn_hit(&R_INFO)) {
         char rb[48];
-        int kbps = 0;
+        long long kbps = 0;
         long long tf = p->total_frames;
         if (tf > 0) {
             char path[LV_MAX_PATH];
@@ -786,20 +956,32 @@ static void draw_main(void) {
                 lv_strlcpy(sz_path, path, sizeof sz_path);
             }
             if (sz_size > 0)
-                kbps = (int)((double)sz_size * 8 * p->rate /
-                             (1000 * (double)tf) + 0.5);
+                kbps = (long long)((double)sz_size * 8 * p->rate /
+                                   (1000 * (double)tf) + 0.5);
         }
-        if (kbps > 0)
-            snprintf(rb, sizeof rb, "%dkhz %dkbps %s",
-                     (int)(p->rate / 1000), kbps, p->ch == 2 ? "st" : "mo");
-        else
+        if (kbps > 0) {
+            /* long long through the cast (a sparse or crafted file can
+               push size*rate/frames past INT_MAX, where the old (int)
+               cast was implementation-defined), and the readout
+               saturates at 999kbps+ */
+            char kb[16];
+            if (kbps >= 1000) lv_strlcpy(kb, "999kbps+", sizeof kb);
+            else snprintf(kb, sizeof kb, "%lldkbps", kbps);
+            snprintf(rb, sizeof rb, "%dkhz %s %s",
+                     (int)(p->rate / 1000), kb, p->ch == 2 ? "st" : "mo");
+        } else
             snprintf(rb, sizeof rb, "%dkhz %s",
                      (int)(p->rate / 1000), p->ch == 2 ? "st" : "mo");
         font_puts(s, R_INFO.x + 2, R_INFO.y + 1, rb, col(s, 180, 180, 180));
+        }
+        LV_ACC(txt_us);
     }
 
+    {   /* widgets: gated per rect like the text */
+        LV_T0;
     for (size_t i = 0; i < sizeof MAIN_BTNS / sizeof MAIN_BTNS[0]; i++) {
         const Btn *b = &MAIN_BTNS[i];
+        if (!rgn_hit(b->r)) continue;
         int active = 0;
         if (b->id == B_SHUF) active = p->shuffle;
         if (b->id == B_REPEAT) active = p->repeat == 1;
@@ -829,28 +1011,39 @@ static void draw_main(void) {
     }
 
     /* row 3: labeled volume + balance sliders share the row */
-    font_puts(s, 8, 65, "VOL", col(s, 150, 150, 150));
-    font_puts(s, 158, 65, "BIAS", col(s, 150, 150, 150));
-    int vx = R_VOL.x + 2 + p->vol * (R_VOL.w - 16) / 128;
-    skin_slider(s, &R_VOL, vx, 12);
-    int px = R_PAN.x + 2 + (p->pan + 32) * (R_PAN.w - 16) / 64;
-    skin_slider(s, &R_PAN, px, 12);
+    {
+        Rect vrow = { 8, 62, MAIN_W - 16, 13 };
+        if (rgn_hit(&vrow)) {
+            font_puts(s, 8, 65, "VOL", col(s, 150, 150, 150));
+            font_puts(s, 158, 65, "BIAS", col(s, 150, 150, 150));
+            int vx = R_VOL.x + 2 + p->vol * (R_VOL.w - 16) / 128;
+            skin_slider(s, &R_VOL, vx, 12);
+            int px = R_PAN.x + 2 + (p->pan + 32) * (R_PAN.w - 16) / 64;
+            skin_slider(s, &R_PAN, px, 12);
+        }
+    }
     /* row 5: timeline slider, its own row below the display; its knob is
        double the width of the volume/bias knobs */
-    double frac = endf > base ? (double)(p->pos_frames - base) / (double)(endf - base) : 0;
-    int kx = R_SEEK.x + (int)(frac * (R_SEEK.w - SEEK_KNOB_W));
-    skin_slider(s, &R_SEEK, kx, SEEK_KNOB_W);
+    if (rgn_hit(&R_SEEK)) {
+        double frac = endf > base ? (double)(p->pos_frames - base) / (double)(endf - base) : 0;
+        int kx = R_SEEK.x + (int)(frac * (R_SEEK.w - SEEK_KNOB_W));
+        skin_slider(s, &R_SEEK, kx, SEEK_KNOB_W);
+    }
 
     if (ui.menu) {
         Rect mi = { 2, 22, 110, 20 };
-        SDL_Rect mb = { mi.x, mi.y, mi.w, mi.h };
-        SDL_FillRect(s, &mb, col(s, 40, 40, 40));
-        SDL_Rect t = { mi.x, mi.y, mi.w, 1 }, b = { mi.x, mi.y + mi.h - 1, mi.w, 1 };
-        SDL_Rect l = { mi.x, mi.y, 1, mi.h }, r = { mi.x + mi.w - 1, mi.y, 1, mi.h };
-        Uint32 bc = col(s, 140, 140, 140);
-        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
-        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
-        font_puts(s, mi.x + 8, mi.y + 6, "OPTIONS...", col(s, 220, 220, 220));
+        if (rgn_hit(&mi)) {
+            SDL_Rect mb = { mi.x, mi.y, mi.w, mi.h };
+            SDL_FillRect(s, &mb, col(s, 40, 40, 40));
+            SDL_Rect t = { mi.x, mi.y, mi.w, 1 }, b = { mi.x, mi.y + mi.h - 1, mi.w, 1 };
+            SDL_Rect l = { mi.x, mi.y, 1, mi.h }, r = { mi.x + mi.w - 1, mi.y, 1, mi.h };
+            Uint32 bc = col(s, 140, 140, 140);
+            SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+            SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+            font_puts(s, mi.x + 8, mi.y + 6, "OPTIONS...", col(s, 220, 220, 220));
+        }
+    }
+        LV_ACC(wid_us);
     }
 }
 
@@ -938,11 +1131,10 @@ static void draw_pl(void) {
         SDL_FillRect(s, &r, col(s, 0, 255, 0));
     }
 
-    /* totals, pinned to the bottom edge */
-    int total = 0;
-    for (int i = 0; i < pl->count; i++) total += pl->items[i].duration;
+    /* totals, pinned to the bottom edge (fmt_pl_total saturates at
+       9999:59:59+ so a crafted playlist cannot wrap the sum) */
     char tb[32];
-    fmt_time(tb, sizeof tb, total);
+    fmt_pl_total(tb, sizeof tb, pl);
     font_puts(s, 14, ui.pl_h - 10, tb, col(s, 0, 255, 0));
     snprintf(tb, sizeof tb, "%d of %d", pl->count, pl->count);
     font_puts(s, 200, ui.pl_h - 10, tb, col(s, 170, 170, 170));
@@ -2022,6 +2214,19 @@ static Rect opt_large_rect(void)     { Rect r = { 186, 56, 48, 14 }; return r; }
 /* 10FPS toggle (ADV page): same column, below the LARGE block */
 static Rect opt_fps_rect(void)       { Rect r = { 186, 114, 48, 14 }; return r; }
 static Rect opt_enc_rect(void)       { Rect r = { 186, 150, 72, 14 }; return r; }
+/* VIZ Hz cycle button (ADV page): visualizer band refresh rate */
+static Rect opt_vhz_rect(void)       { Rect r = { 186, 214, 48, 14 }; return r; }
+/* ui.vis_hz -> the viz tick period; only the four table values ever
+   reach here (config clamps, the cycle button walks the same table),
+   and the switch default makes a torn value 10 Hz, never a busy loop */
+static int vis_frame_ms(int hz) {
+    switch (hz) {
+    case 60: return 16;
+    case 30: return 33;
+    case 24: return 41;
+    default: return 100;
+    }
+}
 
 /* ffmpeg detection status for the ADV page (streaming substrate): the
    probe dlopens-and-closes per call, so it runs ONCE at opt_open into
@@ -2106,6 +2311,8 @@ static void opt_open(void) {
     ui.opt_fade = cfg.fade_stop > 0;
     ui.opt_large = cfg.allow_large > 0;
     ui.opt_f10 = cfg.ui_always10 > 0;
+    ui.opt_vhz = (cfg.vis_hz == 24 || cfg.vis_hz == 30 || cfg.vis_hz == 60)
+                 ? cfg.vis_hz : 10;
     ui.opt_enc = cfg.tag_legacy_enc + 1;   /* LV_ENC_AUTO(-1) -> cycle 0 */
     if (ui.opt_enc < 0 || ui.opt_enc > 4) ui.opt_enc = 0;
     ui.opt_ff = dec_ffmpeg_probe_info(ui.opt_ff_ver, sizeof ui.opt_ff_ver,
@@ -2166,6 +2373,7 @@ static void opt_save(void) {
     ui.pl->fade_stop = ui.opt_fade; /* apply without waiting for a restart */
     cfg.allow_large = ui.opt_large; /* decode.c reads cfg live: no restart */
     cfg.ui_always10 = ui.opt_f10;   /* scheduler reads cfg live: no restart */
+    cfg.vis_hz = ui.opt_vhz;        /* ditto: the vis tick period is live */
     cfg.tag_legacy_enc = ui.opt_enc - 1;  /* tag.c reads it live: decoding applies now,
                                              already-indexed rows keep old readings until re-scan */
     cfg_unlock();
@@ -2393,6 +2601,17 @@ static void draw_opt(void) {
         const char *ffl = opt_ff_label(ui.opt_ff, ui.opt_ff_ver, &ffred);
         font_puts(s, 10, 186, ffl,
                   ffred ? col(s, 255, 60, 60) : col(s, 0, 255, 0));
+        /* 4-state cycle button (NOT a checkbox): the visualizer band
+           refresh rate; the label shows the current Hz. 10 is the floor
+           default, so only a non-default value colors as an override. */
+        font_puts(s, 10, 210, "VIZ: spectrum bars refresh", col(s, 220, 220, 220));
+        font_puts(s, 10, 224, "cycle: 10 / 24 / 30 / 60 Hz", col(s, 120, 120, 120));
+        Rect r4 = opt_vhz_rect();
+        skin_button(s, &r4, ui.pressed == OPTB_VHZ, 0);
+        char vhzl[8];
+        snprintf(vhzl, sizeof vhzl, "%dHZ", ui.opt_vhz);
+        font_puts(s, r4.x + (r4.w - font_w(vhzl)) / 2, r4.y + 3, vhzl,
+                  ui.opt_vhz != 10 ? col(s, 0, 224, 255) : col(s, 220, 220, 220));
     } else {
         /* ABOUT page: static credits, no controls — centered title/icon/
            creator block over a left-aligned thanks list */
@@ -2472,6 +2691,19 @@ static void draw_opt(void) {
         font_puts(s, tb.x + 6, tb.y + 17, "AUTO = decide from block evidence", col(s, 220, 220, 220));
         font_puts(s, tb.x + 6, tb.y + 29, "index needs CLEAR + SCAN to re-read", col(s, 220, 220, 220));
     }
+    if (ui.opt_hover == OPTB_VHZ) {
+        Rect rv = opt_vhz_rect();
+        SDL_Rect tb = { rv.x, rv.y + rv.h + 4, 214, 30 };
+        if (tb.x + tb.w > OPT_W) tb.x = OPT_W - tb.w;
+        SDL_FillRect(s, &tb, col(s, 40, 40, 40));
+        SDL_Rect t = { tb.x, tb.y, tb.w, 1 }, b = { tb.x, tb.y + tb.h - 1, tb.w, 1 };
+        SDL_Rect l = { tb.x, tb.y, 1, tb.h }, r = { tb.x + tb.w - 1, tb.y, 1, tb.h };
+        Uint32 bc = col(s, 140, 140, 140);
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        font_puts(s, tb.x + 6, tb.y + 5, "visualizer refresh rate (Hz)", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 17, "higher = smoother, more CPU", col(s, 220, 220, 220));
+    }
 }
 
 static void handle_opt_mouse(SDL_Event *e) {
@@ -2494,6 +2726,8 @@ static void handle_opt_mouse(SDL_Event *e) {
                 if (in_rect(&tf, x, y)) { ui.pressed = OPTB_TFPS; return; }
                 Rect te = opt_enc_rect();
                 if (in_rect(&te, x, y)) { ui.pressed = OPTB_TENC; return; }
+                Rect tv = opt_vhz_rect();
+                if (in_rect(&tv, x, y)) { ui.pressed = OPTB_VHZ; return; }
             }
             if (y < 22) { ui.drag = 11; drag_begin(ui.wopt); ui.opt_focus = -1; }
             return;
@@ -2526,6 +2760,7 @@ static void handle_opt_mouse(SDL_Event *e) {
             Rect sv = opt_save_rect(), cl = opt_close_rect();
             Rect tb = opt_tab_basic_rect(), ta = opt_tab_adv_rect(), tg0 = opt_large_rect();
             Rect tf0 = opt_fps_rect(), te0 = opt_enc_rect(), tu = opt_tab_about_rect();
+            Rect tv0 = opt_vhz_rect();
             if (ui.pressed == OPTB_X && in_rect(&xc, x, y)) opt_close();
             else if (ui.pressed == OPTB_TABB && in_rect(&tb, x, y)) { ui.opt_tab = 0; ui.opt_focus = -1; }
             else if (ui.pressed == OPTB_TABA && in_rect(&ta, x, y)) { ui.opt_tab = 1; ui.opt_focus = -1; }
@@ -2535,6 +2770,16 @@ static void handle_opt_mouse(SDL_Event *e) {
             else if (ui.pressed == OPTB_TENC && in_rect(&te0, x, y)) {
                 ui.opt_enc = (ui.opt_enc + 1) % 5;
                 tag_set_legacy_default(ui.opt_enc - 1); /* live effect; SAVE persists */
+            }
+            else if (ui.pressed == OPTB_VHZ && in_rect(&tv0, x, y)) {
+                /* 10 -> 24 -> 30 -> 60 -> 10 (the config table; a value
+                   outside it — none is reachable — restarts at the default) */
+                static const int VHZT[4] = { 10, 24, 30, 60 };
+                int i = 0;
+                while (i < 4 && VHZT[i] != ui.opt_vhz) i++;
+                ui.opt_vhz = VHZT[i == 4 ? 0 : (i + 1) & 3];
+                /* the scheduler reads cfg at tick time; effect lands on
+                   SAVE with the rest (no hidden half-applied state) */
             }
             else if (ui.pressed == OPTB_SAVE && in_rect(&sv, x, y)) opt_save();
             else if (ui.pressed == OPTB_CLOSE && in_rect(&cl, x, y)) opt_close();
@@ -2570,8 +2815,9 @@ static void handle_opt_mouse(SDL_Event *e) {
         drag_move_snap(ui.wopt);
     } else if (e->type == SDL_MOUSEMOTION) {
         if (ui.opt_tab == 1) {
-            Rect te = opt_enc_rect();
-            ui.opt_hover = in_rect(&te, x, y) ? OPTB_TENC : -1;
+            Rect te = opt_enc_rect(), tv = opt_vhz_rect();
+            ui.opt_hover = in_rect(&te, x, y) ? OPTB_TENC
+                           : in_rect(&tv, x, y) ? OPTB_VHZ : -1;
         } else if (!ui.opt_tab) {
             Rect f = opt_field_rect(OPTF_LIBDIRS);
             ui.opt_hover = (x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
@@ -2656,7 +2902,7 @@ static void action(int id) {
         if (ui.eq_visible) SDL_ShowWindow(ui.weq);
         else SDL_HideWindow(ui.weq);
         break;
-    case B_VIS: ui.vis_on = !ui.vis_on; break;
+    case B_VIS: ui.vis_on = !ui.vis_on; p->viz_feed = ui.vis_on; break;
     case B_LIST:
         ui.pl_visible = !ui.pl_visible;
         if (ui.pl_visible) {
@@ -3552,15 +3798,8 @@ static Uint32 ev_win(const SDL_Event *e) {
     position slider keep pace instead of jumping on refocus), and a one-shot
     repaint after EXPOSED/SHOWN, because on an uncomposited X11 desktop the
     WM hands us a garbage window when someone uncovers it. */
-#define D_MAIN 1u
-#define D_PL   2u
-#define D_EQ   4u
-#define D_FILE 8u
-#define D_OPT  16u
-#define D_SRCH 32u
-#define D_URL  64u
-#define D_INFO 128u
-#define D_ALL  (D_MAIN | D_PL | D_EQ | D_FILE | D_OPT | D_SRCH | D_URL | D_INFO)
+/* the window bits D_MAIN..D_ALL live at the top of draw_main, beside the
+   main-window sub-region producer bits that split D_MAIN's repaints */
 static unsigned ui_dirty;
 
 /* ---- song-info window (edit menu PM_INFO) ---------------------------------
@@ -3748,6 +3987,20 @@ static void win_present(SDL_Window *w) {
         SDL_UpdateWindowSurface(w);
 }
 
+/* item 4 (cpu_floor_hunting): the main window's damage is exactly the
+   regions the last draw_main pass painted — present just those so X11
+   receives rect damage instead of whole-window damage (an uncomposited
+   Xvnc re-encodes every damaged pixel: the second, OUTSIDE-levari draw
+   cost). rgn_rects/rgn_n are draw_main's file-scope statics, so this
+   must be called immediately after draw_main, as the scheduler does.
+   Other windows keep the whole-window call: their draw paths have no
+   region scheme (yet). */
+static void win_present_main(SDL_Window *w) {
+    if (!w || (SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED)) return;
+    if (rgn_n) SDL_UpdateWindowSurfaceRects(w, rgn_rects, rgn_n);
+    else SDL_UpdateWindowSurface(w);
+}
+
 int ui_run(Player *p, int show_pl) {
     memset(&ui, 0, sizeof ui);
     ui.pl = p;
@@ -3759,6 +4012,7 @@ int ui_run(Player *p, int show_pl) {
     ui.pl_docked = 1;
     ui.eq_visible = ui_show_eq;
     ui.vis_on = ui_show_vis;
+    p->viz_feed = ui_show_vis;  /* engine feeds viz_buf only while the band shows */
     search_init(p);
 
     SDL_SetHint(SDL_HINT_APP_NAME, "levari");
@@ -3769,6 +4023,25 @@ int ui_run(Player *p, int show_pl) {
         fprintf(stderr, "levari: SDL_Init: %s\n", SDL_GetError());
         return -1;
     }
+    /* levari draws exclusively on software window surfaces, so opt out of
+       SDL's texture-framebuffer path: on X11 without GL it slots in a
+       SOFTWARE renderer (verified on the P4: SDL_video.c
+       SDL_UpdateWindowTexture) and upgrades EVERY present — rect or not —
+       to a full-surface texture upload + full RenderCopy + full-window
+       PutImage (LD_PRELOAD spy on XShmPutImage: one 315x150 request per
+       tick regardless of damage, before and after item 4 alike). Direct
+       driver framebuffer ops are the only ones that honor our rects.
+       The opt-out is X11-only: it was measured and justified on X11
+       alone, and on Cocoa it is actively harmful (verified 0.3.6 on
+       mac112: with the hint SDL_GetWindowSurface returns NULL on the
+       NSView-backed window, ui.smain is NULL and the first draw
+       NULL-derefs in skin_draw_main_bg; SDL_FRAMEBUFFER_ACCELERATION=1
+       as env proves the hint is the cause and the 0.3.5 binary passes
+       the same run unchanged). Windows is excluded too — never tested
+       there, and 0.3.5 shipped fine without the hint. */
+#if !defined(_WIN32) && !defined(__APPLE__)
+    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+#endif
     SDL_Rect disp;
     if (SDL_GetDisplayBounds(0, &disp) != 0) {
         disp.x = disp.y = 0;
@@ -3840,9 +4113,11 @@ int ui_run(Player *p, int show_pl) {
     ui_dirty = D_ALL;
     int wake = 1;   /* one-shot unfocused repaint after EXPOSED/SHOWN; 1 = paint once at startup */
     struct pollsnap { int state, cur, count; long long pos_s;
+                      int vol, pan, shuffle, repeat, ab_a, ab_b, eq_on;
                       int pl_vis, eq_vis, file_vis, opt_vis, url_vis, search_open; };
     struct pollsnap snap_prev =
-        { -99, -99, -99, -9999, -1, -1, -1, -1, -1, -1 };
+        { -99, -99, -99, -9999, -99, -99, -99, -99, -99, -99, -99,
+          -1, -1, -1, -1, -1, -1 };
     int running = 1;
     while (running) {
         if (ui_deadline_ms && SDL_GetTicks() >= ui_deadline_ms) break;
@@ -4062,12 +4337,25 @@ int ui_run(Player *p, int show_pl) {
             struct pollsnap sn = {
                 p->state, p->cur, p->pl->count,
                 p->rate ? p->pos_frames / p->rate : 0,
+                p->vol, p->pan, p->shuffle, p->repeat, p->ab_a, p->ab_b,
+                eq_enabled(&p->eq),
                 ui.pl_visible, ui.eq_visible, ui.file_visible,
                 ui.opt_visible, uvo, so };
             if (sn.state != snap_prev.state || sn.cur != snap_prev.cur ||
                 sn.count != snap_prev.count)
                 ui_dirty |= D_MAIN | D_PL;
-            if (sn.pos_s != snap_prev.pos_s) ui_dirty |= D_MAIN;
+            if (sn.pos_s != snap_prev.pos_s) ui_dirty |= D_M_TIME;
+            /* theme-level producers: button tints and the vol/pan knobs sit
+               OUTSIDE the poll regions, so a change of these must force the
+               full pass the old 1 Hz D_MAIN poll healed implicitly (a
+               shuffle/repeat/AB/EQ toggle or a daemon vol step reaching
+               the UI only through this poll is exactly that class) */
+            if (sn.vol != snap_prev.vol || sn.pan != snap_prev.pan ||
+                sn.shuffle != snap_prev.shuffle ||
+                sn.repeat != snap_prev.repeat ||
+                sn.ab_a != snap_prev.ab_a || sn.ab_b != snap_prev.ab_b ||
+                sn.eq_on != snap_prev.eq_on)
+                ui_dirty |= D_MAIN;
             if (sn.pl_vis != snap_prev.pl_vis) ui_dirty |= D_PL;
             if (sn.eq_vis != snap_prev.eq_vis) ui_dirty |= D_EQ;
             if (sn.file_vis != snap_prev.file_vis) ui_dirty |= D_FILE;
@@ -4115,14 +4403,43 @@ int ui_run(Player *p, int show_pl) {
 
             int vis_live = ui.vis_on && playing;
             int f10_live = cfg.ui_always10 > 0 && ui.marquee;
-            int anim = (ui.marquee && (playing || f10_live)) || vis_live ||
+            /* the plain marquee animates at 10 Hz only while we hold focus
+               (the documented unfocused contract above): unfocused it keeps
+               crawling, but one step per SECOND — the old 1 Hz poll repaint
+               rate, riding the same second-change that refreshes the time
+               readout (scroll_off advances only inside drawn strip passes).
+               The always_10FPS toggle and a live visualizer override focus
+               (the vis band repaints the strip anyway, so the marquee keeps
+               10 Hz pace with it). */
+            int strip_live = ui.marquee && (playing || f10_live) &&
+                             (ui.app_focused || f10_live || vis_live);
+            int strip_slow = ui.marquee && playing && !ui.app_focused &&
+                             !f10_live && !vis_live;
+            int anim = strip_live || vis_live ||
                        ui.drag || ui.opt_scanning || ui.msg[0];
+            /* anim producers mark ONLY the region they move (item 1): the
+               marquee/viz creep never forces a full-window repaint again.
+               Drag (press chrome anywhere) and the scan spinner are
+               theme-level — those mark the full bit D_M_BG. */
+            if (anim) {
+                if (vis_live) ui_dirty |= D_M_VIZ;
+                else if (strip_live) ui_dirty |= D_M_TITLE;
+                if (ui.msg[0] && ui.app_focused) ui_dirty |= D_M_TITLE;
+                if (ui.drag || ui.opt_scanning) ui_dirty |= D_M_BG;
+            }
+            /* the 1 Hz unfocused crawl: D_M_TIME is set exactly on the
+               poll's second-change (pos_s flip), so this marks the strip
+               once per second and nothing schedules the 10 Hz tick here */
+            if (strip_slow && (ui_dirty & D_M_TIME)) ui_dirty |= D_M_TITLE;
+            unsigned mregs = main_draw_regions(ui_dirty);
 
             if (ui.app_focused) {
-                if ((ui_dirty & D_MAIN) || anim) {
+                if (mregs) {
                     refresh_title();
-                    draw_main();
-                    win_present(ui.wmain);
+                    draw_main(mregs);
+                    LV_T0;
+                    win_present_main(ui.wmain);
+                    LV_ACC(blit_us);
                 }
                 if ((ui_dirty & D_PL) && ui.pl_visible) { draw_pl(); win_present(ui.wpl); }
                 if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
@@ -4135,10 +4452,12 @@ int ui_run(Player *p, int show_pl) {
                 if (((ui_dirty & D_SRCH) || srch_focused) && so && search_window()) { search_draw(); win_present(search_window()); }
                 ui_dirty = 0;
             } else if (vis_live || f10_live || playing || (wake && ui_dirty)) {
-                if ((ui_dirty & D_MAIN) || vis_live || f10_live) {
+                if (mregs) {
                     refresh_title();
-                    draw_main();
-                    win_present(ui.wmain);
+                    draw_main(mregs);
+                    LV_T0;
+                    win_present_main(ui.wmain);
+                    LV_ACC(blit_us);
                 }
                 if ((ui_dirty & D_PL) && ui.pl_visible) { draw_pl(); win_present(ui.wpl); }
                 if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { draw_eq(); win_present(ui.weq); }
@@ -4160,7 +4479,7 @@ int ui_run(Player *p, int show_pl) {
                unfocused but playing polls at 1 Hz so the time readout and
                position slider keep pace instead of jumping on refocus;
                unfocused idle sleeps on events. */
-            if (anim) next = now + 100;
+            if (anim) next = now + (vis_live ? vis_frame_ms(cfg.vis_hz) : 100);
             else if (srch_focused || file_focused || url_focused) next = now + (unsigned)(500 - (int)(now % 500));
             else if (ui.app_focused) next = now + 1000;
             else if (playing) next = now + 1000;
@@ -4168,6 +4487,13 @@ int ui_run(Player *p, int show_pl) {
         }
     }
     /* save window dumps at exit so they reflect the final state */
+#ifdef LV_PROFILE
+    fprintf(stderr, "lvprof: full=%u title=%u viz=%u time=%u dirty_px=%llu "
+            "us:bg=%llu text=%llu widgets=%llu blit=%llu\n",
+            lvprof.full, lvprof.title, lvprof.viz, lvprof.ticks_time,
+            lvprof.px, lvprof.bg_us, lvprof.txt_us, lvprof.wid_us,
+            lvprof.blit_us);
+#endif
     if (ui_dump_path) {
         char f[512];
         snprintf(f, sizeof f, "%s-main.bmp", ui_dump_path);

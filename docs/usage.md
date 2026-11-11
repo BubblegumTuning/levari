@@ -104,6 +104,11 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
                                   whenever a title is long enough to marquee,
                                   so it scrolls while paused/stopped/unfocused
                                   (options window ADV page, `10FPS` toggle)
+    ui.vis_hz = 10                visualizer band refresh rate: 10 | 24 | 30
+                                  | 60; anything else falls back to 10.
+                                  Higher is smoother, costs proportionally
+                                  more CPU (options window ADV page, `VIZ`
+                                  cycle button, cyan label when non-default)
     tag.legacy_encoding = auto    codepage for tag fields with no declared
                                   encoding: auto | latin1 | cp1251 | utf8 |
                                   shiftjis.

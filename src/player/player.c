@@ -103,7 +103,13 @@ static void load_track_locked(Player *p, int idx) {
         p->track_end = (long long)(t->end_sec * p->rate);
     if (!t->duration) {
         long long len = (p->track_end ? p->track_end : p->total_frames) - p->track_start;
-        if (len > 0 && p->rate > 0) t->duration = (int)(len / p->rate);
+        if (len > 0 && p->rate > 0) {
+            long long s = len / p->rate;   /* gate before the cast: the
+                                              frame total is decoder data,
+                                              and an absurd one must not
+                                              smuggle a wrapped int here */
+            if (s > 0 && s <= LV_DUR_MAX) t->duration = (int)s;
+        }
     }
 }
 
@@ -256,14 +262,20 @@ static void *player_thread(void *arg) {
             int got = dec_read(p->dec, buf, CHUNK);
             if (got > 0) {
                 eq_process(&p->eq, buf, got, p->ch);
-                pthread_mutex_lock(&p->viz_mtx);
-                for (int i = 0; i < got; i++)
-                    p->viz_buf[i] = p->ch == 2
-                        ? (int16_t)(((int)buf[i * 2] + (int)buf[i * 2 + 1]) / 2)
-                        : buf[i];
-                p->viz_n = got;
-                p->viz_seq++;
-                pthread_mutex_unlock(&p->viz_mtx);
+                /* the mono downmix + copy exists ONLY for the viz band:
+                   with the band off (viz_feed=0, set by the UI at toggle
+                   and startup) none of it runs — the FFT was already
+                   UI-gated, this closes the engine-side tail */
+                if (p->viz_feed) {
+                    pthread_mutex_lock(&p->viz_mtx);
+                    for (int i = 0; i < got; i++)
+                        p->viz_buf[i] = p->ch == 2
+                            ? (int16_t)(((int)buf[i * 2] + (int)buf[i * 2 + 1]) / 2)
+                            : buf[i];
+                    p->viz_n = got;
+                    p->viz_seq++;
+                    pthread_mutex_unlock(&p->viz_mtx);
+                }
                 int16_t *toput = buf;
                 int tout = got;
                 if (p->speed != 100) {

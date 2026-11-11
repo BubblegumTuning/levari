@@ -5,11 +5,14 @@
    release, ROCK via the shared EQ_PRE table sets a curve, and RESET
    zeroes all ten bands while leaving the preamp untouched.
    Technique + link recipe as in test/pldock (#include ui.c; every object
-   EXCEPT main.c.o, ui.c.o AND dispatch.c.o):
+   EXCEPT main.c.o, ui.c.o, decode.c.o AND stb_vorbis.c.o — dispatch.c.o
+   MUST stay: it defines dec_open/dec_ffmpeg_probe_info that ui.c refs,
+   while decode.c.o + stb_vorbis.c.o are the pre-split stale leftovers
+   that collide with the dec_*.dir tier objects):
      SDL=$(pkg-config --cflags --libs sdl2)
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/teq \
        test/eq/testeq.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
        $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
 */

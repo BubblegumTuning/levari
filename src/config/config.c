@@ -8,6 +8,7 @@
 #include <unistd.h>
 #endif
 #include <stdio.h>
+#include <stdlib.h>   /* atoi: ui.vis_hz */
 #include <pthread.h>
 
 Config cfg;
@@ -77,6 +78,11 @@ static void set_key(const char *k, char *v) {
         int o = onoff(v); if (o >= 0) cfg.allow_large = o;
     } else if (!strcmp(k, "ui.always_10fps")) {
         int o = onoff(v); if (o >= 0) cfg.ui_always10 = o;
+    } else if (!strcmp(k, "ui.vis_hz")) {
+        int hz = atoi(v);
+        if (hz == 24 || hz == 30 || hz == 60) cfg.vis_hz = hz;
+        /* anything else (incl. garbage) stays the memset default... which
+           is 0, NOT 10: the default is set explicitly in cfg_load below */
     } else if (!strcmp(k, "tag.legacy_encoding")) {
         if      (!lv_strcasecmp(v, "auto"))   cfg.tag_legacy_enc = LV_ENC_AUTO;
         else if (!lv_strcasecmp(v, "latin1")) cfg.tag_legacy_enc = LV_ENC_LATIN1;
@@ -91,6 +97,7 @@ void cfg_load(void) {
     cfg.ui_pl = cfg.ui_eq = cfg.ui_vis = cfg.ui_search = -1;
     cfg.shuffle_remember = cfg.shuffle = -1;
     cfg.fade_stop = 1; /* fade-out on stop is on unless configured off */
+    cfg.vis_hz = 10;   /* ui.vis_hz: default 10; only 24/30/60 override */
     cfg.tag_legacy_enc = LV_ENC_AUTO;
     char path[LV_MAX_PATH];
     cfg_path(path, sizeof path);
@@ -154,6 +161,7 @@ static int cfg_save_locked(void) {
     fprintf(f, "player.fade_stop = %s\n", onoff_s(cfg.fade_stop));
     fprintf(f, "decode.allow_large = %s\n", onoff_s(cfg.allow_large));
     fprintf(f, "ui.always_10fps = %s\n", onoff_s(cfg.ui_always10));
+    fprintf(f, "ui.vis_hz = %d\n", cfg.vis_hz);
     fprintf(f, "tag.legacy_encoding = %s\n", legacy_enc_s(cfg.tag_legacy_enc));
     fclose(f);
     /* mingw's rename refuses to replace an existing file: retry once

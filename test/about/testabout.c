@@ -4,11 +4,14 @@
    field click cannot take focus there. draw_opt() renders every page
    (smoke) and the ABOUT page is saved as a BMP when LV_ABOUT_BMP names
    a path (layout eyeball). Technique (see skill): #include ui.c, link
-   every object EXCEPT main.c.o, ui.c.o and dispatch.c.o:
+   every object EXCEPT main.c.o, ui.c.o, decode.c.o and stb_vorbis.c.o
+   (dispatch.c.o MUST stay: it defines dec_open/dec_ffmpeg_probe_info
+   that ui.c refs; the two excluded TUs are pre-split leftovers that
+   collide with the dec_*.dir tier objects):
      SDL=$(pkg-config --cflags --libs sdl2)
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/ta \
        test/about/testabout.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
        $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
        -lz -lm -lpthread -ldl -lstdc++

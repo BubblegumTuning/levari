@@ -53,6 +53,25 @@ static void fill(SDL_Surface *s, int x, int y, int w, int h, Uint32 c) {
 static void hline(SDL_Surface *s, int x, int y, int w, Uint32 c) { fill(s, x, y, w, 1, c); }
 static void vline(SDL_Surface *s, int x, int y, int h, Uint32 c) { fill(s, x, y, 1, h, c); }
 
+/* one already-MAPRGB'd pixel, written at the surface's native format.
+   The glyph loops below used to write Uint32 unconditionally: true for
+   RGBA surfaces, but with SDL_HINT_FRAMEBUFFER_ACCELERATION=0 a software
+   window surface on a 16-bit display IS the native RGB565 framebuffer —
+   4-byte writes then clobber the neighbour and land at the wrong stride
+   (measured on the depth-16 Xvnc pentium4: every glyph edge smeared,
+   screenshots pixel-exact everywhere ELSE). Same contract for 24/8-bpp
+   surfaces, free for the common 32. */
+static void putpx(SDL_Surface *s, int px, int py, Uint32 c) {
+    Uint8 *d = (Uint8 *)s->pixels + (size_t)py * s->pitch
+               + (size_t)px * s->format->BytesPerPixel;
+    switch (s->format->BytesPerPixel) {
+    case 4: *(Uint32 *)d = c; break;
+    case 3: d[0] = (Uint8)c; d[1] = (Uint8)(c >> 8); d[2] = (Uint8)(c >> 16); break;
+    case 2: *(Uint16 *)d = (Uint16)c; break;
+    default: *d = (Uint8)c; break;
+    }
+}
+
 static void bevel(SDL_Surface *s, const Rect *r, Uint32 hi, Uint32 lo) {
     hline(s, r->x, r->y, r->w, hi);
     vline(s, r->x, r->y, r->h, hi);
@@ -243,16 +262,13 @@ static const unsigned char FONT[95][5] = {
 void font_putc(SDL_Surface *s, int x, int y, int ch, Uint32 color) {
     if (ch < 32 || ch > 126) ch = '?';
     const unsigned char *g = FONT[ch - 32];
-    Uint8 *base = (Uint8 *)s->pixels;
-    int bpp = s->format->BytesPerPixel;
     for (int col = 0; col < 5; col++) {
         unsigned char bits = g[col];
         for (int row = 0; row < 7; row++) {
             if (!(bits & (1 << row))) continue;
             int px = x + col, py = y + row;
             if (px < 0 || py < 0 || px >= s->w || py >= s->h) continue;
-            Uint32 *p = (Uint32 *)(base + (size_t)py * s->pitch + (size_t)px * bpp);
-            *p = color;
+            putpx(s, px, py, color);
         }
     }
 }
@@ -297,8 +313,6 @@ void font_putcp16_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, 
     int gw = cp < 0x80 || half ? 8 : 16;
     int goff = cp < 0x80 ? 0 : (half ? 4 : 0); /* 8-wide glyphs stored centered */
     if (!g) { font_putc(s, x, y + 9, '?', color); return; }
-    Uint8 *base = (Uint8 *)s->pixels;
-    int bpp = s->format->BytesPerPixel;
     for (int r = 0; r < 16; r++) {
         uint16_t bits = g[r];
         if (!bits) continue;
@@ -308,8 +322,7 @@ void font_putcp16_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, 
             if (!(bits & (0x8000 >> (goff + c)))) continue;
             int px = x + c;
             if (px < cx0 || px >= cx1 || px >= s->w) continue;
-            Uint32 *p = (Uint32 *)(base + (size_t)py * s->pitch + (size_t)px * bpp);
-            *p = color;
+            putpx(s, px, py, color);
         }
     }
 }

@@ -24,6 +24,9 @@ typedef struct {
                               repainting the main window at 10 fps whenever
                               a title is long enough to marquee, so it keeps
                               scrolling while paused/stopped/unfocused */
+    int  vis_hz;           /* ui.vis_hz: visualizer band refresh — one of
+                              10 (default) / 24 / 30 / 60; anything else in
+                              the config file falls back to 10 */
     int  tag_legacy_enc;   /* tag.legacy_encoding: LV_ENC_* from tag.h —
                               -1 auto (default, per-block evidence),
                               0 latin-1, 1 cp1251, 2 utf-8 */

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.5 LANGUAGES C)
+project(levari VERSION 0.3.6 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -206,6 +206,15 @@ if(LEVAR_TIERS)
 endif()
 add_executable(levari ${LEVARI_SRC})
 
+# LV_PROFILE=ON embeds the main-window draw-path instrument (per-producer
+# tick counts, dirty-rect px totals, per-stage microseconds printed to
+# stderr at exit — the standing measurement tool for low-floor CPU claims;
+# dev builds only, never shipped on).
+option(LV_PROFILE "main-window draw instrumentation at exit (stderr)" OFF)
+if(LV_PROFILE)
+    target_compile_definitions(levari PRIVATE LV_PROFILE)
+endif()
+
 if(WIN32)
     # link the SDL2 import lib directly rather than the SDL2::SDL2 target
     # (which injects -mwindows via CMake interface; we set it explicitly
@@ -257,7 +266,7 @@ endif()
 # CPU tuning for ARM boards: -DLV_TUNE=arm1176jzf-s (Pi Zero 1 / Pi 1),
 # cortex-a7 (Pi 2) or cortex-a72 (Pi 4). On 32-bit armv7 the NEON flags
 # also switch minimp3 to its SIMD mp3 decoder; the armv6 boards (Pi Zero 1,
-# Pi 1: ARM1176, VFPv3-D16, no NEON) get plain VFP instead, so minimp3 keeps
+# Pi 1: ARM1176, VFPv2, no NEON) get plain VFP instead, so minimp3 keeps
 # its scalar path and the binary runs on them (NEON flags would SIGILL).
 set(LV_TUNE "" CACHE STRING "-mcpu target, e.g. arm1176jzf-s (Pi Zero) / cortex-a7 (Pi 2) / cortex-a72 (Pi 4)")
 if(LV_TUNE AND NOT WIN32)
@@ -271,6 +280,20 @@ if(LV_TUNE AND NOT WIN32)
         target_compile_options(levari PRIVATE -mfpu=vfp -mfloat-abi=hard)
         target_compile_options(modplug PRIVATE -mfpu=vfp -mfloat-abi=hard)
     endif()
+    # LTO RE-COMPILES THE IR AT LINK TIME with the driver's default
+    # -march — the `lto1: warning: switch -mcpu... conflicts with
+    # -march=armv6+fp` line: per-object compile flags are replayed but
+    # the link driver's defaults WIN for new codegen, so the final
+    # binary gains VFPv3 encodings (vdiv.f64 = undefined instruction on
+    # the ARM1176's VFPv2) even though every .o was compiled -mfpu=vfp.
+    # Pin -mcpu (and the FPU/ABI pair) at link time so lto1 generates
+    # for the same silicon we ship to.
+    target_link_options(levari PRIVATE -mcpu=${LV_TUNE})
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv7")
+        target_link_options(levari PRIVATE -mfpu=neon-vfpv4 -mfloat-abi=hard)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv6")
+        target_link_options(levari PRIVATE -mfpu=vfp -mfloat-abi=hard)
+    endif()
 endif()
 
 # decoders dominate CPU: let these TUs optimize for speed, not size.
@@ -278,7 +301,7 @@ endif()
 # already assumes the -O3 source property covers both, and without it
 # stb_vorbis ran -Os in plain builds and NO -O at all in the tier OBJECT
 # libs (object libs do not inherit levari's -Os) — 20-25% slower ogg
-set_source_files_properties(src/decode/decode.c third_party/stb_vorbis.c
+set_source_files_properties(src/decode/decode.c third_party/stb_vorbis.c src/dsp/dsp.c src/viz/viz.c
     PROPERTIES COMPILE_OPTIONS "-O3")
 
 if(LEVAR_TIERS)

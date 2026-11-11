@@ -175,7 +175,10 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
         while (n && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ')) s[--n] = 0;
         if (!*s) continue;
         if (!strncmp(s, "#EXTINF:", 8)) {
-            pending_dur = atoi(s + 8);
+            /* EXTINF is raw attacker-writable: a value past the hazard
+               ceiling means unknown, exactly like a missing field */
+            int d = atoi(s + 8);
+            pending_dur = (d > 0 && d <= LV_DUR_MAX) ? d : 0;
             continue;
         }
         if (*s == '#') continue;
@@ -298,8 +301,9 @@ int pl_load_pls(Playlist *p, const char *pls) {
         } else if (is_title) {
             lv_strlcpy(ent[at].title, eq, sizeof ent[at].title);
         } else {
-            int d = atoi(eq);   /* LengthN -1 = unknown -> 0 */
-            ent[at].dur = d > 0 ? d : 0;
+            int d = atoi(eq);   /* LengthN -1 = unknown -> 0, and any
+                                   value past the hazard ceiling too */
+            ent[at].dur = (d > 0 && d <= LV_DUR_MAX) ? d : 0;
         }
     }
     fclose(f);
@@ -390,10 +394,16 @@ int pl_load_cue(Playlist *p, const char *cue) {
                 lv_strlcpy(p->items[idx].tags.artist, q1 + 1, sizeof p->items[idx].tags.artist);
             }
         } else if (!strncmp(s, "INDEX 01 ", 9)) {
-            int mm, ss, ff;
-            if (sscanf(s + 9, "%d:%d:%d", &mm, &ss, &ff) == 3) {
-                double sec = mm * 60 + ss + ff / 75.0;
-                if (idx >= 0 && idx < p->count) {
+            long mm, ss, ff;
+            /* long, and the time built in double: these are raw sscanf
+               ints off a hostile file and the old `mm * 60 + ss` was int
+               math — INDEX 01 99999999:00:00 multiplied past INT_MAX,
+               signed-overflow UB wrapping into a negative start_sec.
+               Absurd times are rejected, the row is kept. */
+            if (sscanf(s + 9, "%ld:%ld:%ld", &mm, &ss, &ff) == 3) {
+                double sec = (double)mm * 60 + (double)ss + ff / 75.0;
+                if (sec >= 0 && sec <= LV_DUR_MAX &&
+                    idx >= 0 && idx < p->count) {
                     /* close the previous track only if it belongs to the
                        same FILE and came from this cue: an INDEX from a
                        new FILE (or a cue loaded onto a populated playlist)
@@ -414,8 +424,10 @@ int pl_load_cue(Playlist *p, const char *cue) {
         /* last track leaves end_sec == 0. Subtracting that goes negative
            once start is past ~1.5s, and load_track only repairs a 0.
            Leave it unknown so the player fills it from the file length. */
-        if (t->end_sec > t->start_sec)
-            t->duration = (int)(t->end_sec - t->start_sec + 0.5);
+        if (t->end_sec > t->start_sec) {
+            double d = t->end_sec - t->start_sec + 0.5;
+            if (d > 0 && d <= LV_DUR_MAX) t->duration = (int)d;
+        }
     }
     return 0;
 }

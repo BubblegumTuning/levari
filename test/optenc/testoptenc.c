@@ -2,11 +2,14 @@
    hand-built SDL_Events drive handle_opt_mouse (down, up), the cycle
    advances, tag_set_legacy_default takes live effect, and opt_save
    persists cfg.tag_legacy_encoding. Technique (see skill): #include ui.c,
-   link every object EXCEPT main.c.o AND ui.c.o:
+   link every object EXCEPT main.c.o, ui.c.o, decode.c.o AND
+   stb_vorbis.c.o (dispatch.c.o MUST stay — it defines
+   dec_open/dec_ffmpeg_probe_info that ui.c refs; the two excluded TUs
+   are pre-split leftovers that collide with the dec_*.dir tier objects):
      SDL=$(pkg-config --cflags --libs sdl2)
      gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/to \
        test/optenc/testoptenc.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name dispatch.c.o) \
+         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
        $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
        $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
        -lz -lm -lpthread -ldl -lstdc++

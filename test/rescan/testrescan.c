@@ -1,8 +1,9 @@
 /* unit test: lib_index_rescan — single-file index row update (playlist
    SCAN button backend). Pins: replace-in-place (row count invariant),
    append-if-absent (decision A), notag certification + clearance, duration
-   preservation when the probe goes blind, missing file -> rc -1 with the
-   index file byte-identical (decision F: index untouched), escaped-path
+   preservation when the probe goes blind, poisoned stored dur clamped to
+   unknown (2b), missing file -> rc -1 with the index file byte-identical
+   (decision F: index untouched), escaped-path
    rows replace-not-shadow (backslash filename), headerless legacy indexes
    (2026-11-07 GH-line): safe file keeps EVERY entry (two directories, one
    rescan, all unrelated rows survive under a stamped header), ambiguous
@@ -148,6 +149,26 @@ int main(void) {
     chk("probe-blind dur preserved", dur, 123);
     slurp(idx, b, sizeof b);
     chk("index row kept dur 123", strstr(b, "\t123\t") != NULL, 1);
+
+    /* 2b) a POISONED stored dur (past the hazard ceiling — atoi would
+       saturate at INT_MAX) must clamp to unknown, and the rewrite must
+       not re-persist the poison */
+    len = slurp(idx, b, sizeof b);
+    row1 = strstr(b, "one.mp3");
+    p5 = row1 ? strstr(row1, "\t123\t0\n") : NULL;
+    if (!p5) { fails++; printf("FAIL poison inject: no \\t123\\t0 row for one.mp3\n"); }
+    else {
+        size_t pre = (size_t)(p5 - b);
+        FILE *w = fopen(idx, "w");
+        fwrite(b, 1, pre, w);
+        fputs("\t99999999999\t0\n", w);
+        fwrite(p5 + 7, 1, (size_t)len - pre - 7, w);
+        fclose(w);
+    }
+    chk("rescan ok (poison dur)", lib_index_rescan(one, &t, &dur, &notag), 0);
+    chk("poison dur clamped to unknown", dur, 0);
+    slurp(idx, b, sizeof b);
+    chk("index lost the poison value", strstr(b, "99999999999") == NULL, 1);
 
     /* 3) notag certification then clearance */
     chk("rescan untagged ok", lib_index_rescan(two, &t, &dur, &notag), 0);

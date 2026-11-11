@@ -48,6 +48,14 @@ int spc_tag_duration(const unsigned char *head, long n);
    the rest. Call after cfg_load (main.c) and on every options change;
    tag.c never reads cfg itself (probe.c builds it standalone). */
 #define LV_ENC_AUTO   -1
+
+/* single hazard ceiling for per-track durations, in seconds: every probe
+   path already refuses a length over one day (XING/VBRI/ogg tail/FLAC
+   return 0 = unknown past 86400), so the playlist parsers, the index
+   reader and the decoder fallbacks must not admit larger numbers —
+   unbounded per-track values poison the library and the footer sum.
+   Out-of-range parses become 0 (unknown), never a dropped row. */
+#define LV_DUR_MAX 86400
 #define LV_ENC_LATIN1  0
 #define LV_ENC_CP1251  1
 #define LV_ENC_UTF8    2
