@@ -189,7 +189,12 @@ pi0 needs
 Builds the release targets (native linux, legacy linux via the zig
 glibc-2.17 toolchain — needs the floor-built static SDL2 from the legacy
 section above, default prefix `~/sdl2-legacy-x86_64`; MinGW win;
-`SDL2_DIR` points at the SDL2-mingw cmake dir) and writes
+`SDL2_DIR` points at the SDL2-mingw cmake dir; win98 — OPT-IN ONLY,
+set `WIN98_RELEASE=1` to build it at all (it otherwise prints a skip
+notice; the era target is a possibility, not a regular release — see
+the Windows 98 section). When opted in it needs the EPEL mingw32 cross
+and the era SDL prefix, `WIN98_SDL2_DIR` overrides, and only packages
+if the era import gate passes) and writes
 `dist/release/levari-<target>.<arch>.<version>.zip`
 (arch tokens match the in-app `LV_ARCH` display: `x86-64`, `arm32`,
 `arm64`, `x86`)
@@ -217,6 +222,60 @@ hood), named pipes (`\\.\pipe\levari-<user>`) for daemon/CLI IPC,
 library index. Opus playback works if `libopus-0.dll` is next to the
 exe; aac/m4a/wma need the libav* DLLs (not supported in the Windows
 build yet).
+
+## Windows 98 legacy build (era floor)
+
+A separate pipeline for Windows 98 SE-class machines (i686): its own
+flag `-DLV_WIN9X=ON`, its own build dir, its own release zip. The
+flagship Windows binary's floor never moves toward 98. The release.sh
+target is OPT-IN (`WIN98_RELEASE=1`) — the era build stays a
+possibility, not a regular release target; a default release run skips
+it with a notice. Status: the
+build and the import-table floor gate are verified; runtime on real 98
+hardware is not yet verified — treat the zip as experimental (see
+docs/WIN98-NOTES.txt, which ships inside it).
+
+Host prereqs (RHEL-family): `sudo dnf install mingw32-gcc
+mingw32-gcc-c++ mingw32-zlib mingw32-zlib-static` (the static zlib is
+the CRB package; without libz.a the exe imports zlib1.dll).
+
+One-time era SDL2 bootstrap — SDL 2.0.8 static, pinned sha256, zero
+source patches; default prefix `~/sdl2-win98`, or pass your own:
+
+    tools/build_sdl2_win98.sh
+
+Then the player:
+
+    cmake -B build-win98 \
+      -DCMAKE_TOOLCHAIN_FILE=tools/mingw-w64-win98-toolchain.cmake \
+      -DSDL2_DIR=$HOME/sdl2-win98/cmake \
+      -DLV_WIN9X=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-win98 -j"$(nproc)"
+
+Verify the era floor before shipping (release.sh runs the gate and
+skips win98 packaging if it fires — the flagship zips still ship):
+
+    file build-win98/levari.exe
+    #   must report PE32 executable (GUI) Intel 80386
+    python3 tools/win98_gate.py i686-w64-mingw32-objdump build-win98/levari.exe <version>
+    #   asserts: NT-only import denylist == 0 hits (every entry is
+    #   loader-rejecting on 9x kernel32/advapi32 — absent exports, not
+    #   deprecated ones), PE32 not PE32+, Intel 80386, GUI subsystem
+    #   with MajorSubsystemVersion 4, embedded v<version> + x86 tokens.
+    #   The flagship build-win exe must FAIL this gate (control).
+
+Why this shape (measured, not folklore): no SDL2 release ever handled
+9x — every vintage forces UNICODE=1 and Windows 98 answers the wide
+Win32 APIs with error stubs, so a clean import table does not prove
+runtime success: real 98 may need the Microsoft Layer for Unicode
+(unicows.dll next to the exe; user-supplied, never shipped in the zip —
+the OPL3 bank posture). The era SDL floor is 2.0.8 because it is the
+oldest release levari links with zero source patches; the handful of
+post-9x imports that SDL 2.0.8 and winpthreads still reference are
+neutralized at link time by tools/win98_shim.c (it defines the
+`__imp__` thunks, which preempts the kernel32 import-lib members, so
+the PE imports none of them), and daemon.c carries `LV_WIN9X` era
+swaps for its own Vista+ pipe calls.
 
 ## macOS build
 

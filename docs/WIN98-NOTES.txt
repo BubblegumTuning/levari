@@ -1,0 +1,27 @@
+levari — Windows 98 legacy build (EXPERIMENTAL)
+
+This zip holds the era build of levari: a separate pipeline targeting
+Windows 98-class machines (i686, Windows 98 SE era Win32). Its import
+table is verified to contain only DLLs stock to Windows 98 SE, but its
+runtime behaviour on real 98 hardware is NOT yet verified — consider
+this build experimental, and please report anything odd.
+
+Notes:
+
+* Audio needs no extra DLLs. This build reaches audio through winmm
+  (stock); SDL's DirectSound backend is loaded dynamically at runtime
+  and simply declines where it is absent.
+
+* Unicode on 9x: this SDL vintage calls the wide ("W") Win32 APIs, and
+  Windows 98 answers those with error stubs. If the program fails to
+  start or the window misbehaves on real 98, install the Microsoft
+  Layer for Unicode (MSLU — file unicows.dll) next to levari.exe. MSLU
+  is distributed by Microsoft as a free redistributable and is NOT
+  shipped in this zip (same posture as the OPL3 bank: our code ships,
+  third-party data stays user-supplied).
+
+* Build recipe (reproducible): tools/build_sdl2_win98.sh bootstraps the
+  pinned era SDL prefix; the app itself then builds with
+  cmake -B build-win98 -DCMAKE_TOOLCHAIN_FILE=tools/mingw-w64-win98-toolchain.cmake
+  -DSDL2_DIR=<prefix>/cmake -DLV_WIN9X=ON -DCMAKE_BUILD_TYPE=Release
+  && cmake --build build-win98

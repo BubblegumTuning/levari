@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "search.h"
 #include "textedit.h"
+#include "x8bit.h"
 #include "../skin/skin.h"
 #include "../skin/cjk_font.h"
 #include "../viz/viz.h"
@@ -27,7 +28,7 @@ enum {
     EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X, EQB_RESET,
     OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
     OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC, OPTB_VHZ,
-    OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_X, OPTB_TABB, OPTB_TABA, OPTB_TABU,
+    OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_VERIFY, OPTB_X, OPTB_TABB, OPTB_TABA, OPTB_TABU,
     B_NONE
 };
 
@@ -37,7 +38,10 @@ enum { OPTF_LIBDIRS, OPTF_LIBIDX, OPTF_LIBAV, OPTF_BACKEND, OPTF_DEVICE, OPTF_SO
 #define OPT_SCAN_W 53
 #define OPT_SCAN_GAP 4
 #define OPT_CHK_W 46
-#define OPT_W (MAIN_W + OPT_SCAN_W + OPT_SCAN_GAP + OPT_SCAN_GAP + OPT_CHK_W)
+/* the right-hand button column(s) fit two stacked 53px slots (SCAN/CLEAR
+   row + VERIFY beside CLEAR) with the same trailing margin the old
+   CHK-column formula left (was MAIN_W + SCAN_W + 2*GAP + CHK_W = 422) */
+#define OPT_W (MAIN_W + 2 * (OPT_SCAN_W + OPT_SCAN_GAP))
 #define OPT_H (MAIN_H + PL_H)
 #define OPT_FLD_X 100
 #define OPT_FLD_W 207
@@ -169,8 +173,10 @@ typedef struct {
     char url_field[LV_MAX_PATH];
     TField url_tf;               /* buf points at url_field */
 #endif
-    int opt_caret;               /* caret byte offset in the focused field (codepoint boundary) */
-    int opt_selall;              /* ctrl-a: whole focused field selected, next edit replaces it */
+    TField opt_tf;               /* options editor state; buf bound to
+                                    opt_field[opt_focus] on every focus
+                                    change (caret re-anchors to the new
+                                    field's end on focus) */
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
     int opt_vhz;                /* ADV cycle button copy: 10/24/30/60 (cfg.vis_hz) */
@@ -183,6 +189,10 @@ typedef struct {
                                     (probe_info), shown on the same line */
     int opt_tab;                 /* options window tab: 0 BASIC, 1 ADVANCED, 2 ABOUT */
     int opt_scanning;            /* a library scan thread is running */
+    int opt_verifying;           /* ... and VERIFY owns the index (shared
+                                    opt_scanning gate, its own BUSY label) */
+    int opt_vfy_rc, opt_vfy_kept, opt_vfy_purged, opt_vfy_unreach;
+    char opt_vfy_bank[LV_MAX_PATH]; /* where the dropped rows were banked */
     int opt_tags;                /* scan reads tags+duration, not just names */
     SDL_atomic_t opt_scan_done;  /* set by the scan thread when finished */
     int opt_scan_added, opt_scan_seen, opt_scan_skipped;
@@ -259,36 +269,6 @@ int ui_show_search;
 
 static int in_rect(const Rect *r, int x, int y) {
     return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
-}
-
-void ui_clip_copy(const char *text) {
-    if (text && *text) SDL_SetClipboardText(text);
-}
-
-/* append the clipboard to dst, dropping control chars; returns 1 if changed */
-int ui_clip_paste(char *dst, size_t n) {
-    char *clip = SDL_GetClipboardText();
-    if (!clip) return 0;
-    size_t len = strlen(dst);
-    int changed = 0;
-    const char *q = clip;
-    while (*q && len + 4 < n) {
-        unsigned cp;
-        int k = font_utf8_next(q, &cp);
-        /* same printable filter as the search query: DEL, C1 and CESU-8
-           surrogates must not reach path/query fields, the daemon or D-Bus */
-        if (cp >= 0x20 && cp != 0x7F &&
-            !(cp >= 0x80 && cp <= 0x9F) &&
-            !(cp >= 0xD800 && cp <= 0xDFFF)) {
-            memcpy(dst + len, q, (size_t)k);
-            len += (size_t)k;
-            dst[len] = 0;
-            changed = 1;
-        }
-        q += k;
-    }
-    SDL_free(clip);
-    return changed;
 }
 
 /* top-right corner close button, present on every window */
@@ -676,11 +656,8 @@ static void draw_icon(SDL_Surface *s, int id, const Rect *r, Uint32 c) {
     }
 }
 
-static void fmt_time(char *buf, size_t n, long long sec) {
-    if (sec < 0) sec = 0;
-    if (sec >= 3600) snprintf(buf, n, "%lld:%02lld:%02lld", sec / 3600, (sec / 60) % 60, sec % 60);
-    else snprintf(buf, n, "%lld:%02lld", sec / 60, sec % 60);
-}
+/* time readout: lv_fmt_time (common.h) — the tree's single M:SS/H:MM:SS
+   format, shared with the daemon's status line */
 
 /* the playlist footer total: sum in long long (durations arrive from
    untrusted files — EXTINF/LengthN/index rows are raw atoi — and two
@@ -696,7 +673,7 @@ static void fmt_pl_total(char *buf, size_t n, const Playlist *pl) {
         if (total > PL_TOTAL_CAP) break;
     }
     if (total > PL_TOTAL_CAP) lv_strlcpy(buf, "9999:59:59+", n);
-    else fmt_time(buf, n, total);
+    else lv_fmt_time(buf, n, total);
 }
 
 #define D_MAIN 1u
@@ -838,7 +815,7 @@ static void draw_main(unsigned regs) {
         /* row 1: play time in a box, 2x font, scrolling title beside it */
         if (rgn_hit(&R_TIME)) {
             char tb[16];
-            fmt_time(tb, sizeof tb, p->state == ST_STOP ? 0 : pos);
+            lv_fmt_time(tb, sizeof tb, p->state == ST_STOP ? 0 : pos);
             font_puts_big(s, R_TIME.x + 6, R_TIME.y + 2, tb, col(s, 0, 255, 0));
         }
 
@@ -1296,16 +1273,6 @@ static int fs_is_root(const char *d) { return !strcmp(d, "/"); }
 #define FILE_FLD_RECT  Rect fld = {6, 24, FILE_W - 12, 16}
 #define FILE_ADD_RECT  Rect addb = {FILE_W - 60, FILE_H - 16, 52, 12}
 
-static int audio_name(const char *name) {
-    const char *e = strrchr(name, '.');
-    if (!e) return 0;
-    return !lv_strcasecmp(e, ".mp3") || !lv_strcasecmp(e, ".ogg") ||
-           !lv_strcasecmp(e, ".oga") || !lv_strcasecmp(e, ".opus") ||
-           !lv_strcasecmp(e, ".flac") || !lv_strcasecmp(e, ".wav") ||
-           !lv_strcasecmp(e, ".aac") || !lv_strcasecmp(e, ".m4a") ||
-           !lv_strcasecmp(e, ".wma");
-}
-
 static int fcmp(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
@@ -1406,7 +1373,7 @@ static void file_list(void) {
                 dirs = d2;
             }
             dirs[nd++] = dup;
-        } else if (audio_name(de->d_name) || ui.file_saving) {
+        } else if (lv_is_audio(de->d_name) || ui.file_saving) {
             /* SAVE mode lists every file (no audio filter): the user must
                see the .m3u they aim to overwrite */
             if (nf == cf) {
@@ -1551,7 +1518,7 @@ static void file_open(void) {
             SDL_SetWindowIcon(ui.wfile, icon);
             SDL_FreeSurface(icon);
         }
-        ui.sfile = SDL_GetWindowSurface(ui.wfile);
+        ui.sfile = lv_win_surface(ui.wfile);
     }
     if (!ui.file_dir[0]) {
         char path[LV_MAX_PATH] = "";
@@ -1894,7 +1861,7 @@ static void file_field_enter(void) {
         }
         const char *base = lv_strrsep(ui.file_field);
         base = base ? base + 1 : ui.file_field;
-        if (audio_name(base)) {
+        if (lv_is_audio(base)) {
             Player *p = ui.pl;
             LibIndex ix = lib_index_load(); /* disk I/O off the player lock */
             pthread_mutex_lock(&p->mtx);
@@ -1933,17 +1900,9 @@ static int file_key(SDL_Event *e) {
         file_sync_field();
         file_build_view();
         break;
-    case SDLK_LEFT:      tf_left(&ui.file_tf);  break;
-    case SDLK_RIGHT:     tf_right(&ui.file_tf); break;
-    case SDLK_HOME:      tf_home(&ui.file_tf);  break;
-    case SDLK_END:       tf_end(&ui.file_tf);   break;
-    case SDLK_BACKSPACE: tf_backspace(&ui.file_tf); break;
-    case SDLK_DELETE:    tf_del(&ui.file_tf);   break;
-    case SDLK_a: if (ctrl) tf_selectall(&ui.file_tf); break;
-    case SDLK_c: if (ctrl) tf_copy(&ui.file_tf); break;
-    case SDLK_x: if (ctrl) tf_cut(&ui.file_tf); break;
-    case SDLK_v: if (ctrl) tf_paste(&ui.file_tf); break;
-    default: break;
+    default:
+        tf_handle_key(&ui.file_tf, e->key.keysym.sym, ctrl);
+        break;
     }
     file_build_view();
     return 1;
@@ -2025,7 +1984,7 @@ static void urlwin_open(void) {
             SDL_SetWindowIcon(ui.wurl, icon);
             SDL_FreeSurface(icon);
         }
-        ui.surl = SDL_GetWindowSurface(ui.wurl);
+        ui.surl = lv_win_surface(ui.wurl);
     }
     /* The window must tell the USER that streaming cannot work without the
        libav* backend (probe: 1 loadable, 2 missing, 0 not compiled in — all
@@ -2036,10 +1995,10 @@ static void urlwin_open(void) {
     ui.url_ff_ok = ui.url_ff_code == 1;
     if (!ui.url_ff_ok) {
         SDL_SetWindowSize(ui.wurl, URL_W, URL_H_NOFF);
-        ui.surl = SDL_GetWindowSurface(ui.wurl);
+        ui.surl = lv_win_surface(ui.wurl);
     } else if (ui.surl && ui.surl->h != URL_H) {
         SDL_SetWindowSize(ui.wurl, URL_W, URL_H);
-        ui.surl = SDL_GetWindowSurface(ui.wurl);
+        ui.surl = lv_win_surface(ui.wurl);
     }
     /* LAZY prefill on open (D5): text only, inert — NOTHING probes or
        GETs here; whatever urlIndex holds (including tampered bytes) is
@@ -2098,19 +2057,11 @@ static int url_key(SDL_Event *e) {
     case SDLK_ESCAPE:
         url_close();
         break;
-    case SDLK_LEFT:      tf_left(&ui.url_tf);  break;
-    case SDLK_RIGHT:     tf_right(&ui.url_tf); break;
-    case SDLK_HOME:      tf_home(&ui.url_tf);  break;
-    case SDLK_END:       tf_end(&ui.url_tf);   break;
-    case SDLK_BACKSPACE: tf_backspace(&ui.url_tf); break;
-    case SDLK_DELETE:    tf_del(&ui.url_tf);   break;
-    case SDLK_a: if (ctrl) tf_selectall(&ui.url_tf); break;
-    case SDLK_c: if (ctrl) tf_copy(&ui.url_tf); break;
-    case SDLK_x: if (ctrl) tf_cut(&ui.url_tf); break;
-    case SDLK_v: if (ctrl) tf_paste(&ui.url_tf); break; /* tf_sanitize_paste:
-        CRLF/quote/control hygiene exactly like the file field — the paste
-        hygiene rule of the streaming plan */
-    default: break;
+    default:
+        tf_handle_key(&ui.url_tf, e->key.keysym.sym, ctrl); /* tf_paste rides
+            tf_sanitize_paste: CRLF/quote/control hygiene exactly like the
+            file field — the paste hygiene rule of the streaming plan */
+        break;
     }
     return 1;
 }
@@ -2201,6 +2152,10 @@ static Rect opt_field_rect(int i) {
 static Rect opt_save_rect(void)  { Rect r = { OPT_W - 142, 224, 60, 14 }; return r; }
 static Rect opt_close_rect(void) { Rect r = { OPT_W - 72,  224, 60, 14 }; return r; }
 static Rect opt_clear_rect(void) { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBIDX].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
+/* VERIFY sits RIGHT of CLEAR (same LIBIDX row, second button column) —
+   under the LIBAV row it read as that field's button; VERIFY belongs to
+   the index, visually with CLEAR. The column widened the window (OPT_W). */
+static Rect opt_verify_rect(void) { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP + OPT_SCAN_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBIDX].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_tog_rect(int i)  { Rect r = { OPT_FLD_X + i * 52, 190, 48, 14 }; return r; }
 /* BASIC/ADVANCED/ABOUT tab buttons: small tabs in the title bar, right of
    the "OPTIONS" label (ends at x=52); visible on all three pages */
@@ -2288,7 +2243,7 @@ static void opt_open(void) {
             SDL_SetWindowIcon(ui.wopt, icon);
             SDL_FreeSurface(icon);
         }
-        ui.sopt = SDL_GetWindowSurface(ui.wopt);
+        ui.sopt = lv_win_surface(ui.wopt);
     }
     char ffdir[LV_MAX_PATH];
     ui.opt_field[OPTF_LIBDIRS][0] = 0;
@@ -2321,8 +2276,11 @@ static void opt_open(void) {
     ui.opt_tab = 0;
     ui.opt_hover = -1;
     ui.opt_focus = -1;
-    ui.opt_caret = 0;
-    ui.opt_selall = 0;
+    ui.opt_tf.buf = ui.opt_field[0]; /* bound for real on focus; keeps buf
+                                        never NULL while the window draws */
+    ui.opt_tf.cap = LV_MAX_PATH;
+    ui.opt_tf.caret = 0;
+    ui.opt_tf.selall = 0;
     ui.opt_status[0] = 0;
     ui.opt_tags = 1;
     ui.opt_visible = 1;
@@ -2339,7 +2297,7 @@ static void opt_close(void) {
     tag_set_legacy_default(cfg.tag_legacy_enc);
     ui.opt_visible = 0;
     ui.opt_focus = -1;
-    ui.opt_caret = 0;
+    ui.opt_tf.caret = 0;
     if (ui.wopt) SDL_HideWindow(ui.wopt);
     SDL_StopTextInput();
 }
@@ -2393,6 +2351,40 @@ static int scan_thread(void *p) {
     free(a->dirs);
     free(a);
     return 0;
+}
+
+/* VERIFY runs the same single-writer dance as scan: opt_scanning is the
+   index-busy flag every index writer shares, opt_verifying only tells
+   the completion block which report to print. lib_index_verify does its
+   own atomic rewrite; nothing else may touch the index while it runs. */
+static int verify_thread(void *unused) {
+    (void)unused;
+    char bank[LV_MAX_PATH];
+    int kept = 0, purged = 0, unreach = 0;
+    int rc = lib_index_verify(&kept, &purged, &unreach, bank, sizeof bank);
+    ui.opt_vfy_rc = rc;
+    ui.opt_vfy_kept = kept;
+    ui.opt_vfy_purged = purged;
+    ui.opt_vfy_unreach = unreach;
+    lv_strlcpy(ui.opt_vfy_bank, bank, sizeof ui.opt_vfy_bank);
+    SDL_AtomicSet(&ui.opt_scan_done, 1);
+    return 0;
+}
+
+static void opt_start_verify(void) {
+    if (ui.opt_scanning) return;      /* scan (or another verify) owns it */
+    ui.opt_scanning = 1;
+    ui.opt_verifying = 1;
+    ui.opt_status[0] = 0;
+    SDL_AtomicSet(&ui.opt_scan_done, 0);
+    SDL_Thread *th = SDL_CreateThread(verify_thread, "lvverify", NULL);
+    if (!th) {
+        ui.opt_scanning = 0;
+        ui.opt_verifying = 0;
+        lv_strlcpy(ui.opt_status, "verify failed to start", sizeof ui.opt_status);
+        return;
+    }
+    SDL_DetachThread(th);
 }
 
 static void opt_start_scan(void) {
@@ -2519,9 +2511,9 @@ static void draw_opt(void) {
         /* text longer than the box scrolls left. Unfocused: the trailing
            suffix shows. Focused: the window is anchored on the caret so it
            and its surroundings stay visible while editing mid-string. */
-        TField tf = { val, sizeof val, ui.opt_caret, ui.opt_selall };
+        TField tf = { val, sizeof val, ui.opt_tf.caret, ui.opt_tf.selall };
         draw_field_text(s, f, val, &tf, ui.opt_focus == i, 1);
-        ui.opt_caret = tf.caret;   /* the helper clamps a stale caret */
+        ui.opt_tf.caret = tf.caret;   /* the helper clamps a stale caret */
     }
 
     if (!ui.opt_tab) {
@@ -2657,6 +2649,13 @@ static void draw_opt(void) {
     Rect cr = opt_clear_rect();
     skin_button(s, &cr, ui.pressed == OPTB_CLEAR && !ui.opt_scanning, 0);
     font_puts(s, cr.x + (cr.w - font_w("CLEAR")) / 2, cr.y + 3, "CLEAR", col(s, 220, 220, 220));
+    /* VERIFY: existence pass over the whole index (drops orphaned rows
+       to <index>.dropped). Same busy gate as SCAN/CLEAR. */
+    Rect vr = opt_verify_rect();
+    skin_button(s, &vr, ui.pressed == OPTB_VERIFY && !ui.opt_scanning, 0);
+    const char *vl = ui.opt_scanning ? "BUSY" : "VERIFY";
+    font_puts(s, vr.x + (vr.w - font_w(vl)) / 2, vr.y + 3, vl,
+              ui.opt_scanning ? col(s, 150, 150, 150) : col(s, 220, 220, 220));
     }
 
     if (ui.opt_status[0])
@@ -2676,6 +2675,48 @@ static void draw_opt(void) {
         SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
         font_puts(s, tb.x + 6, tb.y + 5, "dirs are scanned recursively", col(s, 220, 220, 220));
         font_puts(s, tb.x + 6, tb.y + 17, "separate multiple dirs with ';'", col(s, 220, 220, 220));
+    }
+    if (ui.opt_hover == OPTB_VERIFY) {
+        Rect rv = opt_verify_rect();
+        SDL_Rect tb = { rv.x, rv.y + rv.h + 4, 250, 56 };
+        if (tb.x + tb.w > OPT_W) tb.x = OPT_W - tb.w;
+        SDL_FillRect(s, &tb, col(s, 40, 40, 40));
+        SDL_Rect t = { tb.x, tb.y, tb.w, 1 }, b = { tb.x, tb.y + tb.h - 1, tb.w, 1 };
+        SDL_Rect l = { tb.x, tb.y, 1, tb.h }, r = { tb.x, tb.y + 1, 1, tb.h };
+        Uint32 bc = col(s, 140, 140, 140);
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        font_puts(s, tb.x + 6, tb.y + 5, "checks every index row still exists", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 17, "gone rows drop to index.dropped", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 29, "temporarily unreachable rows stay", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 41, "(share offline != file deleted)", col(s, 220, 220, 220));
+    }
+    if (ui.opt_hover == OPTB_SCAN) {
+        Rect rs = opt_scan_rect();
+        SDL_Rect tb = { rs.x, rs.y + rs.h + 4, 224, 42 };
+        if (tb.x + tb.w > OPT_W) tb.x = OPT_W - tb.w;
+        SDL_FillRect(s, &tb, col(s, 40, 40, 40));
+        SDL_Rect t = { tb.x, tb.y, tb.w, 1 }, b = { tb.x, tb.y + tb.h - 1, tb.w, 1 };
+        SDL_Rect l = { tb.x, tb.y, 1, tb.h }, r = { tb.x + tb.w - 1, tb.y, 1, tb.h };
+        Uint32 bc = col(s, 140, 140, 140);
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        font_puts(s, tb.x + 6, tb.y + 5, "scans the LIBRARY DIRS field", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 17, "adds new rows, keeps existing", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 29, "TAGS box = read tags + length", col(s, 220, 220, 220));
+    }
+    if (ui.opt_hover == OPTB_CLEAR) {
+        Rect rc = opt_clear_rect();
+        SDL_Rect tb = { rc.x, rc.y + rc.h + 4, 224, 30 };
+        if (tb.x + tb.w > OPT_W) tb.x = OPT_W - tb.w;
+        SDL_FillRect(s, &tb, col(s, 40, 40, 40));
+        SDL_Rect t = { tb.x, tb.y, tb.w, 1 }, b = { tb.x, tb.y + tb.h - 1, tb.w, 1 };
+        SDL_Rect l = { tb.x, tb.y, 1, tb.h }, r = { tb.x + tb.w - 1, tb.y, 1, tb.h };
+        Uint32 bc = col(s, 140, 140, 140);
+        SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
+        SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+        font_puts(s, tb.x + 6, tb.y + 5, "deletes the library index file", col(s, 220, 220, 220));
+        font_puts(s, tb.x + 6, tb.y + 17, "SCAN rebuilds it, tags re-read", col(s, 220, 220, 220));
     }
     if (ui.opt_hover == OPTB_TENC) {
         Rect r3 = opt_enc_rect();
@@ -2738,6 +2779,8 @@ static void handle_opt_mouse(SDL_Event *e) {
         if (in_rect(&cr, x, y)) { if (!ui.opt_scanning) ui.pressed = OPTB_CLEAR; return; }
         Rect ck = opt_chk_rect();
         if (in_rect(&ck, x, y)) { ui.pressed = OPTB_CHK; return; }
+        Rect vr = opt_verify_rect();
+        if (in_rect(&vr, x, y)) { if (!ui.opt_scanning) ui.pressed = OPTB_VERIFY; return; }
         for (int i = 0; i < 6; i++) {
             Rect tg = opt_tog_rect(i);
             if (in_rect(&tg, x, y)) { ui.pressed = OPTB_TPL + i; return; }
@@ -2746,8 +2789,9 @@ static void handle_opt_mouse(SDL_Event *e) {
             Rect f = opt_field_rect(i);
             if (in_rect(&f, x, y)) {
                 ui.opt_focus = i;
-                ui.opt_caret = (int)strlen(ui.opt_field[i]);
-                ui.opt_selall = 0;
+                ui.opt_tf.buf = ui.opt_field[i];
+                ui.opt_tf.caret = (int)strlen(ui.opt_tf.buf);
+                ui.opt_tf.selall = 0;
                 SDL_SetWindowInputFocus(ui.wopt);
                 SDL_StartTextInput();
                 return;
@@ -2805,6 +2849,10 @@ static void handle_opt_mouse(SDL_Event *e) {
                 Rect ck = opt_chk_rect();
                 if (in_rect(&ck, x, y)) ui.opt_tags = !ui.opt_tags;
             }
+            else if (ui.pressed == OPTB_VERIFY) {
+                Rect vr = opt_verify_rect();
+                if (in_rect(&vr, x, y)) opt_start_verify();
+            }
             ui.pressed = B_NONE;
         }
         if (ui.drag == 11) {
@@ -2819,8 +2867,12 @@ static void handle_opt_mouse(SDL_Event *e) {
             ui.opt_hover = in_rect(&te, x, y) ? OPTB_TENC
                            : in_rect(&tv, x, y) ? OPTB_VHZ : -1;
         } else if (!ui.opt_tab) {
-            Rect f = opt_field_rect(OPTF_LIBDIRS);
-            ui.opt_hover = (x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
+            Rect f = opt_field_rect(OPTF_LIBDIRS), vr = opt_verify_rect();
+            Rect sn = opt_scan_rect(), cr = opt_clear_rect();
+            ui.opt_hover = in_rect(&vr, x, y) ? OPTB_VERIFY
+                           : in_rect(&sn, x, y) ? OPTB_SCAN
+                           : in_rect(&cr, x, y) ? OPTB_CLEAR
+                           : (x >= 8 && x < f.x + f.w && y >= f.y - 2 && y <= f.y + f.h + 2)
                            ? OPTF_LIBDIRS : -1;
         } else {
             ui.opt_hover = -1;
@@ -2828,39 +2880,20 @@ static void handle_opt_mouse(SDL_Event *e) {
     }
 }
 
-/* options field editing rides the shared TField ops (textedit.c); the
-   ESC close and the per-field focus gate stay here, as do all OPTB_*
-   side effects — only buffer editing moved */
+/* options field editing rides the shared TField ops (textedit.c) through
+   the one shared switch (tf_handle_key); the ESC close and the per-field
+   focus gate stay here, as do all OPTB_* side effects — only buffer
+   editing moved */
 static void opt_key(SDL_Event *e) {
     if (e->key.keysym.sym == SDLK_ESCAPE) { opt_close(); return; }
     if (ui.opt_focus < 0) return;
-    TField tf = { ui.opt_field[ui.opt_focus], LV_MAX_PATH,
-                  ui.opt_caret, ui.opt_selall };
-    int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
-    switch (e->key.keysym.sym) {
-    case SDLK_LEFT:      tf_left(&tf);  break;
-    case SDLK_RIGHT:     tf_right(&tf); break;
-    case SDLK_HOME:      tf_home(&tf);  break;
-    case SDLK_END:       tf_end(&tf);   break;
-    case SDLK_a: if (ctrl) tf_selectall(&tf); else return; break;
-    case SDLK_c: if (ctrl) tf_copy(&tf); else return; break;
-    case SDLK_x: if (ctrl) tf_cut(&tf); else return; break;
-    case SDLK_v: if (ctrl) tf_paste(&tf); else return; break;
-    case SDLK_BACKSPACE: tf_backspace(&tf); break;
-    case SDLK_DELETE:    tf_del(&tf);   break;
-    default: return;
-    }
-    ui.opt_caret = tf.caret;
-    ui.opt_selall = tf.selall;
+    tf_handle_key(&ui.opt_tf, e->key.keysym.sym,
+                  (e->key.keysym.mod & KMOD_CTRL) != 0);
 }
 
 static void opt_text(const char *text) {
     if (ui.opt_focus < 0) return;
-    TField tf = { ui.opt_field[ui.opt_focus], LV_MAX_PATH,
-                  ui.opt_caret, ui.opt_selall };
-    tf_insert(&tf, text);
-    ui.opt_caret = tf.caret;
-    ui.opt_selall = tf.selall;
+    tf_insert(&ui.opt_tf, text);
 }
 
 /* when the options window's SHUF startup toggle is on, keep the shuffle
@@ -3554,7 +3587,7 @@ static void handle_pl_mouse(SDL_Event *e) {
             if (w != ui.pl_w || h != ui.pl_h) {
                 ui.pl_w = w; ui.pl_h = h;
                 SDL_SetWindowSize(ui.wpl, w, h);
-                ui.spl = SDL_GetWindowSurface(ui.wpl);
+                ui.spl = lv_win_surface(ui.wpl);
             }
         }
     } else if (e->type == SDL_MOUSEWHEEL) {
@@ -3786,9 +3819,10 @@ static Uint32 ev_win(const SDL_Event *e) {
    The old loop repainted every visible window at a fixed 10 fps no matter
    what: paused, unfocused, nothing changed. That steady 10 Hz wake-up is the
    entire steady-state CPU cost and keeps the CPU out of deep sleep states on
-   laptops. Now events mark their window dirty, a poll tick (1 s, or 10 Hz
-   only while an animation is live) catches player-thread changes, and only
-   dirty windows are repainted. Unfocused windows are not repainted at all
+   laptops. Now events mark their window dirty, a poll tick (1 s, or only
+   while an animation is live — a 10 Hz beat, and the visualizer's own
+   cfg.vis_hz rate while the band runs) catches player-thread changes, and
+   only dirty windows are repainted. Unfocused windows are not repainted at all
     (FOCUS_GAINED marks the whole set dirty again), with four exceptions: the
     main window while the visualizer is on and playing (the vis band lives in
     the main window and a user watching it wants it live), the main window
@@ -3922,7 +3956,7 @@ static void info_open(void) {
             SDL_SetWindowIcon(ui.winfo, icon);
             SDL_FreeSurface(icon);
         }
-        ui.sinfo = SDL_GetWindowSurface(ui.winfo);
+        ui.sinfo = lv_win_surface(ui.winfo);
     }
     ui.info_focus = -1;               /* a re-open never inherits a stale focus */
     ui.info_visible = 1;
@@ -3984,7 +4018,7 @@ static void handle_info_mouse(SDL_Event *e) {
 
 static void win_present(SDL_Window *w) {
     if (w && !(SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED))
-        SDL_UpdateWindowSurface(w);
+        lv_win_present(w, NULL, 0);
 }
 
 /* item 4 (cpu_floor_hunting): the main window's damage is exactly the
@@ -3997,8 +4031,7 @@ static void win_present(SDL_Window *w) {
    region scheme (yet). */
 static void win_present_main(SDL_Window *w) {
     if (!w || (SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED)) return;
-    if (rgn_n) SDL_UpdateWindowSurfaceRects(w, rgn_rects, rgn_n);
-    else SDL_UpdateWindowSurface(w);
+    lv_win_present(w, rgn_n ? rgn_rects : NULL, rgn_n);
 }
 
 int ui_run(Player *p, int show_pl) {
@@ -4033,7 +4066,7 @@ int ui_run(Player *p, int show_pl) {
        driver framebuffer ops are the only ones that honor our rects.
        The opt-out is X11-only: it was measured and justified on X11
        alone, and on Cocoa it is actively harmful (verified 0.3.6 on
-       mac112: with the hint SDL_GetWindowSurface returns NULL on the
+       macOS: with the hint SDL_GetWindowSurface returns NULL on the
        NSView-backed window, ui.smain is NULL and the first draw
        NULL-derefs in skin_draw_main_bg; SDL_FRAMEBUFFER_ACCELERATION=1
        as env proves the hint is the cause and the 0.3.5 binary passes
@@ -4104,9 +4137,17 @@ int ui_run(Player *p, int show_pl) {
         SDL_GetWindowPosition(ui.weq, &qx, &qy);
         ui.snap[0].w = ui.weq; ui.snap[0].dx = qx - wx; ui.snap[0].dy = qy - wy;
     }
-    ui.smain = SDL_GetWindowSurface(ui.wmain);
-    ui.spl = SDL_GetWindowSurface(ui.wpl);
-    if (ui.weq) ui.seq = SDL_GetWindowSurface(ui.weq);
+    ui.smain = lv_win_surface(ui.wmain);
+    ui.spl = lv_win_surface(ui.wpl);
+    if (ui.weq) ui.seq = lv_win_surface(ui.weq);
+    /* Tier-0 guard: an unsupported depth/visual must name itself, not
+       SIGSEGV on the first draw (lv_win_surface already told the terminal
+       why when a takeover attempt failed). */
+    if (!ui.smain || !ui.spl) {
+        fprintf(stderr, "levari: no drawable surface on this display — "
+                        "the screen depth/visual is unsupported\n");
+        return -1;
+    }
     if (ui_show_search) search_open(ui.wmain);
 
     Uint32 next = SDL_GetTicks();
@@ -4133,14 +4174,14 @@ int ui_run(Player *p, int show_pl) {
         if (SDL_WaitEventTimeout(&e, wait)) switch (e.type) {
         case SDL_QUIT: running = 0; break;
         case SDL_WINDOWEVENT:
-            if (e.window.windowID == SDL_GetWindowID(ui.wmain)) ui.smain = SDL_GetWindowSurface(ui.wmain);
-            if (e.window.windowID == SDL_GetWindowID(ui.wpl)) ui.spl = SDL_GetWindowSurface(ui.wpl);
-            if (ui.weq && e.window.windowID == SDL_GetWindowID(ui.weq)) ui.seq = SDL_GetWindowSurface(ui.weq);
-            if (ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) ui.sfile = SDL_GetWindowSurface(ui.wfile);
-            if (ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) ui.sopt = SDL_GetWindowSurface(ui.wopt);
-            if (ui.winfo && e.window.windowID == SDL_GetWindowID(ui.winfo)) ui.sinfo = SDL_GetWindowSurface(ui.winfo);
+            if (e.window.windowID == SDL_GetWindowID(ui.wmain)) ui.smain = lv_win_surface(ui.wmain);
+            if (e.window.windowID == SDL_GetWindowID(ui.wpl)) ui.spl = lv_win_surface(ui.wpl);
+            if (ui.weq && e.window.windowID == SDL_GetWindowID(ui.weq)) ui.seq = lv_win_surface(ui.weq);
+            if (ui.wfile && e.window.windowID == SDL_GetWindowID(ui.wfile)) ui.sfile = lv_win_surface(ui.wfile);
+            if (ui.wopt && e.window.windowID == SDL_GetWindowID(ui.wopt)) ui.sopt = lv_win_surface(ui.wopt);
+            if (ui.winfo && e.window.windowID == SDL_GetWindowID(ui.winfo)) ui.sinfo = lv_win_surface(ui.winfo);
 #ifdef LV_URL_ENABLED
-            if (ui.wurl && e.window.windowID == SDL_GetWindowID(ui.wurl)) ui.surl = SDL_GetWindowSurface(ui.wurl);
+            if (ui.wurl && e.window.windowID == SDL_GetWindowID(ui.wurl)) ui.surl = lv_win_surface(ui.wurl);
 #endif
             if (search_window() && e.window.windowID == search_window_id())
                 search_surface_refresh();
@@ -4301,7 +4342,28 @@ int ui_run(Player *p, int show_pl) {
         if (SDL_AtomicGet(&ui.opt_scan_done)) {
             SDL_AtomicSet(&ui.opt_scan_done, 0);
             ui.opt_scanning = 0;
-            if (ui.opt_scan_skipped)
+            if (ui.opt_verifying) {
+                ui.opt_verifying = 0;
+                if (ui.opt_vfy_rc == -3)
+                    lv_strlcpy(ui.opt_status, "index: run a full scan",
+                               sizeof ui.opt_status);
+                else if (ui.opt_vfy_rc != 0)
+                    lv_strlcpy(ui.opt_status, "verify failed (index untouched)",
+                               sizeof ui.opt_status);
+                else if (ui.opt_vfy_purged)
+                    snprintf(ui.opt_status, sizeof ui.opt_status,
+                             "dropped %d (%d kept, %d unreachable)",
+                             ui.opt_vfy_purged, ui.opt_vfy_kept,
+                             ui.opt_vfy_unreach);
+                else if (ui.opt_vfy_unreach)
+                    snprintf(ui.opt_status, sizeof ui.opt_status,
+                             "all %d rows kept (%d unreachable)",
+                             ui.opt_vfy_kept, ui.opt_vfy_unreach);
+                else
+                    lv_strlcpy(ui.opt_status, "all rows verified",
+                               sizeof ui.opt_status);
+            }
+            else if (ui.opt_scan_skipped)
                 snprintf(ui.opt_status, sizeof ui.opt_status,
                          "added %d (%d seen, %d path(s) too long)",
                          ui.opt_scan_added, ui.opt_scan_seen, ui.opt_scan_skipped);
@@ -4313,8 +4375,10 @@ int ui_run(Player *p, int show_pl) {
         }
         /* idle redraw scheduler: repaint only dirty windows, and only on the
            poll tick. 10 Hz while an animation is live (scrolling title,
-           visualizer, drag, scan), else 1 Hz for the position text. An
-           unfocused app sleeps on events, except a live visualizer (the vis
+           drag, scan) — except a live visualizer, which drives the tick at
+           its own cfg.vis_hz rate (10/24/30/60 Hz) — else 1 Hz for the
+           position text. An unfocused app sleeps on events, except a live
+           visualizer (the vis
            band lives in the main window and a watcher wants it moving), a
            1 Hz main-window repaint while playing (no time/position jump on
            refocus), or a one-shot repaint after the WM exposes/shows a
@@ -4410,7 +4474,7 @@ int ui_run(Player *p, int show_pl) {
                readout (scroll_off advances only inside drawn strip passes).
                The always_10FPS toggle and a live visualizer override focus
                (the vis band repaints the strip anyway, so the marquee keeps
-               10 Hz pace with it). */
+               pace with it — at the band's cfg.vis_hz rate). */
             int strip_live = ui.marquee && (playing || f10_live) &&
                              (ui.app_focused || f10_live || vis_live);
             int strip_slow = ui.marquee && playing && !ui.app_focused &&
@@ -4472,9 +4536,12 @@ int ui_run(Player *p, int show_pl) {
                 wake = 0;
             }
 
-            /* vis_live is part of anim, so a live visualizer always ticks at
-               10 Hz whether focused or not. A focused search field redraws on
-               each 500 ms caret boundary (2 Hz, just enough to toggle it).
+            /* vis_live is part of anim, so a live visualizer drives the anim
+               tick at its own cfg.vis_hz rate (10/24/30/60 Hz, default 10 —
+               the vis_frame_ms switch) whether focused or not; every other
+               live animation keeps the 100 ms beat. A focused search field
+               redraws on each 500 ms caret boundary (2 Hz, just enough to
+               toggle it).
                Focused idle polls at 1 Hz for player-thread state changes;
                unfocused but playing polls at 1 Hz so the time readout and
                position slider keep pace instead of jumping on refocus;
@@ -4523,12 +4590,15 @@ int ui_run(Player *p, int show_pl) {
         ui_dump_path = NULL;
     }
     search_shutdown();
-    if (ui.wopt) SDL_DestroyWindow(ui.wopt);
-    if (ui.wfile) SDL_DestroyWindow(ui.wfile);
-    if (ui.winfo) SDL_DestroyWindow(ui.winfo);
+    if (ui.wopt) { lv_win_release(ui.wopt); SDL_DestroyWindow(ui.wopt); }
+    if (ui.wfile) { lv_win_release(ui.wfile); SDL_DestroyWindow(ui.wfile); }
+    if (ui.winfo) { lv_win_release(ui.winfo); SDL_DestroyWindow(ui.winfo); }
 #ifdef LV_URL_ENABLED
-    if (ui.wurl) SDL_DestroyWindow(ui.wurl);
+    if (ui.wurl) { lv_win_release(ui.wurl); SDL_DestroyWindow(ui.wurl); }
 #endif
+    if (ui.weq) lv_win_release(ui.weq);
+    if (ui.wpl) lv_win_release(ui.wpl);
+    if (ui.wmain) lv_win_release(ui.wmain);
     SDL_DestroyWindow(ui.weq);
     SDL_DestroyWindow(ui.wpl);
     SDL_DestroyWindow(ui.wmain);

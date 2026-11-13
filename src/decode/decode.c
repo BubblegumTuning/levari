@@ -555,9 +555,11 @@ Decoder *dec_open(const char *path) {
        modplug/ogg-flac buffer the stream) would happily OOM on a
        multi-gigabyte file. Over LV_LARGE_FILE the open is refused unless
        the user opted in; tag_probe is unaffected (fixed 128KB head). */
+#define LV_LARGE_FILE (256LL << 20)   /* the named cap: keep the ADV-page
+                                         copy ("over 256 MB") in sync */
     if (!cfg.allow_large) {
         struct stat st;
-        if (stat(path, &st) == 0 && (long long)st.st_size > (256LL << 20)) {
+        if (stat(path, &st) == 0 && (long long)st.st_size > LV_LARGE_FILE) {
             fprintf(stderr, "levari: %s is %lld MB, over the 256 MB ingest "
                             "cap (enable LARGE in options > advanced)\n",
                     path, (long long)st.st_size >> 20);

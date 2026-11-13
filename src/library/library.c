@@ -9,6 +9,7 @@
 #include "../compat/win32.h"
 #endif
 #include <dirent.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -34,18 +35,6 @@ void lib_index_path(char *out, size_t n) {
 #endif
     mkdir(base, 0755);
     snprintf(out, n, "%s/index", base);
-}
-
-static int is_audio(const char *name) {
-    const char *e = strrchr(name, '.');
-    if (!e) return 0;
-    return !lv_strcasecmp(e, ".mp3") || !lv_strcasecmp(e, ".ogg") ||
-           !lv_strcasecmp(e, ".oga") || !lv_strcasecmp(e, ".opus") ||
-           !lv_strcasecmp(e, ".flac") || !lv_strcasecmp(e, ".wav") ||
-           !lv_strcasecmp(e, ".aac") || !lv_strcasecmp(e, ".m4a") ||
-           !lv_strcasecmp(e, ".wma") || !lv_strcasecmp(e, ".mod") ||
-           !lv_strcasecmp(e, ".s3m") || !lv_strcasecmp(e, ".xm") ||
-           !lv_strcasecmp(e, ".it") || !lv_strcasecmp(e, ".spc");
 }
 
 typedef struct {
@@ -270,7 +259,7 @@ static void scan_dir(const char *dir, ScanCtx *c) {
                 (attr & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
 #endif
             scan_dir(full, c);
-        } else if (is_audio(de->d_name)) {
+        } else if (lv_is_audio(de->d_name)) {
             /* the index row stores the escaped path (up to 2x): a path
                near LV_MAX_PATH full of backslashes produces a row longer
                than the readers' line buffer, which then splits mid-row.
@@ -296,7 +285,7 @@ static void scan_dir(const char *dir, ScanCtx *c) {
                            a total whose seconds exceed INT_MAX, and the
                            old direct cast was implementation-defined */
                         long long s = tot > 0 ? tot / dec_rate(dec) : 0;
-                        if (s > 0 && s <= LV_DUR_MAX) dur = (int)s;
+                        dur = lv_clamp_dur(s);
                         dec_close(dec);
                     }
                 }
@@ -315,14 +304,6 @@ static void scan_dir(const char *dir, ScanCtx *c) {
         }
     }
     closedir(d);
-}
-
-static int contains_ci(const char *hay, const char *needle) {
-    size_t nl = strlen(needle);
-    if (!nl) return 1;
-    for (const char *p = hay; *p; p++)
-        if (!lv_strncasecmp(p, needle, nl)) return 1;
-    return 0;
 }
 
 static int cmd_scan(const char *dir, FILE *out) {
@@ -442,13 +423,13 @@ LibIndex lib_index_load(void) {
             if (p6) {
                 *p6++ = 0;
                 int d5 = atoi(p5);
-                dur = (d5 > 0 && d5 <= LV_DUR_MAX) ? d5 : 0;  /* clamp the number, NEVER drop the row */
+                dur = lv_clamp_dur(d5);  /* clamp the number, NEVER drop the row */
                 char *p7 = strchr(p6, '\t');
                 if (p7) { *p7++ = 0; track = atoi(p6); notag = atoi(p7); }
                 else track = atoi(p6);
             } else {
                 int d5 = atoi(p5);
-                dur = (d5 > 0 && d5 <= LV_DUR_MAX) ? d5 : 0;  /* clamp the number, NEVER drop the row */
+                dur = lv_clamp_dur(d5);  /* clamp the number, NEVER drop the row */
             }
         }
         if (!p1[0]) continue;
@@ -541,7 +522,7 @@ static int row_dur(const char *line) {
     /* same LV_DUR_MAX clamp as lib_index_load: this is the index's second
        reader (rescan fallback when the probe goes blind) and its value
        lands straight in Track.duration via out_dur */
-    return (d > 0 && d <= LV_DUR_MAX) ? d : 0;
+    return lv_clamp_dur(d);
 }
 
 int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
@@ -652,6 +633,138 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
     return 0;
 }
 
+int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
+                     char *bank_out, size_t bank_n) {
+    if (bank_out && bank_n) bank_out[0] = 0;
+    char idx[LV_MAX_PATH];
+    lib_index_path(idx, sizeof idx);
+    struct stat ist;
+    if (stat(idx, &ist) != 0) {        /* no index yet: vacuously verified */
+        if (out_kept) *out_kept = 0;
+        if (out_purged) *out_purged = 0;
+        if (out_unreach) *out_unreach = 0;
+        return 0;
+    }
+    if (idx_migrate(idx, 1) == -2) return -3; /* same refuse rule as rescan */
+
+    char line[2 * LV_MAX_PATH + 1024]; /* house row budget */
+    char *hdr = NULL;
+    char **keep = NULL;                 /* kept rows verbatim */
+    char **drop = NULL;                 /* banked rows verbatim */
+    int kn = 0, kc = 0, dn = 0, dc = 0, unreach = 0, oversize = 0;
+    int oom = 0, bad = 0;
+    FILE *r = fopen(idx, "r");
+    if (!r) return -2;
+    if (lib_idx_getline(r, line, sizeof line) == 1 &&
+        !strncmp(line, "#levari-index", 13))
+        hdr = strdup(line);            /* creation marker preserved verbatim */
+    else {
+        fclose(r);                     /* post-migrate this cannot happen;
+                                          refuse rather than reinterpret */
+        free(hdr);
+        return -3;
+    }
+    int gr;
+    while ((gr = lib_idx_getline(r, line, sizeof line)) != 0) {
+        if (gr == 2) { oversize++; continue; } /* same rule as the reload
+                                                  reader: skip the row */
+        /* field 1 (escaped path) -> unescape into a SEPARATE buffer
+           (house rule: unescape shortens in place; never re-join after) */
+        char esc[2 * LV_MAX_PATH], path[2 * LV_MAX_PATH];
+        size_t tl = strcspn(line, "\t");
+        if (tl >= sizeof esc) tl = sizeof esc - 1;
+        memcpy(esc, line, tl);
+        esc[tl] = 0;
+        unesc_field(path, sizeof path, esc, tl);
+        struct stat st;
+        int gone, err;
+        if (stat(path, &st) == 0) { gone = !S_ISREG(st.st_mode); err = gone; }
+        else { err = errno; gone = (err == ENOENT || err == ENOTDIR); }
+        /* gone is the WHOLE decision: ENOENT/ENOTDIR (or a path that is
+           no longer a regular file) drop; every other stat failure is
+           "cannot ask" — kept and counted as unreachable */
+        char ***arr; int *np, *cp;
+        if (gone) { arr = &drop; np = &dn; cp = &dc; }
+        else {
+            arr = &keep; np = &kn; cp = &kc;
+            if (err) unreach++;
+        }
+        if (*np == *cp) {
+            int nc = *cp ? *cp * 2 : 256;
+            char **p2 = realloc(*arr, (size_t)nc * sizeof *p2);
+            if (!p2) { oom = 1; break; }
+            *arr = p2; *cp = nc;
+        }
+        char *dup = strdup(line);
+        if (!dup) { oom = 1; break; }
+        (*arr)[(*np)++] = dup;
+    }
+    fclose(r);
+    if (oom) {
+        for (int i = 0; i < kn; i++) free(keep[i]);
+        for (int i = 0; i < dn; i++) free(drop[i]);
+        free(keep); free(drop); free(hdr);
+        return -2;
+    }
+    int kept = kn + oversize, purged = dn;
+    if (purged == 0) {                 /* nothing to do: index untouched */
+        for (int i = 0; i < kn; i++) free(keep[i]);
+        free(keep); free(drop); free(hdr);
+        if (out_kept) *out_kept = kept;
+        if (out_purged) *out_purged = 0;
+        if (out_unreach) *out_unreach = unreach;
+        return 0;
+    }
+    /* bank FIRST (crash between bank and rewrite loses nothing: the live
+       index is still intact), then rewrite atomically (tmp+rename, the
+       rescan/cfg_save mingw retry) */
+    char bank[LV_MAX_PATH + 16];
+    snprintf(bank, sizeof bank, "%s.dropped", idx);
+    FILE *b = fopen(bank, "w");
+    if (!b) {
+        for (int i = 0; i < kn; i++) free(keep[i]);
+        for (int i = 0; i < dn; i++) free(drop[i]);
+        free(keep); free(drop); free(hdr);
+        return -2;
+    }
+    for (int i = 0; i < dn; i++) fputs(drop[i], b);
+    if (fflush(b) || ferror(b)) bad = 1;
+    if (fclose(b) != 0) bad = 1;
+    if (bad) {
+        remove(bank);
+        for (int i = 0; i < kn; i++) free(keep[i]);
+        for (int i = 0; i < dn; i++) free(drop[i]);
+        free(keep); free(drop); free(hdr);
+        return -2;
+    }
+    char tmp[LV_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", idx);
+    FILE *w = fopen(tmp, "w");
+    if (!w) {
+        for (int i = 0; i < kn; i++) free(keep[i]);
+        for (int i = 0; i < dn; i++) free(drop[i]);
+        free(keep); free(drop); free(hdr);
+        return -2;
+    }
+    fputs(hdr, w);
+    for (int i = 0; i < kn; i++) fputs(keep[i], w);
+    int wbad = (fflush(w) != 0 || ferror(w));
+    if (fclose(w) != 0) wbad = 1;
+    if (!wbad && rename(tmp, idx) != 0) {
+        remove(idx);
+        if (rename(tmp, idx) != 0) { remove(tmp); wbad = 1; }
+    }
+    for (int i = 0; i < kn; i++) free(keep[i]);
+    for (int i = 0; i < dn; i++) free(drop[i]);
+    free(keep); free(drop); free(hdr);
+    if (wbad) return -2;
+    if (bank_out && bank_n) lv_strlcpy(bank_out, bank, bank_n);
+    if (out_kept) *out_kept = kept;
+    if (out_purged) *out_purged = purged;
+    if (out_unreach) *out_unreach = unreach;
+    return 0;
+}
+
 /* ---- urlIndex: one row = the last working URL (D5). Lives beside the
    library index — derive the directory from lib_index_path (whose
    branches both mkdir their base, so the folder exists after the call) */
@@ -721,7 +834,7 @@ static int cmd_list(const char *filter, FILE *out) {
     int gr;
     while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
         if (gr == 2) continue; /* over-long row: already drained */
-        if (filter && !contains_ci(line, filter)) continue;
+        if (filter && !lv_stristr(line, filter)) continue;
         /* display the real path, not the escaped field */
         char *tab = strchr(line, '\t');
         if (v2 && tab) {
@@ -753,7 +866,7 @@ static int cmd_play(const char *query, FILE *out) {
         if (gr == 2) continue; /* over-long row: already drained */
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
-        if (query && *query && !contains_ci(line, query)) continue;
+        if (query && *query && !lv_stristr(line, query)) continue;
         char *tab = strchr(line, '\t');
         if (tab) *tab = 0;
         if (v2) { size_t sl = strlen(line); unesc_field(line, sl + 1, line, sl); } /* queue real paths */
@@ -772,7 +885,7 @@ static int cmd_play(const char *query, FILE *out) {
 }
 
 int lib_run(const char *sub, const char *arg, FILE *out) {
-    if (!sub || !*sub) { fprintf(out, "usage: levari library scan|list|play [arg]\n"); return 1; }
+    if (!sub || !*sub) { fprintf(out, "usage: levari library scan|list|play|verify [arg]\n"); return 1; }
     if (!strcmp(sub, "scan")) {
         if (arg && *arg) return cmd_scan(arg, out);
         if (cfg.lib_dir_n) {
@@ -784,11 +897,23 @@ int lib_run(const char *sub, const char *arg, FILE *out) {
     }
     if (!strcmp(sub, "list")) return cmd_list(arg, out);
     if (!strcmp(sub, "play")) return cmd_play(arg, out);
-    fprintf(out, "usage: levari library scan [dir] | list [filter] | play [query]\n");
+    if (!strcmp(sub, "verify") && !arg) {
+        int kept = 0, purged = 0, unreach = 0;
+        char bank[LV_MAX_PATH] = "";
+        int rc = lib_index_verify(&kept, &purged, &unreach, bank, sizeof bank);
+        if (rc == -3) { fprintf(out, "levari: index pre-v2 and ambiguous: run a full scan\n"); return 1; }
+        if (rc != 0) { fprintf(out, "levari: verify failed (index untouched)\n"); return 1; }
+        fprintf(out, "verify: kept %d, dropped %d, unreachable kept %d",
+                kept, purged, unreach);
+        if (purged && bank[0]) fprintf(out, " (banked in %s)", bank);
+        fprintf(out, "\n");
+        return 0;
+    }
+    fprintf(out, "usage: levari library scan [dir] | list [filter] | play [query] | verify\n");
     return 1;
 }
 
 int lib_cmd(int argc, char **argv) {
-    if (argc < 2) { printf("usage: levari library scan|list|play [arg]\n"); return 1; }
+    if (argc < 2) { printf("usage: levari library scan|list|play|verify [arg]\n"); return 1; }
     return lib_run(argv[1], argc > 2 ? argv[2] : NULL, stdout);
 }

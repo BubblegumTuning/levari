@@ -36,7 +36,6 @@ void skin_draw_main_bg(SDL_Surface *s);
 void skin_draw_pl_bg(SDL_Surface *s, int w, int h, const Rect *text, const Rect *scroll);
 void skin_button(SDL_Surface *s, const Rect *r, int pressed, int active);
 void skin_slider(SDL_Surface *s, const Rect *track, int knob_x, int knob_w);
-void skin_knob(SDL_Surface *s, int x, int y, int w, int h);
 void skin_window_bg(SDL_Surface *s, int w, int h);
 void skin_vslider(SDL_Surface *s, int x, int y, int h, int knob_y);
 
@@ -45,9 +44,7 @@ void font_puts(SDL_Surface *s, int x, int y, const char *str, Uint32 color);
 int  font_w(const char *str);
 /* UTF-8 aware: CJK codepoints render as 16x16 JIS X 0208 glyphs */
 void font_puts16(SDL_Surface *s, int x, int y, const char *str, Uint32 color);
-void font_putcp16(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color);
 void font_putcp16_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, int cx0, int cx1);
-int  font_cp_w(unsigned cp);
 int  font_cp_w16(unsigned cp);
 int  font_w16(const char *str);
 int  font_utf8_next(const char *s, unsigned *cp);

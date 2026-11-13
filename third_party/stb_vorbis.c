@@ -3582,6 +3582,10 @@ static int start_decoder(vorb *f)
    uint8 header[6], x,y;
    int len,i,j,k, max_submaps = 0;
    int longest_floorlist=0;
+   // LEVARI PATCH (SIXTH hunk; upstream master identical, unfixed as of
+   // 2026-11-13): running allocation budget for the comment section — see
+   // the vendor site below.
+   size_t cmt_budget = 64u * 1024 * 1024;
 
    // first page, first packet
    f->first_decode = TRUE;
@@ -3650,6 +3654,18 @@ static int start_decoder(vorb *f)
    if (!vorbis_validate(header))                    return error(f, VORBIS_invalid_setup);
    //file vendor
    len = get32_packet(f);
+   // LEVARI PATCH (SIXTH hunk; upstream master identical, unfixed as of
+   // 2026-11-13): the vendor/comment lengths and the comment count are raw
+   // get32 values trusted for allocation BEFORE any data is read — a
+   // crafted 357-byte Ogg drove single mallocs of 1.6-2.1 GB at this line,
+   // at the comment_list line, and at the per-comment line (night fuzz
+   // 2026-11-12: ten oom-* artifacts, one signature). Reject absurd
+   // declared sizes against the section budget instead of allocating them:
+   // a real Vorbis comment section — embedded cover art included — stays
+   // far below 64 MB. Negative declared lengths (get32 top bit set, int
+   // wrap — previously turned into zero-size allocations) are rejected too.
+   if (len < 0 || (size_t) len + 1 > cmt_budget)     return error(f, VORBIS_invalid_setup);
+   cmt_budget -= (size_t) len + 1;
    f->vendor = (char*)setup_malloc(f, sizeof(char) * (len+1));
    if (f->vendor == NULL)                           return error(f, VORBIS_outofmem);
    for(i=0; i < len; ++i) {
@@ -3658,17 +3674,33 @@ static int start_decoder(vorb *f)
    f->vendor[len] = (char)'\0';
    //user comments
    f->comment_list_length = get32_packet(f);
+   // LEVARI PATCH (see vendor hunk above): bound the pointer table by the
+   // remaining budget (this also closes the sizeof(char*)*count int-wrap
+   // through setup_malloc's int sz parameter for huge counts).
+   if (f->comment_list_length < 0 || (size_t) f->comment_list_length > cmt_budget / sizeof(char*))
+                                                    return error(f, VORBIS_invalid_setup);
    f->comment_list = NULL;
    if (f->comment_list_length > 0)
    {
       f->comment_list = (char**) setup_malloc(f, sizeof(char*) * (f->comment_list_length));
       if (f->comment_list == NULL)                  return error(f, VORBIS_outofmem);
+      cmt_budget -= (size_t) f->comment_list_length * sizeof(char*);
    }
 
    for(i=0; i < f->comment_list_length; ++i) {
       len = get32_packet(f);
+      // LEVARI PATCH (see vendor hunk above): truncate like the FOURTH
+      // hunk does — entries >= i are uninitialized and vorbis_deinit
+      // must not reach them.
+      if (len < 0 || (size_t) len + 1 > cmt_budget) { f->comment_list_length = i; return error(f, VORBIS_invalid_setup); }
+      cmt_budget -= (size_t) len + 1;
       f->comment_list[i] = (char*)setup_malloc(f, sizeof(char) * (len+1));
-      if (f->comment_list[i] == NULL)               return error(f, VORBIS_outofmem);
+      // LEVARI PATCH (FOURTH hunk; upstream master identical, unfixed
+      // 2026-11-12): truncate comment_list_length to the entries actually
+      // allocated — setup_malloc does not zero, so entries > i are
+      // uninitialized and vorbis_deinit would free garbage (wild-free,
+      // release-verified). Remove marker if upstream ever fixes this.
+      if (f->comment_list[i] == NULL) { f->comment_list_length = i; return error(f, VORBIS_outofmem); }
 
       for(j=0; j < len; ++j) {
          f->comment_list[i][j] = get8_packet(f);
@@ -3779,7 +3811,16 @@ static int start_decoder(vorb *f)
             f->setup_temp_memory_required = c->entries;
 
          c->codeword_lengths = (uint8 *) setup_malloc(f, c->entries);
-         if (c->codeword_lengths == NULL) return error(f, VORBIS_outofmem);
+         // LEVARI PATCH (extends the 2026-10-28 leak fix in this hunk
+         // family; upstream master identical, unfixed 2026-11-12): these
+         // sparse-mode outofmem returns leak the 'lengths' temp
+         // (setup_temp_malloc at the sparse alloc site is a local var
+         // vorbis_deinit never sees). Do NOT temp-free the c->codewords /
+         // c->sorted_* struct fields here — deinit frees them
+         // (double-free trap, see the 2026-10-28 hunk below). The c->sparse
+         // guard is required: past a successful conversion lengths IS
+         // c->codeword_lengths. Remove markers if upstream ever fixes this.
+         if (c->codeword_lengths == NULL) { if (c->sparse) { setup_temp_free(f, lengths, c->entries); } return error(f, VORBIS_outofmem); }
          memcpy(c->codeword_lengths, lengths, c->entries);
          setup_temp_free(f, lengths, c->entries); // note this is only safe if there have been no intervening temp mallocs!
          lengths = c->codeword_lengths;
@@ -3808,12 +3849,15 @@ static int start_decoder(vorb *f)
       } else {
          unsigned int size;
          if (c->sorted_entries) {
+            // LEVARI PATCH: sparse 'lengths' leak — see cluster comment above.
             c->codeword_lengths = (uint8 *) setup_malloc(f, c->sorted_entries);
-            if (!c->codeword_lengths)           return error(f, VORBIS_outofmem);
+            if (!c->codeword_lengths)           { if (c->sparse) { setup_temp_free(f, lengths, c->entries); } return error(f, VORBIS_outofmem); }
+            // LEVARI PATCH: sparse 'lengths' leak — see cluster comment above.
             c->codewords = (uint32 *) setup_temp_malloc(f, sizeof(*c->codewords) * c->sorted_entries);
-            if (!c->codewords)                  return error(f, VORBIS_outofmem);
+            if (!c->codewords)                  { if (c->sparse) { setup_temp_free(f, lengths, c->entries); } return error(f, VORBIS_outofmem); }
+            // LEVARI PATCH: sparse 'lengths' leak — see cluster comment above.
             values = (uint32 *) setup_temp_malloc(f, sizeof(*values) * c->sorted_entries);
-            if (!values)                        return error(f, VORBIS_outofmem);
+            if (!values)                        { if (c->sparse) { setup_temp_free(f, lengths, c->entries); } return error(f, VORBIS_outofmem); }
          }
          size = c->entries + (sizeof(*c->codewords) + sizeof(*values)) * c->sorted_entries;
          if (size > f->setup_temp_memory_required)
@@ -3830,12 +3874,15 @@ static int start_decoder(vorb *f)
 
       if (c->sorted_entries) {
          // allocate an extra slot for sentinels
+         // LEVARI PATCH: sparse 'lengths' leak — see cluster comment above
+         // (guard needed: past a successful conversion lengths is a struct field).
          c->sorted_codewords = (uint32 *) setup_malloc(f, sizeof(*c->sorted_codewords) * (c->sorted_entries+1));
-         if (c->sorted_codewords == NULL) return error(f, VORBIS_outofmem);
+         if (c->sorted_codewords == NULL) { if (c->sparse) { setup_temp_free(f, lengths, c->entries); } return error(f, VORBIS_outofmem); }
          // allocate an extra slot at the front so that c->sorted_values[-1] is defined
          // so that we can catch that case without an extra if
+         // LEVARI PATCH: sparse 'lengths' leak — see cluster comment above.
          c->sorted_values    = ( int   *) setup_malloc(f, sizeof(*c->sorted_values   ) * (c->sorted_entries+1));
-         if (c->sorted_values == NULL) return error(f, VORBIS_outofmem);
+         if (c->sorted_values == NULL) { if (c->sparse) { setup_temp_free(f, lengths, c->entries); } return error(f, VORBIS_outofmem); }
          ++c->sorted_values;
          c->sorted_values[-1] = -1;
          compute_sorted_huffman(c, lengths, values);
@@ -4217,8 +4264,16 @@ static void vorbis_deinit(stb_vorbis *p)
    int i,j;
 
    setup_free(p, p->vendor);
-   for (i=0; i < p->comment_list_length; ++i) {
-      setup_free(p, p->comment_list[i]);
+   // LEVARI PATCH (FIFTH hunk; upstream master identical, unfixed
+   // 2026-11-12): a crafted comment_list_length can make the list
+   // setup_malloc fail (sizeof(char*)*len truncated through the int sz
+   // parameter -> 0 at len=0x20000000); the outofmem return left
+   // comment_list NULL and this loop SEGVs at address 0. Remove marker
+   // if upstream ever fixes this.
+   if (p->comment_list) {
+      for (i=0; i < p->comment_list_length; ++i) {
+         setup_free(p, p->comment_list[i]);
+      }
    }
    setup_free(p, p->comment_list);
 

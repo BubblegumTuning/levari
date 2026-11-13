@@ -33,18 +33,6 @@ static int ensure(Playlist *p, int need) {
     return 0;
 }
 
-static int audio_ext(const char *name) {
-    const char *e = strrchr(name, '.');
-    if (!e) return 0;
-    return !lv_strcasecmp(e, ".mp3") || !lv_strcasecmp(e, ".ogg") ||
-           !lv_strcasecmp(e, ".oga") || !lv_strcasecmp(e, ".opus") ||
-           !lv_strcasecmp(e, ".flac") || !lv_strcasecmp(e, ".wav") ||
-           !lv_strcasecmp(e, ".aac") || !lv_strcasecmp(e, ".m4a") ||
-           !lv_strcasecmp(e, ".wma") || !lv_strcasecmp(e, ".mod") ||
-           !lv_strcasecmp(e, ".s3m") || !lv_strcasecmp(e, ".xm") ||
-           !lv_strcasecmp(e, ".it") || !lv_strcasecmp(e, ".spc");
-}
-
 static int cmpstr(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
@@ -82,7 +70,7 @@ static void pl_add_dir(Playlist *p, const char *dir) {
 #endif
         if (lstat(full, &st) == 0 && S_ISDIR(st.st_mode))
             pl_add_dir(p, full);
-        else if (audio_ext(names[i]))
+        else if (lv_is_audio(names[i]))
             pl_add_file(p, full);
         free(names[i]);
     }
@@ -178,7 +166,7 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
             /* EXTINF is raw attacker-writable: a value past the hazard
                ceiling means unknown, exactly like a missing field */
             int d = atoi(s + 8);
-            pending_dur = (d > 0 && d <= LV_DUR_MAX) ? d : 0;
+            pending_dur = lv_clamp_dur(d);
             continue;
         }
         if (*s == '#') continue;
@@ -303,7 +291,7 @@ int pl_load_pls(Playlist *p, const char *pls) {
         } else {
             int d = atoi(eq);   /* LengthN -1 = unknown -> 0, and any
                                    value past the hazard ceiling too */
-            ent[at].dur = (d > 0 && d <= LV_DUR_MAX) ? d : 0;
+            ent[at].dur = lv_clamp_dur(d);
         }
     }
     fclose(f);
@@ -426,7 +414,11 @@ int pl_load_cue(Playlist *p, const char *cue) {
            Leave it unknown so the player fills it from the file length. */
         if (t->end_sec > t->start_sec) {
             double d = t->end_sec - t->start_sec + 0.5;
-            if (d > 0 && d <= LV_DUR_MAX) t->duration = (int)d;
+            /* lv_clamp_dur takes the integral seconds (the double floor's
+               at most one second off at the 24h edge); keep-semantics on
+               out-of-range preserved: 0 means leave the row as it is */
+            int c = lv_clamp_dur((long long)d);
+            if (c) t->duration = c;
         }
     }
     return 0;

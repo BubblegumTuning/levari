@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
     mpris_start(&player);
     if (playlist.count > 0) pl_post(&player, CMD_PLAY, 0);
     if (selftest > 0) ui_deadline_ms = (unsigned)(selftest * 1000);
-    ui_run(&player, show_pl);
+    int ui_rc = ui_run(&player, show_pl);
     mpris_stop();
     srv_stop();
     printf("selftest: cur=%d state=%d pos=%lld/%lld rate=%d\n",
@@ -132,5 +132,11 @@ int main(int argc, char **argv) {
     pl_player_stop(&player);
     if (save_to) pl_save_m3u(&playlist, save_to);
     pl_clear(&playlist);
-    return 0;
+    /* ui_run's -1 means video is dead (SDL_Init, window creation, or an
+       unsupported depth/visual): the player ran but CANNOT display, so a
+       zero exit would claim success (this exact swallow kept a dlopen-
+       dead musl artifact green through every headless gate while it
+       drew to a dummy-driver offscreen surface). Propagate; the
+       selftest line above stays printed as the diagnostic. */
+    return ui_rc < 0 ? 1 : 0;
 }

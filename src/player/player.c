@@ -56,14 +56,16 @@ static void close_dec(Player *p) {
     p->pos_frames = 0;
 }
 
-static void load_track_locked(Player *p, int idx) {
+static void load_track_locked(Player *p, int idx, int report) {
     Playlist *pl = p->pl;
     if (idx < 0 || idx >= pl->count) { close_dec(p); p->state = ST_STOP; return; }
     close_dec(p);
     p->ab_a = p->ab_b = -1;
     Decoder *d = dec_open(pl->items[idx].path);
     if (!d) {
-        fprintf(stderr, "levari: cannot decode %s\n", pl->items[idx].path);
+        /* report=0 only inside load_track_alive's walk, where a dead row
+           is a fact of life, not an error to print once per row */
+        if (report) fprintf(stderr, "levari: cannot decode %s\n", pl->items[idx].path);
         p->state = ST_STOP;
         return;
     }
@@ -108,12 +110,15 @@ static void load_track_locked(Player *p, int idx) {
                                               frame total is decoder data,
                                               and an absurd one must not
                                               smuggle a wrapped int here */
-            if (s > 0 && s <= LV_DUR_MAX) t->duration = (int)s;
+            t->duration = lv_clamp_dur(s);  /* the backfill only runs when
+                                               duration was 0, so an
+                                               out-of-range s keeps 0 =
+                                               unknown exactly as before */
         }
     }
 }
 
-static void load_track(Player *p, int idx) {
+static void load_track(Player *p, int idx, int report) {
     /* tag_read is file I/O (128 KB head read, slow on network shares) and
        the UI draw path blocks on p->mtx every frame: probe the tags BEFORE
        taking the lock, then write them back under it only if the row is
@@ -137,8 +142,34 @@ static void load_track(Player *p, int idx) {
         !strcmp(p->pl->items[idx].path, path) &&
         !p->pl->items[idx].tags.title[0])
         p->pl->items[idx].tags = tags;
-    load_track_locked(p, idx);
+    load_track_locked(p, idx, report);
     pthread_mutex_unlock(&p->mtx);
+}
+
+/* dead-row recovery: a row that fails to decode (orphaned library
+   index after a NAS path change) must not end the session. From the
+   picked row keep loading forward until one succeeds — with shuffle
+   or repeat on, forward wraps (those modes already mean "go on");
+   sequential stops at the list end exactly like pick_next's -1, so a
+   dead tail can never spin playback past the designed stop. The walk
+   is bounded by the rows it attempts even when EVERY row is dead (no
+   spin). Only the first attempt reports, so a walk over many dead
+   rows prints one named failure, not a wall. Shuffle SELECTION is
+   untouched: skipping is recovery, not selection. */
+static void load_track_alive(Player *p, int start) {
+    pthread_mutex_lock(&p->mtx);
+    int n = p->pl->count;
+    int wrap = p->shuffle || p->repeat;
+    pthread_mutex_unlock(&p->mtx);
+    if (start < 0) start = 0;
+    int tries = wrap ? n : (start < n ? n - start : 0);
+    for (int k = 0; k < tries; k++) {
+        load_track(p, (start + k) % n, k == 0);
+        if (p->state == ST_PLAY) return;
+    }
+    if (!tries) { load_track(p, start, 1); return; } /* index vanished mid-flight */
+    if (tries > 1)
+        fprintf(stderr, "levari: no playable track in %d rows tried\n", tries);
 }
 
 static void hard_stop(Player *p) {
@@ -200,12 +231,12 @@ static void *player_thread(void *arg) {
             if (cmd != CMD_STOP) p->fading = 0;
             switch (cmd) {
             case CMD_PLAY:
-                load_track(p, cmd_arg);
+                load_track_alive(p, cmd_arg);
                 break;
             case CMD_TOGGLE_PAUSE:
                 if (p->state == ST_PLAY) { p->state = ST_PAUSE; ao_pause(); }
                 else if (p->state == ST_PAUSE) { p->state = ST_PLAY; ao_resume(); }
-                else if (p->pl->count) load_track(p, p->cur >= 0 ? p->cur : 0);
+                else if (p->pl->count) load_track_alive(p, p->cur >= 0 ? p->cur : 0);
                 break;
             case CMD_STOP:
                 /* second stop while fading, or fade off/paused: stop at once */
@@ -227,12 +258,12 @@ static void *player_thread(void *arg) {
                 break;
             case CMD_NEXT: {
                 int n = pick_next(p, p->cur);
-                if (n >= 0) load_track(p, n);
+                if (n >= 0) load_track_alive(p, n);
                 break;
             }
             case CMD_PREV: {
                 int n = pick_prev(p, p->cur < 0 ? 0 : p->cur);
-                if (n >= 0) load_track(p, n);
+                if (n >= 0) load_track_alive(p, n);
                 break;
             }
             case CMD_SPEED:
@@ -320,7 +351,7 @@ static void *player_thread(void *arg) {
                     continue;
                 }
                 int n = pick_next(p, p->cur);
-                if (n >= 0) { load_track(p, n); continue; }
+                if (n >= 0) { load_track_alive(p, n); continue; }
                 hard_stop(p);
                 continue;
             }

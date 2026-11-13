@@ -1489,7 +1489,7 @@ static int mp3_head_duration(const unsigned char *b, size_t n, size_t off,
            ceiling, else the row reports unknown instead of a value in
            decades (a sparse or crafted file reaches here at 8 kbps) */
         long long cd = audbytes * 8 / bitrate;
-        return (cd > 0 && cd <= LV_DUR_MAX) ? (int)cd : 0;
+        return lv_clamp_dur(cd);
     }
     return 0;
 }

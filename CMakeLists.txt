@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.6 LANGUAGES C)
+project(levari VERSION 0.3.7 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -25,6 +25,10 @@ add_compile_definitions(_FILE_OFFSET_BITS=64)
 # is directory-scoped, exactly where the tier compiles inherit. Default
 # keeps streaming on; release.sh ships only the default.
 option(LV_STREAMING "build network streaming (URL playback)" ON)
+option(LV_WIN9X "win98 era floor guards: no post-9x kernel32/advapi32 imports (Win98-branch pipeline only; NEVER set on flagship win builds)" OFF)
+if(LV_WIN9X)
+    add_compile_definitions(LV_WIN9X)
+endif()
 if(LV_STREAMING)
     add_compile_definitions(LV_URL_ENABLED=1)
 endif()
@@ -185,6 +189,7 @@ set(LEVARI_SRC
     src/ui/ui.c
     src/ui/textedit.c
     src/ui/search.c
+    src/ui/x8bit.c
     src/skin/skin.c
     src/skin/cjk_font.c
     src/decode/decode.c
@@ -206,6 +211,19 @@ if(LEVAR_TIERS)
 endif()
 add_executable(levari ${LEVARI_SRC})
 
+# 8-bit PseudoColor/GrayScale presentation path (src/ui/x8bit.c): needs
+# X11 headers at COMPILE time only — Xlib is dlopen'd at runtime, so the
+# legacy artifact's zero-link-time-X11 shape survives. Absent headers just
+# disable the takeover (the Tier-0 guard in ui.c names the cause instead
+# of crashing).
+if(UNIX AND NOT APPLE)
+    include(CheckIncludeFile)
+    check_include_file(X11/Xlib.h HAVE_X11_XLIB_H)
+    if(HAVE_X11_XLIB_H)
+        target_compile_definitions(levari PRIVATE LV_X8BIT)
+    endif()
+endif()
+
 # LV_PROFILE=ON embeds the main-window draw-path instrument (per-producer
 # tick counts, dirty-rect px totals, per-stage microseconds printed to
 # stderr at exit — the standing measurement tool for low-floor CPU claims;
@@ -215,12 +233,38 @@ if(LV_PROFILE)
     target_compile_definitions(levari PRIVATE LV_PROFILE)
 endif()
 
+# Shared hardening/optimization flags, identical for BOTH executables
+# (levari, levari-mcp) — the two copies were verbatim except that the
+# levari WIN32 link also carried -mwindows. That one stays with the GUI
+# target alone (see its explicit target_link_options): levari-mcp is a
+# stdio server and must never grow a GUI subsystem.
+function(lv_harden tgt)
+    if(WIN32)
+        target_compile_options(${tgt} PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
+        target_link_options(${tgt} PRIVATE -Wl,--gc-sections)
+    elseif(APPLE)
+        target_compile_options(${tgt} PRIVATE -Os -flto -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
+        target_link_options(${tgt} PRIVATE -flto -Wl,-dead_strip)
+    else()
+        # hardening: PIE (ASLR for the image), stack canaries, full RELRO
+        # (-z now makes the GOT read-only), FORTIFY source-level buffer checks
+        target_compile_options(${tgt} PRIVATE -Os -flto -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter)
+        target_link_options(${tgt} PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
+    endif()
+endfunction()
+
 if(WIN32)
     # link the SDL2 import lib directly rather than the SDL2::SDL2 target
     # (which injects -mwindows via CMake interface; we set it explicitly
     # below so the intent is visible: GUI subsystem, no console window on
     # double-click; CLI verbs re-attach to the parent console in main.c).
     target_compile_definitions(levari PRIVATE SDL_MAIN_HANDLED MODPLUG_BUILD)
+    if(LV_WIN9X)
+        # import interposition: era-safe definitions for the post-9x
+        # thunks era SDL + winpthreads objects reference at link time
+        # (see the file header for why the import archive never wins)
+        target_sources(levari PRIVATE tools/win98_shim.c)
+    endif()
     target_include_directories(levari PRIVATE src third_party ${SDL2_INCLUDE_DIRS})
     # static SDL2: single self-contained exe, no SDL2.dll needed
     target_link_libraries(levari "${SDL2_LIBDIR}/libSDL2.a"
@@ -246,21 +290,14 @@ if(APPLE)
         MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/assets/Info.plist.in")
 endif()
+lv_harden(levari)
 if(WIN32)
-    target_compile_options(levari PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
-    # -mwindows: GUI subsystem (no console on double-click). No -Wl,-s:
-    # stripped exes trip heuristic AV scans (Behavior:Win32/DefenseEvasion)
-    # and the symbol table costs little here.
-    # MinGW-w64 links PE executables DYNAMICBASE (ASLR) by default.
-    target_link_options(levari PRIVATE -Wl,--gc-sections -mwindows)
-elseif(APPLE)
-    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
-    target_link_options(levari PRIVATE -flto -Wl,-dead_strip)
-else()
-    # hardening: PIE (ASLR for the image), stack canaries, full RELRO
-    # (-z now makes the GOT read-only), FORTIFY source-level buffer checks
-    target_compile_options(levari PRIVATE -Os -flto -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter)
-    target_link_options(levari PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
+    # -mwindows: GUI subsystem (no console on double-click). GUI target
+    # ONLY — lv_harden gives levari-mcp the same flags without it.
+    # No -Wl,-s: stripped exes trip heuristic AV scans
+    # (Behavior:Win32/DefenseEvasion) and the symbol table costs little
+    # here. MinGW-w64 links PE executables DYNAMICBASE (ASLR) by default.
+    target_link_options(levari PRIVATE -mwindows)
 endif()
 
 # CPU tuning for ARM boards: -DLV_TUNE=arm1176jzf-s (Pi Zero 1 / Pi 1),
@@ -453,16 +490,7 @@ if(ENABLE_MCP)
     else()
         target_link_libraries(levari-mcp modplug snes_spc dl pthread m)
     endif()
-    if(WIN32)
-        target_compile_options(levari-mcp PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
-        target_link_options(levari-mcp PRIVATE -Wl,--gc-sections)
-    elseif(APPLE)
-        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
-        target_link_options(levari-mcp PRIVATE -flto -Wl,-dead_strip)
-    else()
-        target_compile_options(levari-mcp PRIVATE -Os -flto -ffunction-sections -fdata-sections -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -Wno-unused-parameter)
-        target_link_options(levari-mcp PRIVATE -flto -pie -Wl,--gc-sections -Wl,-s -Wl,-z,relro,-z,now)
-    endif()
+    lv_harden(levari-mcp)
     set_source_files_properties(third_party/cJSON.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter;-Wno-unknown-pragmas;-fstack-protector-strong;-D_FORTIFY_SOURCE=2")
     if(NOT WIN32)
         # ffmpeg backend: same variant objects as the levari target

@@ -9,8 +9,40 @@
 
 #define LV_MAX_PATH 4096
 
+/* single hazard ceiling for per-track durations, in seconds: every probe
+   path already refuses a length over one day (XING/VBRI/ogg tail/FLAC
+   return 0 = unknown past 86400), so the playlist parsers, the index
+   reader and the decoder fallbacks must not admit larger numbers —
+   unbounded per-track values poison the library and the footer sum.
+   Out-of-range parses become 0 (unknown), NEVER a dropped row (library
+   admission is structural). Lived in tag.h until the clamp helper made
+   it a tree-wide contract. */
+#define LV_DUR_MAX 86400
+
+/* the ONE duration clamp — "clamp the number, never drop the row":
+   in range means the value, anything else means 0 = unknown. Every
+   parser/reader/backfill of an untrusted duration goes through here
+   (the CUE parser's INDEX line keeps its different rule on purpose:
+   there an absurd row is REJECTED and the file kept — playlist.c). */
+static inline int lv_clamp_dur(long long d) {
+    return (d > 0 && d <= LV_DUR_MAX) ? (int)d : 0;
+}
+
+/* the ONE time readout format: H:MM:SS at and past an hour, else M:SS.
+   The daemon's private fmt_t once always printed M:SS, so a 90-minute
+   track read 1:30:00 in the UI and 90:00 over the daemon pipe; the
+   playlist row duration column [m:ss] is deliberately NOT this format
+   (compact column width). */
+static inline void lv_fmt_time(char *buf, size_t n, long long sec) {
+    if (sec < 0) sec = 0;
+    if (sec >= 3600)
+        snprintf(buf, n, "%lld:%02lld:%02lld", sec / 3600, (sec / 60) % 60, sec % 60);
+    else
+        snprintf(buf, n, "%lld:%02lld", sec / 60, sec % 60);
+}
+
 #ifndef LV_VERSION
-#define LV_VERSION "0.3.6"
+#define LV_VERSION "0.3.7"
 #endif
 
 /* build architecture, shown in the options title bar before the version
@@ -97,6 +129,25 @@ static inline const char *lv_stristr(const char *hay, const char *needle) {
     for (const char *p = hay; *p; p++)
         if (!lv_strncasecmp(p, needle, nl)) return p;
     return NULL;
+}
+
+/* THE audio-extension contract, one list for the whole tree: library
+   scan, folder-add to the playlist, and the file browser all answer
+   from here (the browser once kept a private narrower list — files
+   could then be scanned or dropped but not shown or opened; do not
+   re-fork). This set mirrors the shipped decoders: minimp3, stb_vorbis,
+   dr_flac/dr_wav, modplug (.mod .s3m .xm .it), snes_spc (.spc) and the
+   ffmpeg branch (.aac .m4a .wma on non-Windows). Add an extension here
+   only together with a decoder for it. */
+static inline int lv_is_audio(const char *name) {
+    const char *e = strrchr(name, '.');
+    static const char *const EXT[] = { ".mp3", ".ogg", ".oga", ".opus",
+        ".flac", ".wav", ".aac", ".m4a", ".wma", ".mod", ".s3m", ".xm",
+        ".it", ".spc" };
+    if (!e) return 0;
+    for (size_t i = 0; i < sizeof EXT / sizeof EXT[0]; i++)
+        if (!lv_strcasecmp(e, EXT[i])) return 1;
+    return 0;
 }
 
 /* last path separator. On Windows both / and \ ; elsewhere \ is a legal
@@ -238,5 +289,14 @@ static inline int drives_from_mask(unsigned mask, char ***out) {
     *out = v;
     return k;
 }
+
+/* era SDL floor (Win98 branch): SDL_HINT_APP_NAME is a 2.0.18 hint.
+   Defining it identically on old SDL keeps call sites preprocessor-
+   identical across floors; the hint is inert there (SDL_SetHint with an
+   unknown key returns FALSE), and on new SDL this is the same token
+   sequence as SDL_hints.h's own define — a benign redefinition. */
+#ifndef SDL_HINT_APP_NAME
+#define SDL_HINT_APP_NAME "SDL_APP_NAME"
+#endif
 
 #endif

@@ -189,10 +189,11 @@ all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
 | Control | Action |
 |---|---|
 | `LIBRARY DIRS` | `;`-separated list of scanned directories (hover for the tooltip). |
-| `SCAN` | Scan the library dirs into the index (uses the `TAGS` checkbox). |
+| `SCAN` | Scan the library dirs into the index (uses the `TAGS` checkbox; additive — rows from other dirs are kept). Hovering shows the summary. |
 | `TAGS` | When on (green), SCAN reads tags+duration; off = filenames only. |
 | `LIB INDEX` / `LIBAV DIR` / `AUDIO BACKEND` / `AUDIO DEVICE` / `DAEMON SOCKET` | Config text fields; `libav.dir` and the socket path apply on restart. |
-| `CLEAR` | Delete the library index. |
+| `CLEAR` | Delete the library index. `SCAN` rebuilds it (tags re-read). Hovering shows the summary. |
+| `VERIFY` | One existence pass over the whole library index: every row's path is checked on disk; rows whose file is gone (ENOENT/ENOTDIR — e.g. orphans left by a NAS path change) are dropped, rows the filesystem merely cannot answer for right now (offline share, I/O error) stay. Dropped rows are banked verbatim to `<index>.dropped` (overwritten each run) before the index is rewritten, so a recovery is one copy away. Runs in the background (button reads `BUSY`, SCAN/CLEAR refuse meanwhile — one index writer at a time); the result line reports `dropped N (M kept, K unreachable)`. An index that predates the v2 format and cannot be migrated without guessing refuses untouched (`index: run a full scan`). Hovering shows the same summary. |
 | `STARTUP` toggles `UI PL` `UI EQ` `UI VIS` `UI SRCH` `SHUF` `FADE` | Startup window visibility; `SHUF` keeps the shuffle state across sessions; `FADE` fades volume out on stop (on by default). |
 
 ### ADV page
@@ -214,6 +215,7 @@ Credits: created by, thanks to the third-party projects
 | Control | Action |
 |---|---|
 | `PL` / `LIB` | Toggle the search scope: current playlist (`PL`) or the media library index (`LIB`, green). Library hits that are not in the playlist are inserted at the current position when jumped to. |
+| `ADD` (footer, visible only in `LIB` mode) | Queue the best match: append it to the **end** of the current playlist — no jump, no playback start. A row already in the playlist gets a second copy on purpose. The `+` key fires the same action whenever the search window is focused (the key's `+` never lands in the query). |
 | Result row | Click to jump: it becomes the current track and starts playing if playback is active. |
 | Scrollbar (right edge) | Press and drag to scroll the results (same mapping as the playlist's bar); the mouse wheel scrolls too. |
 | `X` | Close the window (same as `Esc`). |

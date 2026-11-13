@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# zig c++ pinned to the legacy 32-bit floor: i386 (x86) with the
+# glibc 2.17 importlib floor, -mcpu=pentium2 (see
+# tools/zig-legacy32-toolchain.cmake; NOT musl — static musl cannot
+# dlopen, killing the SDL dlopen backends; measured).
+# Drops CMake's "-Xlinker --dependency-file=..." (same zig 0.16 lld
+# segfault workaround as zig-cxx-2.17).
+args=(); prev=""; filtered=()
+for a in "$@"; do
+    if [ "$prev" = "-Xlinker" ] && [ "${a#--dependency-file=}" != "$a" ]; then
+        args=("${args[@]:0:${#args[@]}-1}")
+        prev=""; continue
+    fi
+    args+=("$a"); prev="$a"
+done
+exec zig c++ -target x86-linux-gnu.2.17 -mcpu=pentium2 "${args[@]}"

@@ -99,7 +99,7 @@ void skin_slider(SDL_Surface *s, const Rect *track, int knob_x, int knob_w) {
     bevel(s, &k, C(s, 180, 180, 180), C(s, 40, 40, 40));
 }
 
-void skin_knob(SDL_Surface *s, int x, int y, int w, int h) {
+static void skin_knob(SDL_Surface *s, int x, int y, int w, int h) {
     Rect k = {x, y, w, h};
     fill(s, x, y, w, h, C(s, 120, 120, 120));
     bevel(s, &k, C(s, 180, 180, 180), C(s, 40, 40, 40));
@@ -301,7 +301,7 @@ int font_utf8_next(const char *s, unsigned *cp) {
 /* unifont 8-wide codepoints (latin-1, curly quotes, dashes...) advance
    half-width like ascii; only fullwidth cjk takes the wide cell */
 static int half16(unsigned cp) { return cp < 0x80 || cjk_halfwidth(cp); }
-int font_cp_w(unsigned cp) { return half16(cp) ? 6 : CJK_GLYPH_W + 1; }
+static int font_cp_w(unsigned cp) { return half16(cp) ? 6 : CJK_GLYPH_W + 1; }
 /* widths on the 16px grid: half-width is 8+1, CJK is 16+1 */
 int font_cp_w16(unsigned cp) { return half16(cp) ? 9 : CJK_GLYPH_W + 1; }
 
@@ -327,7 +327,7 @@ void font_putcp16_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, 
     }
 }
 
-void font_putcp16(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color) {
+static void font_putcp16(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color) {
     font_putcp16_clip(s, x, y, cp, color, 0, s->w);
 }
 

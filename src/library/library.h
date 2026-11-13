@@ -34,14 +34,6 @@ int lib_idx_getline(FILE *f, char *line, size_t n);
    returns 0 on success, 1 if the index cannot be opened for writing. */
 int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *added, int *seen, int *skipped);
 
-/* one parsed row of the index (fields point into a scratch buffer) */
-typedef struct {
-    const char *path, *artist, *title, *album;
-    int duration;
-    int track;  /* 0 = unknown */
-    int notag;  /* 1 = scan probed the file and found no tags at all */
-} LibEntry;
-
 /* whole index in memory, sorted by path. ALL file I/O happens in load,
    so callers that touch a shared playlist can hold their lock only for
    the apply step (the UI locks the player mutex every draw frame). */
@@ -69,6 +61,27 @@ void lib_fill_playlist(Playlist *p);
    it. Out params may be NULL. */
 int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
                      int *out_notag);
+
+/* VERIFY (master, 2026-11-13): one existence pass over the WHOLE index —
+   every row's path field is stat'd. A row that stats as a regular file
+   is kept byte-identically; a row the filesystem answered ENOENT or
+   ENOTDIR about is DROPPED (its file is gone — the NAS-path-change
+   orphan class); a row whose stat failed any other way (EACCES, ESTALE,
+   ENOTCONN, EIO — transient or transport-level) is KEPT and counted,
+   because "cannot ask" must never become "the file does not exist".
+   Dropped rows are banked verbatim to "<index>.dropped" (overwritten
+   each run) BEFORE the index is rewritten, so a misclassification is a
+   one-step recovery, never data loss; the bank path lands in bank_out.
+   Rows are copied verbatim (escaped paths, sparse 7th field, header
+   creation marker untouched) — the ONLY interpretation performed is
+   field 1's unescape for the stat. Headerless-or-ambiguous indexes are
+   refused (-3, byte-identical, "run a full scan") exactly like
+   lib_index_rescan's rule. Runs OFF any player lock; the UI gates it
+   against the scan thread (one index writer at a time).
+   Returns 0 on success (counts valid); -2 on index read/write failure
+   (index untouched); -3 on the refuse-above. Out params may be NULL. */
+int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
+                     char *bank_out, size_t bank_n);
 
 /* urlIndex (streaming-plan D5, master ruling): ONE row = the last
    WORKING url, stored next to the library index (same exposure class —

@@ -5,6 +5,11 @@
    fix mirrors the playlist drag==5 house pattern: press anywhere on the
    bar track grabs it (search drag == 2), motion maps pointer y
    proportionally over the scroll range, release clears.
+   Since 2026-11-13 the file also pins the LIB-scope queue-ADD button
+   (draw+mouse scope-gated, best match, duplicates allowed) and the +
+   keyboard action (queues, its TEXTINPUT swallowed so the query stays
+   clean); those pins run against a zeroed fake Player — do_jump remains
+   untriggered.
 
    Compile (from the repo root, after `cmake --build build`):
 
@@ -120,6 +125,66 @@ int main(void) {
     nres = 3; scroll = 0;
     press(barx, list.y + list.h - 2);
     chk("no bar grab when results fit", drag, 0);
+
+    /* ---- queue-ADD button + the + key (2026-11-13) ----
+       A zeroed fake Player stands in for the live one: the queue path
+       only touches sp->mtx (zero-init == PTHREAD_MUTEX_INITIALIZER on
+       glibc), sp->pl and pl_add_file. do_jump remains untriggered. */
+    {
+        static Player ffp;
+        static Playlist fpl;
+        sp = &ffp; ffp.pl = &fpl; pl_init(&fpl);
+        nres = 0; res_push("/tmp/qq.mp3", "Q", "A", -1);
+        Rect qb = srch_queue_rect();
+        int qx = qb.x + qb.w / 2, qy = qb.y + qb.h / 2;
+
+        /* invisible control = dead control: PL scope gates the mouse too */
+        scope = 0; pressed = SB_NONE;
+        press(qx, qy);
+        chk("queue dead in PL scope", pressed, SB_NONE);
+        up(qx, qy);
+        chk("PL-scope click queues nothing", fpl.count, 0);
+
+        /* LIB scope: down arms, up appends the BEST match */
+        scope = 1;
+        press(qx, qy);
+        chk("queue arms in LIB scope", pressed, SB_QUEUE);
+        up(qx, qy);
+        chk("up queues best match", fpl.count, 1);
+        chk("queued path = res[0]", strcmp(fpl.items[0].path, "/tmp/qq.mp3") == 0, 1);
+
+        /* already in the list: a second copy is the contract */
+        press(qx, qy); up(qx, qy);
+        chk("duplicate queued on purpose", fpl.count, 2);
+
+        /* keyboard: + queues, and the TEXTINPUT the key emits is eaten
+           so the query stays clean; KP variant included */
+        SDL_Event ke;
+        memset(&ke, 0, sizeof ke);
+        ke.type = SDL_KEYDOWN;
+        ke.key.keysym.sym = SDLK_PLUS;
+        search_key(&ke);
+        chk("+ key queues", fpl.count, 3);
+        chk("+ key left the query empty", query[0] == 0, 1);
+        search_text("+");
+        chk("plus TEXTINPUT swallowed, not typed", query[0] == 0, 1);
+        chk("swallow did not queue twice", fpl.count, 3);
+        ke.key.keysym.sym = SDLK_KP_PLUS;
+        search_key(&ke);
+        chk("keypad + queues", fpl.count, 4);
+
+        /* the swallow is one-shot: normal typing resumes untouched */
+        scope = 0;
+        search_text("z");
+        chk("typing after the swallow works", strcmp(query, "z") == 0, 1);
+
+        /* no results: button and key stay inert */
+        nres = 0;
+        press(qx, qy); up(qx, qy);
+        ke.key.keysym.sym = SDLK_PLUS;
+        search_key(&ke);
+        chk("empty results keep queue inert", fpl.count, 4);
+    }
 
     printf(fails ? "%d FAILURES\n" : "all pass\n", fails);
     return fails != 0;

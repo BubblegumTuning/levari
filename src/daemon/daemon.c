@@ -38,16 +38,50 @@ static HANDLE cur_pipe;
    and recycled for another object. the thread clears cur_pipe under this
    lock *before* CloseHandle, so a handle srv_stop sees is still open. */
 static pthread_mutex_t pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef LV_WIN9X
+/* ---- win98 era floor (Win98 branch; parked-features dossier): replaces
+   the post-9x kernel32/advapi32 entries this file uses, all confirmed
+   loader-rejecting imports by objdump census (GetTickCount64 Vista+,
+   CancelIoEx Vista+, CancelSynchronousIo Vista+,
+   ConvertStringSecurityDescriptor* Win2000+). Mainline win builds never
+   define LV_WIN9X and keep the modern shape untouched. ---- */
+#include <mmsystem.h>
+
+/* era-aware monotonic ms: 9x has no GetTickCount64; winmm timeGetTime is
+   32-bit and wraps every ~49.7 days — wrap-extend so every 5 s deadline
+   below keeps its meaning across a rollover. called only from this serial
+   server thread (and srv_stop only joins it), so plain statics are safe. */
+static ULONGLONG lv_tick_ms(void) {
+    static DWORD last_lo, epoch;
+    DWORD lo = timeGetTime();
+    if (lo < last_lo) epoch++; /* 32-bit rollover */
+    last_lo = lo;
+    return ((ULONGLONG)epoch << 32) | lo;
+}
+#define GetTickCount64() lv_tick_ms()
+
+/* 9x CancelIo cancels EVERY pending op on the handle. Equivalent here:
+   the server loop is serial per instance (one pending OVERLAPPED at a
+   time) and srv_stop's CancelIoEx(cp, NULL) cancelled everything anyway. */
+#define CancelIoEx(h, o) CancelIo((h))
+
+/* No CancelSynchronousIo before Vista. The write-path comment already
+   names DisconnectNamedPipe as the sure unblock; era builds lean on it.
+   The call sites keep running: the cancel becomes a no-op, the bounded
+   reap with its deliberate-leak escape stays the safety net. */
+static BOOL lv_cancel_sync(HANDLE h) {
+    (void)h;
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return FALSE;
+}
+#define CancelSynchronousIo(h) lv_cancel_sync(h)
+#endif
 #else
 static int listen_fd = -1;
 static char srv_path[512];   /* the path actually bound (random in /tmp fallback) */
 static char srv_ptr_pub[512]; /* pointer file this instance published ('' if none) */
 #endif
-
-static void fmt_t(char *b, size_t n, long long sec) {
-    if (sec < 0) sec = 0;
-    snprintf(b, n, "%lld:%02lld", sec / 60, sec % 60);
-}
 
 static void status_line(Player *p, char *out, size_t n) {
     long long base = p->track_start;
@@ -55,8 +89,8 @@ static void status_line(Player *p, char *out, size_t n) {
     long long pos = p->rate ? (p->pos_frames - base) / p->rate : 0;
     long long tot = p->rate ? (endf - base) / p->rate : 0;
     char ps[16], ts[16];
-    fmt_t(ps, sizeof ps, pos);
-    fmt_t(ts, sizeof ts, tot);
+    lv_fmt_time(ps, sizeof ps, pos);
+    lv_fmt_time(ts, sizeof ts, tot);
     const char *st = p->state == ST_PLAY ? "playing" : p->state == ST_PAUSE ? "paused" : "stopped";
     char title[256];
     /* count/cur read under p->mtx: the daemon's own play handler swaps
@@ -348,6 +382,11 @@ static void *srv_thread(void *arg) {
        access even from another logon session. */
     PSECURITY_DESCRIPTOR psd = NULL;
     SECURITY_ATTRIBUTES sa, *sap = NULL;
+#ifndef LV_WIN9X
+    /* the SDDL converter is Win2000+ ADVAPI32: importing it at all would
+       loader-reject on 9x. era builds keep the NULL descriptor (permissive
+       default DACL — the posture the security notes already document for
+       Windows) and stay unverified-until-hardware on this item. */
     if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
             "D:(A;;GA;;;OW)", SDDL_REVISION_1, &psd, NULL)) {
         sa.nLength = sizeof sa;
@@ -355,6 +394,7 @@ static void *srv_thread(void *arg) {
         sa.bInheritHandle = FALSE;
         sap = &sa;
     }
+#endif
     while (!srv_quit) {
         /* FILE_FLAG_OVERLAPPED: the only supported way to bound a pipe
            read. SetCommTimeouts is documented for communications devices

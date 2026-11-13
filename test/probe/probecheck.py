@@ -24,11 +24,26 @@ runs in-process):
   5. hand-muxed Ogg fixtures: Opus/Vorbis/Ogg-FLAC durations come from the
      end-of-stream granulepos (Opus minus preskip); a tag-only stream
      reports 0, never a guess
+  6. crafted Ogg comment packet: comment_list_length 0x20000000 truncated
+     the list setup_malloc to size 0 (int sz param) and the open-failure
+     cleanup freed NULL/uninitialized comment_list entries — SEGV in the
+     release binary (rc=139), scan-reachable via the dec_open duration
+     fallback. Must now be a clean open refusal (stb_vorbis LEVARI PATCH
+     hunks 4+5, 2026-11-12)
+  7. attacker-sized comment-section allocations: vendor length, comment
+     count, and per-comment length are raw get32 fields the vendored
+     stb_vorbis trusted for allocation before reading any data — a 357-byte
+     crafted Ogg made the RELEASE binary allocate and zero-fill up to
+     2.0 GB at open (measured 2026-11-13; night-fuzz OOM class, scan-
+     reachable via the dec_open duration fallback). The sixth LEVARI PATCH
+     hunk bounds the whole comment section by a 64 MB budget. Pin: hostile
+     declares must refuse the open in well under 2 s (pre-fix: 5-8 s of
+     allocation/zero-fill on the same machine) and never crash.
 
 Usage: python3 test/probe/probecheck.py [build-dir] [old-build-dir]
        (default build dir: ./build)
 """
-import os, re, subprocess, struct, sys, tempfile, shutil
+import os, re, subprocess, struct, sys, tempfile, shutil, time
 
 build = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build")
 old_build = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
@@ -227,6 +242,32 @@ try:
     r = run(scratch, ["--probe", os.path.join(repo, "test", "sample.mp3")])
     ok = r.returncode == 0 and "FAIL open" not in r.stdout and "seek=ok" in r.stdout
     check("valid sample.mp3 still probes ok", ok, f"rc={r.returncode} out={r.stdout!r}")
+
+    # 6. crafted comment packet (fuzz 2026-11-12): must refuse the open
+    # cleanly, not SEGV in vorbis_deinit. Fixture = AFL-minimized 272-byte
+    # repro; pre-fix release binary rc=139.
+    r = run(scratch, ["--probe", os.path.join(repo, "test", "probe", "comment-oom.oggo")])
+    check("hostile comment ogg exits 0 (not SEGV)", r.returncode == 0,
+          f"rc={r.returncode}")
+    check("hostile comment ogg prints FAIL open", "FAIL open" in r.stdout, r.stdout)
+
+    # 7. attacker-sized comment allocations (fuzz 2026-11-13 night): the
+    # vendored stb_vorbis trusted vendor length / comment count / comment
+    # length for allocation before any data was read. Pre-fix release
+    # behavior: 6.9 s and 1.8 GB resident on this very fixture (measured;
+    # OOM-kill on small machines). Post-fix: instant refusal. The wall
+    # bound below is the bounded-work assertion (30x margin on the pre-fix
+    # measurement); the fixture is the raw 357-byte fuzz artifact, kept
+    # byte-for-byte (minimization drifts — see the fix commit).
+    fx = os.path.join(repo, "test", "probe", "oom-vendor.oggo")
+    t0 = time.monotonic()
+    r = run(scratch, ["--probe", fx])
+    wall = time.monotonic() - t0
+    check("oom-sized comment declare: exits 0 (no crash/OOM-kill)", r.returncode == 0,
+          f"rc={r.returncode}")
+    check("oom-sized comment declare: FAIL open", "FAIL open" in r.stdout, r.stdout)
+    check("oom-sized comment declare: refused in <2s (bounded work)", wall < 2.0,
+          f"wall={wall:.2f}s — open allocated from the declared length again")
 finally:
     shutil.rmtree(scratch, ignore_errors=True)
 

@@ -1,5 +1,7 @@
 #include "search.h"
 #include "ui.h"
+#include "textedit.h"
+#include "x8bit.h"
 #include "../skin/skin.h"
 #include "../playlist/playlist.h"
 #include "../library/library.h"
@@ -7,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { SB_NONE, SB_X, SB_SCOPE };
+enum { SB_NONE, SB_X, SB_SCOPE, SB_QUEUE };
 
 #define SRCH_W 340
 #define SRCH_H (MAIN_H + PL_H) /* left column as tall as main+playlist: the trio forms a rectangle */
@@ -31,14 +33,19 @@ static SDL_Surface *sf;
 static int visible, pressed, drag, scroll, sel, nres;
 static int scope; /* 0 = playlist, 1 = library */
 static int focused; /* 1 while the search window holds WM focus: gates the caret */
-static int selall; /* ctrl-a: whole query selected, next edit replaces it */
 static char query[512];
-static int caret; /* byte offset in query (codepoint boundary): edit position */
+static TField qtf = { query, sizeof query, 0, 0 }; /* the ONE line editor
+    (textedit.c): caret byte offset (codepoint boundary) + ctrl-a select
+    ride the shared tf_* ops, exactly like file/URL/options fields */
 static Result *res;
 static int res_cap;
 static LibEnt *libs;
 static int lib_n, lib_cap, lib_loaded;
 static int dgx, dgy;
+/* the + key arms the queue action via KEYDOWN and SDL then emits the SAME
+   key as TEXTINPUT "+": this one-shot lets search_key eat that text so +
+   queues without littering the query (any other keydown clears it) */
+static int eat_plus;
 /* WM-refusal bookkeeping for the search drag (mirrors drag_step in
    ui.c; drag state is global so per-window persistence is unnecessary) */
 static int srx, sry, sxlo, sxhi, sylo, syhi;
@@ -180,36 +187,24 @@ static char *norm_dup(const char *s) {
 static void lib_load(void) {
     lib_free();
     lib_loaded = 1;
-    char idx[LV_MAX_PATH];
-    lib_index_path(idx, sizeof idx);
-    FILE *f = fopen(idx, "r");
-    if (!f) return;
-    char line[2 * LV_MAX_PATH + 1024];
-    int v2 = lib_idx_header(f);
-    int gr;
-    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
-        if (gr == 2) continue; /* over-long row: already drained */
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-        char *f1 = line;
-        char *f2 = strchr(f1, '\t'); if (!f2) continue; *f2++ = 0;
-        if (v2) lib_unesc_path(f1);
-        char *f3 = strchr(f2, '\t'); if (!f3) continue; *f3++ = 0;
-        char *f4 = strchr(f3, '\t'); if (!f4) continue; *f4++ = 0;
-        char *f5 = strchr(f4, '\t'); if (f5) *f5 = 0;
-        if (lib_n == lib_cap) {
-            lib_cap = lib_cap ? lib_cap * 2 : 256;
-            LibEnt *l2 = realloc(libs, (size_t)lib_cap * sizeof *libs);
-            if (!l2) break;
-            libs = l2;
-        }
+    /* ONE index reader for the whole tree (library.c): the header check,
+       the over-long-row guard, the v2 unescape and the field split all
+       live there; search only attaches what it matches on — normalized
+       copies of the four text fields plus the extension-stripped
+       basename. Every string is copied OUT here, so the LibIndex is
+       freed at once and nothing dangles. */
+    LibIndex ix = lib_index_load();   /* disk I/O — never under any lock */
+    if (ix.n > 0) {
+        libs = malloc((size_t)ix.n * sizeof *libs);
+        if (libs) lib_cap = ix.n;
+    }
+    for (int i = 0; libs && i < ix.n; i++) {
+        LibRow *r = &ix.rows[i];
         LibEnt *e = &libs[lib_n];
-        e->path = dupn(f1); e->artist = dupn(f2); e->title = dupn(f3); e->album = dupn(f4);
-        if (!e->path || !e->artist || !e->title || !e->album) {
-            free(e->path); free(e->artist); free(e->title); free(e->album);
-            break; /* NULL path would crash the strrchr below */
-        }
-        lib_n++;
+        e->path = dupn(r->path);
+        if (!e->path) continue;       /* NULL path would crash the strrchr below */
+        e->artist = dupn(r->artist); e->title = dupn(r->title);
+        e->album = dupn(r->album);
         char fb[512];
         const char *b = strrchr(e->path, '/');
         b = b ? b + 1 : e->path;
@@ -220,14 +215,18 @@ static void lib_load(void) {
         e->ntitle = norm_dup(e->title);
         e->nartist = norm_dup(e->artist);
         e->nalbum = norm_dup(e->album);
-        if (!e->nfile || !e->ntitle || !e->nartist || !e->nalbum) {
-            /* eval_fields derefs every F[f] without a NULL test */
+        if (!e->artist || !e->title || !e->album ||
+            !e->nfile || !e->ntitle || !e->nartist || !e->nalbum) {
+            /* eval_fields derefs every F[f] without a NULL test: an
+               incomplete row never joins the set (OOM now costs one
+               row, not the tail of the index) */
             free(e->path); free(e->artist); free(e->title); free(e->album);
             free(e->nfile); free(e->ntitle); free(e->nalbum); free(e->nartist);
-            break;
+            continue;
         }
+        lib_n++;
     }
-    fclose(f);
+    lib_index_free(&ix);
 }
 
 void search_lib_invalidate(void) { lib_loaded = 0; }
@@ -351,14 +350,24 @@ static void do_jump(Result *r) {
     }
 }
 
+/* append the BEST match (res[0]) to the end of the live playlist.
+   A row already in the playlist gets another copy on purpose: the user
+   knows what they are doing. Unlike do_jump this never seeks or plays. */
+static void do_queue(void) {
+    if (nres < 1) return;
+    pthread_mutex_lock(&sp->mtx);
+    pl_add_file(sp->pl, res[0].path);
+    pthread_mutex_unlock(&sp->mtx);
+}
+
 /* ---------- window ---------- */
 
 void search_init(Player *p) {
     sp = p;
     visible = pressed = drag = scroll = sel = nres = 0;
-    scope = 0; selall = 0;
+    scope = 0; qtf.selall = 0;
     query[0] = 0;
-    caret = 0;
+    qtf.caret = 0;
 }
 
 int search_is_open(void) { return visible; }
@@ -389,7 +398,7 @@ void search_open(SDL_Window *anchor) {
             SDL_SetWindowIcon(w, icon);
             SDL_FreeSurface(icon);
         }
-        sf = SDL_GetWindowSurface(w);
+        sf = lv_win_surface(w);
         if (anchor) {
             /* dock flush against the main window's left edge and follow it;
                re-read main's position in case the WM moved it after creation */
@@ -401,8 +410,8 @@ void search_open(SDL_Window *anchor) {
         }
     }
     lib_loaded = 0; /* re-read the index on every open */
-    selall = 0;
-    if (caret < 0 || caret > (int)strlen(query)) caret = (int)strlen(query);
+    qtf.selall = 0;
+    if (qtf.caret < 0 || qtf.caret > (int)strlen(query)) qtf.caret = (int)strlen(query);
     visible = 1;
     SDL_ShowWindow(w);
     SDL_RaiseWindow(w);
@@ -419,7 +428,7 @@ void search_close(void) {
 }
 
 void search_shutdown(void) {
-    if (w) SDL_DestroyWindow(w);
+    if (w) { lv_win_release(w); SDL_DestroyWindow(w); }
     w = NULL; sf = NULL; visible = 0;
     lib_free();
     free(res);
@@ -427,11 +436,18 @@ void search_shutdown(void) {
 }
 
 void search_surface_refresh(void) {
-    if (w) sf = SDL_GetWindowSurface(w);
+    if (w) sf = lv_win_surface(w);
 }
 
 static Rect srch_close_rect(void) {
     Rect r = { SRCH_W - 18, 4, 12, 12 };
+    return r;
+}
+/* queue button (LIB scope only): playlist small-button size (23x12), in
+   the empty right end of the 18px footer band under the list — it touches
+   no other hit-rect (the list rect ends at SRCH_H-18 above it) */
+static Rect srch_queue_rect(void) {
+    Rect r = { SRCH_W - 35, SRCH_H - 15, 23, 12 };
     return r;
 }
 #define SRCH_EDIT_RECT   Rect edit = {6, 26, SRCH_W - 12 - 58, 18}
@@ -456,7 +472,7 @@ static void draw_edit(void) {
 
     int pad = 3, avail = edit.w - 2 * pad - 6;
     int len = (int)strlen(query);
-    if (caret < 0 || caret > len) caret = len;
+    if (qtf.caret < 0 || qtf.caret > len) qtf.caret = len;
     /* focused: the visible slice is anchored on the caret (like the options
        fields) so mid-string edits stay on screen; unfocused: the tail shows */
     char disp[512];
@@ -464,14 +480,14 @@ static void draw_edit(void) {
     int caret_x = -1;
     if (focused) {
         char pre[512];
-        memcpy(pre, query, (size_t)caret);
-        pre[caret] = 0;
+        memcpy(pre, query, (size_t)qtf.caret);
+        pre[qtf.caret] = 0;
         const char *st = font_fit_tail(pre, avail);
         int off = (int)(st - pre);
         int caret_w = font_w16(st);
         int room = avail - caret_w;
-        int extra = room > 0 ? font_fit(query + caret, room) : 0;
-        int shown_len = (caret - off) + extra;
+        int extra = room > 0 ? font_fit(query + qtf.caret, room) : 0;
+        int shown_len = (qtf.caret - off) + extra;
         memcpy(disp, query + off, (size_t)shown_len);
         disp[shown_len] = 0;
         shown = disp;
@@ -479,7 +495,7 @@ static void draw_edit(void) {
     } else {
         shown = font_fit_tail(query, avail);
     }
-    if (selall && query[0]) {
+    if (qtf.selall && query[0]) {
         SDL_Rect hl = { edit.x + pad, edit.y + 1,
                         (unsigned)font_w16(shown), (unsigned)(edit.h - 2) };
         if (hl.x + (int)hl.w > edit.x + edit.w - pad)
@@ -536,6 +552,14 @@ void search_draw(void) {
     snprintf(st, sizeof st, "%d match%s%s", nres, nres == 1 ? "" : "es",
              scope ? " (library)" : " (playlist)");
     font_puts(sf, 6, SRCH_H - 14, st, col(150, 150, 150));
+    /* queue-ADD rides the footer only in LIB scope (draw AND mouse gate
+       together, so an invisible control can never be clicked) */
+    if (scope) {
+        Rect qb = srch_queue_rect();
+        skin_button(sf, &qb, pressed == SB_QUEUE, 0);
+        font_puts(sf, qb.x + (qb.w - font_w("ADD")) / 2, qb.y + 3, "ADD",
+                  col(220, 220, 220));
+    }
     if (!nres && query[0])
         font_puts16(sf, list.x + 2, list.y + 1, "(no matches)", col(150, 150, 150));
     else if (!query[0])
@@ -559,21 +583,25 @@ void search_mouse(SDL_Event *e) {
         Rect xc = srch_close_rect();
         if (in_rect(&xc, x, y)) { pressed = SB_X; return; }
         if (in_rect(&scopeb, x, y)) { pressed = SB_SCOPE; return; }
+        if (scope) {
+            Rect qb = srch_queue_rect();
+            if (in_rect(&qb, x, y)) { pressed = SB_QUEUE; return; }
+        }
         if (in_rect(&edit, x, y)) {
-            selall = 0;
+            qtf.selall = 0;
             /* place the caret at the codepoint boundary nearest the click,
                hit-testing the currently visible caret-anchored slice */
             int av = edit.w - 12;
             int qlen = (int)strlen(query);
-            if (caret < 0 || caret > qlen) caret = qlen;
+            if (qtf.caret < 0 || qtf.caret > qlen) qtf.caret = qlen;
             char pre[512];
-            memcpy(pre, query, (size_t)caret);
-            pre[caret] = 0;
+            memcpy(pre, query, (size_t)qtf.caret);
+            pre[qtf.caret] = 0;
             const char *st = font_fit_tail(pre, av);
             int off = (int)(st - pre);
             int room = av - font_w16(st);
-            int extra = room > 0 ? font_fit(query + caret, room) : 0;
-            const char *end = query + off + (caret - off) + extra;
+            int extra = room > 0 ? font_fit(query + qtf.caret, room) : 0;
+            const char *end = query + off + (qtf.caret - off) + extra;
             const char *p = query + off;
             int px = edit.x + 3;
             while (p < end) {
@@ -583,7 +611,7 @@ void search_mouse(SDL_Event *e) {
                 px += font_cp_w16(cp);
                 p += n;
             }
-            caret = (int)(p - query);
+            qtf.caret = (int)(p - query);
             SDL_SetWindowInputFocus(w);
             SDL_StartTextInput();
             return;
@@ -616,6 +644,12 @@ void search_mouse(SDL_Event *e) {
         else if (pressed == SB_SCOPE && in_rect(&scopeb, x, y)) {
             scope = !scope;
             run_search();
+        }
+        else if (pressed == SB_QUEUE) {
+            /* no scope gate needed on UP: pressed can only arm while the
+               button is drawn, and scope cannot toggle mid-press */
+            Rect qb = srch_queue_rect();
+            if (in_rect(&qb, x, y)) do_queue();
         }
         pressed = SB_NONE;
         if (drag == 1) {
@@ -672,37 +706,16 @@ void search_mouse(SDL_Event *e) {
     }
 }
 
-/* byte length of the codepoint before offset i (i > 0) */
-static int cp_before_len(int i) {
-    int q = i - 1;
-    while (q > 0 && ((unsigned char)query[q] & 0xC0) == 0x80) q--;
-    return i - q;
-}
-
 void search_key(SDL_Event *e) {
     int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
+    /* rearm/clear the swallow on EVERY keydown: only the + key itself
+       leaves one pending for the TEXTINPUT its press emits */
+    eat_plus = e->key.keysym.sym == SDLK_PLUS ||
+               e->key.keysym.sym == SDLK_KP_PLUS;
     switch (e->key.keysym.sym) {
-    case SDLK_a:
-        if (ctrl) selall = query[0] ? 1 : 0;
-        break;
-    case SDLK_c:
-        if (ctrl) ui_clip_copy(query);
-        break;
-    case SDLK_x:
-        if (ctrl && selall && query[0]) {
-            ui_clip_copy(query);
-            query[0] = 0; caret = 0; selall = 0; nres = 0; sel = scroll = 0;
-        }
-        break;
-    case SDLK_v:
-        if (ctrl) {
-            if (selall) { query[0] = 0; caret = 0; selall = 0; }
-            if (ui_clip_paste(query, sizeof query)) {
-                caret = (int)strlen(query);
-                if (query[0]) run_search();
-                else { nres = 0; sel = scroll = 0; }
-            }
-        }
+    case SDLK_PLUS:
+    case SDLK_KP_PLUS:
+        do_queue();
         break;
     case SDLK_RETURN:
     case SDLK_KP_ENTER:
@@ -714,77 +727,51 @@ void search_key(SDL_Event *e) {
     case SDLK_DOWN:
         if (sel < nres - 1) { sel++; keep_scroll(); }
         break;
-    case SDLK_LEFT:
-        if (selall) { caret = 0; selall = 0; break; }
-        if (caret > 0) caret -= cp_before_len(caret);
-        break;
-    case SDLK_RIGHT:
-        if (selall) { caret = (int)strlen(query); selall = 0; break; }
-        if (query[caret]) {
-            unsigned cp;
-            caret += font_utf8_next(query + caret, &cp);
-        }
-        break;
-    case SDLK_HOME:
-        caret = 0; selall = 0;
-        break;
-    case SDLK_END:
-        caret = (int)strlen(query); selall = 0;
-        break;
-    case SDLK_BACKSPACE:
-        if (selall) { query[0] = 0; caret = 0; selall = 0; nres = 0; sel = scroll = 0; }
-        else if (caret > 0) {
-            int q = caret - cp_before_len(caret);
-            memmove(query + q, query + caret, strlen(query + caret) + 1);
-            caret = q;
-            run_search();
-        }
-        break;
-    case SDLK_DELETE:
-        if (selall) { query[0] = 0; caret = 0; selall = 0; nres = 0; sel = scroll = 0; }
-        else if (query[caret]) {
-            unsigned cp;
-            int n = font_utf8_next(query + caret, &cp);
-            memmove(query + caret, query + caret + n, strlen(query + caret + n) + 1);
-            run_search();
-        }
-        break;
     case SDLK_ESCAPE:
         search_close();
         break;
+    default: {
+        /* the one shared edit switch (textedit.c): arrows, Home/End,
+           Backspace/Delete, ctrl-a/c/x/v — the same ops the file, URL
+           and options fields ride. Paste lands on tf_paste's sanitizer
+           (the single paste policy; it now trims/unwraps the query too,
+           which is harmless — the matcher tokenizes whitespace). */
+        int changed = tf_handle_key(&qtf, e->key.keysym.sym, ctrl);
+        if (changed > 0) {
+            if (query[0]) run_search();
+            else { nres = 0; sel = scroll = 0; }
+        }
+        break;
+    }
     }
 }
 
 void search_text(const char *text) {
-    if (selall) { query[0] = 0; caret = 0; selall = 0; }
-    size_t len = strlen(query);
-    if (caret < 0 || caret > (int)len) caret = (int)len;
+    if (eat_plus) {
+        eat_plus = 0;
+        if (!strcmp(text, "+")) return; /* the + KEYDOWN already queued */
+    }
+    /* keep the matcher guard: tab is accepted (tokenize splits on it),
+       DEL, the C1 range and surrogates smuggled in as 3-byte CESU-8
+       must not reach the matcher or the render loop; the surviving
+       insert rides the shared tf_insert (caret + select-all semantics
+       identical to every other field) */
+    char clean[512];
+    size_t o = 0;
     const char *q = text;
-    int changed = 0;
-    while (*q && len + 4 < sizeof query) {
+    while (*q && o + 4 < sizeof clean) {
         unsigned cp;
         int n = font_utf8_next(q, &cp);
-        /* printable only: tab is accepted (tokenize splits on it anyway),
-           DEL, the C1 range and surrogates smuggled in as 3-byte CESU-8
-           must not reach the matcher or the render loop */
         int keep = cp == 0x09 || (cp >= 0x20 && cp < 0x7F) ||
                    (cp >= 0xA0 && !(cp >= 0xD800 && cp <= 0xDFFF));
-        if (keep) {
-            char enc[4];
-            int m = utf8_enc(cp, enc);
-            memmove(query + caret + m, query + caret, len - (size_t)caret + 1);
-            memcpy(query + caret, enc, (size_t)m);
-            caret += m;
-            len += (size_t)m;
-            query[len] = 0;
-            changed = 1;
-        }
+        if (keep) o += (size_t)utf8_enc(cp, clean + o);
         q += n;
     }
-    if (changed) {
-        if (query[0]) run_search();
-        else { nres = 0; sel = scroll = 0; }
-    }
+    if (!o) return;
+    clean[o] = 0;
+    tf_insert(&qtf, clean);
+    if (query[0]) run_search();
+    else { nres = 0; sel = scroll = 0; }
 }
 
 /* the WM may swallow the button press that focuses the window, so when the

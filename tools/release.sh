@@ -88,6 +88,45 @@ sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}
 build build-rel-win -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-toolchain.cmake" -DSDL2_DIR="$sdl2" -DLEVAR_TIERS=avx2
 package win x86-64 build-rel-win levari.exe README.md
 
+# Win98 legacy build: the era pipeline, separate ONLY — the flagship win
+# artifact's floor must NEVER regress toward 98. OPT-IN target, not a
+# regular release: the era exe is hardware-unverified and building it every
+# release would imply a support promise we have not earned. It ships only
+# when WIN98_RELEASE=1 is set explicitly; the default prints a skip notice
+# and the release continues untouched. When opted in it needs the EPEL
+# mingw32 cross (dnf install mingw32-gcc mingw32-gcc-c++ mingw32-zlib
+# mingw32-zlib-static) and the era SDL 2.0.8 static prefix bootstrapped
+# once via tools/build_sdl2_win98.sh (default prefix $HOME/sdl2-win98;
+# WIN98_SDL2_DIR overrides the cmake dir). A missing piece SKIPS the
+# target with a notice (pi0 policy: aborting the whole release because one
+# era target's prereqs are absent is the wrong failure mode; the flagship
+# zips must still ship).
+w98skip=""
+command -v i686-w64-mingw32-gcc >/dev/null 2>&1 || \
+    w98skip="i686-w64-mingw32-gcc not installed (dnf install mingw32-gcc mingw32-gcc-c++ mingw32-zlib mingw32-zlib-static)"
+w98sdl=${WIN98_SDL2_DIR:-$HOME/sdl2-win98/cmake}
+[ -f "$w98sdl/sdl2-config.cmake" ] || \
+    w98skip="$w98skip${w98skip:+; }era SDL2 cmake dir not found: $w98sdl (run tools/build_sdl2_win98.sh)"
+if [ "${WIN98_RELEASE:-0}" != "1" ]; then
+    echo "== win98 skipped: opt-in only — WIN98_RELEASE=1 to build it (era target, hardware-unverified, not a regular release)"
+elif [ -z "$w98skip" ]; then
+    build build-rel-win98 -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-win98-toolchain.cmake" -DSDL2_DIR="$w98sdl" -DLV_WIN9X=ON
+    # the era twin of the legacy ISA gate: import denylist == 0 hits,
+    # PE32 i386 (not PE32+), GUI subsystem MajorSubsystemVersion 4,
+    # embedded v<ver> + x86 tokens — a miss means the image would not
+    # even load on 98 (tools/win98_gate.py; the flagship win exe is the
+    # standing control that FAILS it). A firing gate SKIPS packaging
+    # (same set -e policy as pi0's ISA scan), it must not abort the
+    # rest of the release.
+    if python3 tools/win98_gate.py i686-w64-mingw32-objdump "build-rel-win98/levari.exe" "$ver"; then
+        package win98 x86 build-rel-win98 levari.exe README.md docs/WIN98-NOTES.txt
+    else
+        echo "== win98 gate FAILED; win98 packaging skipped"
+    fi
+else
+    echo "== win98 skipped: $w98skip"
+fi
+
 # Pi Zero 1 / Pi 1 (ARMv6 hard-float). Wired up via tools/armv6-toolchain.cmake.
 # Needs the whole cross stack — gcc AND g++ AND ARM-built SDL2 (distro tree
 # under /usr/arm-linux-gnueabihf/lib, or SDL2_PI0_DIR pointing at an SDL2
