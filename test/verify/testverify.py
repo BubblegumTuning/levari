@@ -6,7 +6,11 @@ index.dropped; EACCES row (unreadable dir -> "cannot ask") kept and
 counted unreachable; non-regular row (path is a directory) dropped;
 escaped-backslash row resolved via field-1 unescape and kept; header
 line byte-identical after rewrite; second run on an all-live index
-leaves the file byte-identical; missing index reports clean.
+leaves the file byte-identical; missing index reports clean; rows
+longer than the fixed readers' buffer survive a purge-triggered
+rewrite verbatim (over-long trailing fields keep their field-1 verdict;
+an over-long FIELD-1 cannot be stat'd and joins the unreachable class
+instead of being silently deleted or prefix-ENOENT'd).
 
 Usage: python3 test/verify/testverify.py [build-dir]
 """
@@ -93,6 +97,30 @@ h = mkhome()
 rc, out = verify(h)
 check("case C missing index clean: " + out.strip().replace("\n", " | "),
       rc == 0 and "kept 0, dropped 0" in out)
+
+# --- case D: oversize rows survive a purge-triggered rewrite ------------
+# (the fixed readers skipped them while counting them kept: once any row
+# triggered the rewrite they vanished with NO bank entry, and a long
+# FIELD-1 could even prefix-ENOENT a live path into deletion)
+h = mkhome()
+live = os.path.join(h, "live.wav")
+open(live, "w").write("RIFF")
+gone = os.path.join(h, "gone.wav")
+big_fields = f"{live}\t" + "x" * 20000 + "\t100\t1\n"     # live, long fields
+big_path = "y" * 20000 + "\tA\tT\tAl\t100\t1\n"           # unstatable field-1
+idxp = build_index(h, [f"{live}\tA\tT\tAl\t100\t1\n",
+                       f"{gone}\tA\tT\tAl\t100\t1\n",      # forces rewrite
+                       big_fields, big_path])
+rc, out = verify(h)
+check("case D rc==0", rc == 0)
+check("case D counts (kept 3 dropped 1 unreachable 1): " + out.strip().replace("\n", " | "),
+      "kept 3, dropped 1, unreachable kept 1" in out)
+after = open(idxp).read()
+check("case D oversize-fields row verbatim", big_fields in after)
+check("case D oversize-path row verbatim", big_path in after)
+check("case D gone row still dropped", f"{gone}\t" not in after)
+check("case D bank only holds the gone row",
+      open(idxp + ".dropped").read() == f"{gone}\tA\tT\tAl\t100\t1\n")
 
 shutil.rmtree(S, ignore_errors=True)
 sys.exit(1 if fails else 0)

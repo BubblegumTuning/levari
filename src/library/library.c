@@ -633,6 +633,31 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
     return 0;
 }
 
+/* read one whole index row into a malloc'd buffer. Unlike lib_idx_getline
+   (whose callers only skip oversize rows on READ), verify re-EMITS rows:
+   skipping there would silently delete a row it never had the right to
+   drop, so here an over-long row is kept whole. returns 1 (row in *out),
+   0 EOF, -1 OOM. */
+static int idx_read_row(FILE *f, char **out) {
+    size_t cap = 2 * LV_MAX_PATH + 1024, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return -1;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == EOF && len == 0) { free(buf); return 0; }
+        if (len + 1 >= cap) {
+            char *p2 = realloc(buf, cap * 2);
+            if (!p2) { free(buf); return -1; }
+            buf = p2; cap *= 2;
+        }
+        buf[len++] = (char)c;
+        if (c == '\n' || c == EOF) break; /* last row without EOL: keep as-is */
+    }
+    buf[len] = 0;
+    *out = buf;
+    return 1;
+}
+
 int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
                      char *bank_out, size_t bank_n) {
     if (bank_out && bank_n) bank_out[0] = 0;
@@ -647,11 +672,11 @@ int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
     }
     if (idx_migrate(idx, 1) == -2) return -3; /* same refuse rule as rescan */
 
-    char line[2 * LV_MAX_PATH + 1024]; /* house row budget */
+    char line[2 * LV_MAX_PATH + 1024]; /* header read budget */
     char *hdr = NULL;
     char **keep = NULL;                 /* kept rows verbatim */
     char **drop = NULL;                 /* banked rows verbatim */
-    int kn = 0, kc = 0, dn = 0, dc = 0, unreach = 0, oversize = 0;
+    int kn = 0, kc = 0, dn = 0, dc = 0, unreach = 0;
     int oom = 0, bad = 0;
     FILE *r = fopen(idx, "r");
     if (!r) return -2;
@@ -664,21 +689,26 @@ int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
         free(hdr);
         return -3;
     }
-    int gr;
-    while ((gr = lib_idx_getline(r, line, sizeof line)) != 0) {
-        if (gr == 2) { oversize++; continue; } /* same rule as the reload
-                                                  reader: skip the row */
+    char *row;
+    int rr;
+    while ((rr = idx_read_row(r, &row)) != 0) {
+        if (rr < 0) { oom = 1; break; }
         /* field 1 (escaped path) -> unescape into a SEPARATE buffer
-           (house rule: unescape shortens in place; never re-join after) */
+           (house rule: unescape shortens in place; never re-join after).
+           A field-1 longer than the path budget cannot be stat'd —
+           a truncated prefix could ENOENT a live row into deletion, so
+           the whole row joins the "cannot ask" class: kept, unreachable */
         char esc[2 * LV_MAX_PATH], path[2 * LV_MAX_PATH];
-        size_t tl = strcspn(line, "\t");
-        if (tl >= sizeof esc) tl = sizeof esc - 1;
-        memcpy(esc, line, tl);
+        size_t tl = strcspn(row, "\t");
+        int statable = tl < sizeof esc;
+        if (!statable) tl = sizeof esc - 1;
+        memcpy(esc, row, tl);
         esc[tl] = 0;
         unesc_field(path, sizeof path, esc, tl);
         struct stat st;
         int gone, err;
-        if (stat(path, &st) == 0) { gone = !S_ISREG(st.st_mode); err = gone; }
+        if (!statable) { gone = 0; err = EIO; }
+        else if (stat(path, &st) == 0) { gone = !S_ISREG(st.st_mode); err = gone; }
         else { err = errno; gone = (err == ENOENT || err == ENOTDIR); }
         /* gone is the WHOLE decision: ENOENT/ENOTDIR (or a path that is
            no longer a regular file) drop; every other stat failure is
@@ -692,12 +722,10 @@ int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
         if (*np == *cp) {
             int nc = *cp ? *cp * 2 : 256;
             char **p2 = realloc(*arr, (size_t)nc * sizeof *p2);
-            if (!p2) { oom = 1; break; }
+            if (!p2) { free(row); oom = 1; break; }
             *arr = p2; *cp = nc;
         }
-        char *dup = strdup(line);
-        if (!dup) { oom = 1; break; }
-        (*arr)[(*np)++] = dup;
+        (*arr)[(*np)++] = row;          /* ownership moves to the array */
     }
     fclose(r);
     if (oom) {
@@ -706,7 +734,7 @@ int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
         free(keep); free(drop); free(hdr);
         return -2;
     }
-    int kept = kn + oversize, purged = dn;
+    int kept = kn, purged = dn;
     if (purged == 0) {                 /* nothing to do: index untouched */
         for (int i = 0; i < kn; i++) free(keep[i]);
         free(keep); free(drop); free(hdr);

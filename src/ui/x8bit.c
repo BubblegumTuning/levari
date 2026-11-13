@@ -54,7 +54,10 @@ static void x8_quant(const unsigned char *src, int spitch, unsigned char *dst,
         unsigned char *dp = dst + (size_t)y * dpitch + rx;
         int py = (y & 3) << 2;
         for (int x = 0; x < rw; x++) {
-            const unsigned char *t = X8_Q6[py | (x & 3)];
+            /* dither phase is window-absolute in BOTH axes: a partial
+               (dirty-rect) pass must continue the pattern its neighbours
+               show, or a rect edge reads as a seam on mid-tone ramps */
+            const unsigned char *t = X8_Q6[py | ((rx + x) & 3)];
             *dp++ = cube[t[sp[2]] * 36 + t[sp[1]] * 6 + t[sp[0]]];
             sp += 4;
         }

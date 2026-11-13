@@ -81,6 +81,30 @@ int main(void)
         PIN(o[0] == 42, "cube remap honored");
     }
 
+    /* dirty-rect passes must be window-position-independent: quantizing
+       the column window [rx,16) alone (what x8_present_win does per dirty
+       rect) must agree with the full-window pass. The old code took the
+       x-phase rect-relative while y was absolute: mid gray mismatched at
+       rx=1 and rx=3, i.e. a visible seam wherever rects meet */
+    {
+        unsigned char cube[256];
+        for (int i = 0; i < 256; i++) cube[i] = (unsigned char)i;
+        unsigned char src[4 * 16], full[16], part[16];
+        for (int i = 0; i < 16; i++) {
+            src[i * 4 + 0] = 136; src[i * 4 + 1] = 136;
+            src[i * 4 + 2] = 136; src[i * 4 + 3] = 255;
+        }
+        x8_quant(src, 4 * 16, full, 16, cube, 0, 0, 16, 1);
+        int seam = 0;
+        for (int rx = 1; rx < 4; rx++) {
+            for (int i = 0; i < 16; i++) part[i] = 0;
+            x8_quant(src, 4 * 16, part, 16, cube, rx, 0, 16 - rx, 1);
+            for (int x = rx; x < 16; x++)
+                if (part[x] != full[x]) seam = 1;
+        }
+        PIN(!seam, "dirty-rect phase matches full-window pass (rx 1..3)");
+    }
+
     printf("%d/%d pins pass\n", total - fails, total);
     return fails ? 1 : 0;
 }
