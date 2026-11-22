@@ -7,6 +7,30 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+/* Wake primitive (batch 21): flagship rides plain pthreads (identical
+   typedef and calls — zero flagship change); the era build swaps in a
+   Win32 manual-reset event because static winpthread condvars never
+   wake on the Win98 box (hardware log batch 20: pstm+pstmok for every
+   post, zero pwake). Keep both macro sets call-for-call identical at
+   the use sites. The era branch deliberately declares the handle as
+   void* WITHOUT including <windows.h>: that header would poison every
+   UI translation unit via this header (winuser.h's SB_* scrollbar
+   macros collide with search.c's enums — batch-21 era build trap).
+   Real type is HANDLE (void*); the operations live in
+   compat/win98_wake.h, included ONLY by player.c — the one TU that
+   touches p->wake. */
+#if defined(LV_WIN9X) && defined(_WIN32)
+typedef struct { void *ev; } lv_wake_t;
+#define LV_WAKE_T          lv_wake_t
+#else
+typedef pthread_cond_t lv_wake_t;
+#define LV_WAKE_T           lv_wake_t
+#define LV_WAKE_INIT(w)     pthread_cond_init((w), NULL)
+#define LV_WAKE_SIGNAL(w)   pthread_cond_signal(w)
+#define LV_WAKE_BROADCAST(w) pthread_cond_broadcast(w)
+#define LV_WAKE_WAIT(w, m)  pthread_cond_wait((w), (m))
+#endif
+
 enum { ST_STOP, ST_PLAY, ST_PAUSE };
 enum { CMD_NONE, CMD_PLAY, CMD_TOGGLE_PAUSE, CMD_STOP, CMD_SEEK, CMD_NEXT, CMD_PREV, CMD_SPEED };
 
@@ -52,14 +76,24 @@ typedef struct {
     pthread_mutex_t viz_mtx; /* viz_buf/n/seq: player writes, UI reads */
     int ao_open;
     pthread_mutex_t mtx; /* guards playlist mutations vs player thread */
-    pthread_cond_t wake; /* player idles here; pl_post/pl_post_seek/stop signal under mtx */
+    LV_WAKE_T wake; /* player idles here; pl_post/pl_post_seek/stop signal under mtx */
     _Atomic int quit;
+#if defined(LV_WIN9X) && defined(_WIN32)
+    void *th; /* era: HANDLE from CreateThread — winpthread's pthread_create
+                 returns EAGAIN on the box (batch 21: plyr:thr rc=11 every
+                 boot, the thread NEVER existed), so era never calls
+                 pthread_* on this field at all */
+#else
     pthread_t th;
+#endif
 } Player;
 
 void pl_player_init(Player *p, Playlist *pl);
 void pl_player_start(Player *p);
 void pl_player_stop(Player *p);
+/* wire the urlIndex bank (D5): main registers lib_url_index_save so the
+   player never links the library module; unset = URL rows never bank */
+void pl_player_set_url_save(int (*fn)(const char *url));
 void pl_post(Player *p, int cmd, int arg);
 void pl_post_seek(Player *p, double frac);
 /* display helpers */

@@ -408,7 +408,6 @@ void SNES_SPC::cpu_write_high( int data, int i, rel_time_t time )
 	}
 }
 
-int const bits_in_int = CHAR_BIT * sizeof (int);
 
 void SNES_SPC::cpu_write( int data, int addr, rel_time_t time )
 {
@@ -432,9 +431,7 @@ void SNES_SPC::cpu_write( int data, int addr, rel_time_t time )
 			#endif
 			
 			// Registers other than $F2 and $F4-$F7
-			//if ( reg != 2 && reg != 4 && reg != 5 && reg != 6 && reg != 7 )
-			// TODO: this is a bit on the fragile side
-			if ( ((~0x2F00 << (bits_in_int - 16)) << reg) < 0 ) // 36%
+			if ( reg != 2 && (reg < 4 || reg > 7) ) // 36%
 				cpu_write_smp_reg( data, time, reg );
 		}
 		// High mem/address wrap-around

@@ -3,20 +3,17 @@
    so the sum must neither wrap nor print an unbounded readout: the old
    int accumulator overflowed on two 2000000000-s rows and the footer
    read 0:00. fmt_pl_total sums in long long and saturates at
-   9999:59:59+. Technique (see skill): #include ui.c, link every object
-   EXCEPT main.c.o, ui.c.o, decode.c.o and stb_vorbis.c.o (dispatch.c.o
-   MUST stay; the two excluded TUs are pre-split leftovers that collide
-   with the dec_*.dir tier objects):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/tp \
-       test/pltot/testpltot.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-   Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
+   9999:59:59+. Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testpltot$'
+   Link = filtered levari_ui archive minus ui_pl.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
-#include "../../src/ui/ui.c"
+#include "../../src/ui/ui_pl.c"
 #include <stdlib.h>
 
 static Track rows[8];

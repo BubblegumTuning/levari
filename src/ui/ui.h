@@ -22,5 +22,11 @@ extern const char *ui_dump_path; /* save main+pl window BMPs once, then NULL */
 extern int ui_show_eq;           /* start with EQ window visible */
 extern int ui_show_vis;          /* spectrum visualization on */
 extern int ui_show_search;       /* start with search window docked left */
+/* wiring main() performs so the UI needs neither decode.h nor mpris.h:
+   ffprobe = dec_ffmpeg_probe_info (URL/options ffmpeg status lines;
+   unset = "0 = not compiled in"), raise_hook = mpris_take_raise polled
+   each event-loop tick (unset = no Raise traffic) */
+void ui_set_ffprobe(int (*fn)(char *ver_out, size_t ver_n, char *dir_out, size_t dir_n));
+void ui_set_raise_hook(int (*fn)(void));
 
 #endif

@@ -6,28 +6,20 @@
    EQ opened while the URL window holds the dock goes ABOVE it. Both the
    48 px and the 64 px (no-ffmpeg notice) URL heights are pinned.
 
-   Technique (see skill Mouse-state-machine + pldock): #include ui.c,
-   shadow the SDL window-position surface with fake windows (executable
-   definitions win over libSDL2 at link time), latch every drag ONLY via
-   the real press path (drag_begin initializes the refusal state), and
-   link every object EXCEPT main.c.o, ui.c.o and the stale tier-split
-   leftovers (decode.c.o, stb_vorbis.c.o) + the dec_*.dir tier objects:
-
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL \
-       -o build/testsnapwin test/snapwin/testsnapwin.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) \
-       $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-
-   Run with a scratch HOME: urlwin_open's lazy urlIndex prefill reads
-   $HOME/.levari/urlIndex and must stay out of the user's home.
+   Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testsnapwin$'
+   Link = filtered levari_ui archive minus ui.c.o ui_url.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy. Registered only when LV_STREAMING=ON
+   (ui_url.c compiles empty otherwise); the scratch HOME keeps the
+   ui_urlwin_open urlIndex prefill out of the user home.
 */
 #include "../../src/ui/ui.c"
+#include "../../src/ui/ui_url.c"
 #include <stdlib.h>
 
 typedef struct { int x, y, w, h; } FakeWin;
@@ -54,7 +46,7 @@ void SDL_SetWindowPosition(SDL_Window *w, int x, int y) {
 void SDL_GetWindowSize(SDL_Window *w, int *W, int *H) { FakeWin *f = slot(w); *W = f->w; *H = f->h; }
 Uint32 SDL_GetGlobalMouseState(int *x, int *y) { *x = gmx; *y = gmy; return gmb; }
 
-/* urlwin_open's SDL path, headless: fake window creation + no-op chrome */
+/* ui_urlwin_open's SDL path, headless: fake window creation + no-op chrome */
 static int create_calls;
 SDL_Window *SDL_CreateWindow(const char *t, int x, int y, int w, int h, Uint32 f) {
     (void)t; (void)f;
@@ -156,7 +148,7 @@ int main(void) {
     /* B: closing the docked URL merges the stacked EQ back down flush
        onto main: they are docked to each other, so eq gets
        merged down to the main window dock */
-    url_close();
+    ui_url_close();
     chk("B url snap slot cleared", ui.snap[SNAP_URL].w == NULL, 1);
     chk("B eq merged down onto main", fw_eq.y, 300 - EQ_H);
     chk("B eq snap dy restored", ui.snap[0].dy, -EQ_H);
@@ -167,7 +159,7 @@ int main(void) {
     chk("C url 64px docks flush above main", fw_url.y, 300 - URL_H_NOFF);
     chk("C url 64px snap dy", ui.snap[SNAP_URL].dy, -URL_H_NOFF);
     chk("C eq pushed by 64px url", fw_eq.y, 300 - URL_H_NOFF - EQ_H);
-    url_close();
+    ui_url_close();
     chk("C merge-down after 64px dock", fw_eq.y, 300 - EQ_H);
 
     /* D: no EQ on the edge: the URL window simply sits above main and
@@ -183,7 +175,7 @@ int main(void) {
     chk("D reopen re-docks above main", fw_url.y, 300 - URL_H);
     chk("D reopen re-docks x", fw_url.x, 100);
 
-    /* E: EQ snapped-above when the URL opens ABOVE it later (url_close
+    /* E: EQ snapped-above when the URL opens ABOVE it later (ui_url_close
        then a fresh dock with the EQ snap untouched) is case A; the
        reverse ORDER — url docked first, then the EQ re-shown — keeps the
        EQ on its snap offset, so the dock-first order needs no pushback. */
@@ -203,20 +195,20 @@ int main(void) {
     gmx = 110; gmy = 510;
     mkdown(&e, 10, 10);
     loop_guard(&e);
-    handle_eq_mouse(&e);
+    ui_handle_eq_mouse(&e);
     chk("F eq title press latches drag 7", ui.drag, 7);
     for (int i = 0; i < 60; i++) {          /* walk up onto the edge */
         gmy -= 6;
         mkmotion(&e, gmx - fw_eq.x, gmy - fw_eq.y);
         loop_guard(&e);
-        handle_eq_mouse(&e);
+        ui_handle_eq_mouse(&e);
     }
     chk("F eq snaps above docked url", fw_eq.y, 300 - URL_H - EQ_H);
     chk("F eq snap above x", fw_eq.x, 100);
     chk("F eq snap dy stacks over url", ui.snap[0].dy, -(URL_H + EQ_H));
     mkup(&e, gmx - fw_eq.x, gmy - fw_eq.y);
     loop_guard(&e);
-    handle_eq_mouse(&e);
+    ui_handle_eq_mouse(&e);
 
     /* G: URL title-strip drag onto the edge: inserts BELOW the snapped EQ
        and pushes it up (drag 13 rides drag_move_snap). The drag must STOP
@@ -230,21 +222,21 @@ int main(void) {
     gmx = 110; gmy = 510;
     mkdown(&e, 10, 10);
     loop_guard(&e);
-    handle_url_mouse(&e);
+    ui_handle_url_mouse(&e);
     chk("G url title press latches drag 13", ui.drag, 13);
     /* raw candidate hits the zone edge (my-wh+12 = 264) at step 59 of 4px */
     for (int i = 0; i < 62; i++) {          /* snap at 59, 3 within-slack steps */
         gmy -= 4;
         mkmotion(&e, gmx - fw_url.x, gmy - fw_url.y);
         loop_guard(&e);
-        handle_url_mouse(&e);
+        ui_handle_url_mouse(&e);
     }
     chk("G url snaps flush above main (bottom of stack)", fw_url.y, 300 - URL_H);
     chk("G url snap x", fw_url.x, 100);
     chk("G eq pushed above dragged-in url", fw_eq.y, 300 - URL_H - EQ_H);
     mkup(&e, gmx - fw_url.x, gmy - fw_url.y);
     loop_guard(&e);
-    handle_url_mouse(&e);
+    ui_handle_url_mouse(&e);
     chk("G release without wall keeps the snap", fw_url.y, 300 - URL_H);
 
     /* H: slow undock FROM the above snap (the cumulative-travel property
@@ -254,17 +246,17 @@ int main(void) {
     gmy = fw_url.y + 10;                    /* grab the title strip again */
     mkdown(&e, 10, 10);
     loop_guard(&e);
-    handle_url_mouse(&e);
+    ui_handle_url_mouse(&e);
     chk("H fresh grab latches drag 13", ui.drag, 13);
     for (int i = 0; i < 20; i++) {          /* 100 px down, 5 px per step */
         gmy += 5;
         mkmotion(&e, gmx - fw_url.x, gmy - fw_url.y);
         loop_guard(&e);
-        handle_url_mouse(&e);
+        ui_handle_url_mouse(&e);
     }
     mkup(&e, gmx - fw_url.x, gmy - fw_url.y);
     loop_guard(&e);
-    handle_url_mouse(&e);
+    ui_handle_url_mouse(&e);
     chk("H slow drag breaks the url above-snap", ui.snap[SNAP_URL].w == NULL, 1);
     chk_min("H undocked url travels with the cursor", fw_url.y, 300 - URL_H + DOCK_SNAP + 1);
 
@@ -304,28 +296,28 @@ int main(void) {
     gmx = 110; gmy = 410;
     mkdown(&e, 10, 10);
     loop_guard(&e);
-    handle_url_mouse(&e);
+    ui_handle_url_mouse(&e);
     /* snap target my-wh = 112, zone edge 124: enters at step 69 of 4px,
        then 3 within-slack steps keep the pin (reflow pushes every step) */
     for (int i = 0; i < 72; i++) {
         gmy -= 4;
         mkmotion(&e, gmx - fw_url.x, gmy - fw_url.y);
         loop_guard(&e);
-        handle_url_mouse(&e);
+        ui_handle_url_mouse(&e);
     }
     chk("J url snapped under the strut", fw_url.y, 160 - URL_H);
     chk("J pushed window pins at the strut", fw_eq.y, 100);
     chk_min("J push path: refused requests bounded", refused_calls <= 1 ? 1 : 0, 1);
     mkup(&e, gmx - fw_url.x, gmy - fw_url.y);
     loop_guard(&e);
-    handle_url_mouse(&e);
+    ui_handle_url_mouse(&e);
     wall_top = 0;
 
-    /* K: the real open path (B_URL button): urlwin_open creates the window
+    /* K: the real open path (B_URL button): ui_urlwin_open creates the window
        and docks it — relative pin so the host ffmpeg probe decides 48/64 */
     reset(URL_H);
     ui.wurl = NULL; ui.surl = NULL; create_calls = 0;
-    urlwin_open();
+    ui_urlwin_open();
     chk("K open creates the window once", create_calls, 1);
     chk("K open docks above main x", fw_url.x, 100);
     chk("K open docks above main (live height)", fw_url.y, 300 - fw_url.h);
@@ -333,18 +325,18 @@ int main(void) {
     chk("K open pushes eq by live height", fw_eq.y, 300 - fw_url.h - EQ_H);
     chk("K open is visible", ui.url_visible, 1);
     /* the B_URL button closes it, and the stack merges down */
-    url_close();
+    ui_url_close();
     chk("K close merges eq down", fw_eq.y, 300 - EQ_H);
-    urlwin_open();
+    ui_urlwin_open();
     chk("K reopen reuses + re-docks", fw_url.y, 300 - fw_url.h);
     chk("K reopen create stays one", create_calls, 1);
-    url_close();
+    ui_url_close();
 
     /* L: URL closed while it was NOT on the above-stack: the EQ (snapped
        above main all along) must not be twitched by the merge logic */
     reset(URL_H);
     fw_url = (FakeWin){ 100 + MAIN_W + 40, 100, URL_W, URL_H };  /* free, unsnapped */
-    url_close();
+    ui_url_close();
     chk("L unsnapped url close leaves eq docked", fw_eq.y, 300 - EQ_H);
     chk("L unsnapped url close clears nothing it did not own", ui.snap[0].w != NULL, 1);
 

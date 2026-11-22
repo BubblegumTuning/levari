@@ -1,23 +1,20 @@
-/* unit test: the playlist SCAN button (action(PB_SCAN)) end to end —
+/* unit test: the playlist SCAN button (ui_action(PB_SCAN)) end to end —
    re-probe updates the Track AND the index (decision A append-if-absent),
    missing file -> red title-strip message + stdout, CUE virtual row and
    select-all state are guarded no-ops, background scan -> refusal message,
    and a real title change preempts the message (refresh_title).
-   Technique: #include ui.c (see testoptenc for the rationale); run with a
-   scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
-   Link shape (canonical tier form — the stale pre-split decode.c.o
-   leftovers carry no dec_ffmpeg_probe_info; dispatch.c.o + the
-   dec_*.dir glob resolve the plain symbols, same fix as test/plmultisel):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/tps \
-       test/plscan/testplscan.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
+   Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testplscan$'
+   Link = filtered levari_ui archive minus ui.c.o ui_pl.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
 #include "../../src/ui/ui.c"
+#include "../../src/ui/ui_pl.c"
 #include <stdlib.h>
 
 static Player fake_pl;
@@ -72,7 +69,7 @@ int main(void) {
     pl_select1(0);
 
     /* happy path: Track updated + index row appended (no index existed) */
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("track title refreshed", strcmp(pl.items[0].tags.title, "ScanMe") == 0, 1);
     chk("no error message on success", ui.msg[0] == 0, 1);
     char idx[LV_MAX_PATH];
@@ -90,27 +87,29 @@ int main(void) {
        row's tags AND the index both verifiably untouched */
     ui.msg[0] = 0;
     lv_strlcpy(pl.items[0].tags.title, "SENTINEL", sizeof pl.items[0].tags.title);
-    long n0 = lib_index_load().n;
+    LibIndex i0 = lib_index_load();
+    long n0 = i0.n;
+    lib_index_free(&i0);
     pl.items[0].end_sec = 100;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("virtual row: silent", ui.msg[0] == 0, 1);
     chk("virtual row: row tags untouched", strcmp(pl.items[0].tags.title, "SENTINEL") == 0, 1);
-    chk("virtual row: index untouched", lib_index_load().n == n0, 1);
+    { LibIndex i0 = lib_index_load(); chk("virtual row: index untouched", i0.n == n0, 1); lib_index_free(&i0); }
     pl.items[0].end_sec = 0;
 
     /* select-all state: no-op (multi-select comes later) — silent AND
        the row/index verifiably untouched */
     ui.pl_selall = 1;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("select-all: silent", ui.msg[0] == 0, 1);
     chk("select-all: row tags untouched", strcmp(pl.items[0].tags.title, "SENTINEL") == 0, 1);
-    chk("select-all: index untouched", lib_index_load().n == n0, 1);
+    { LibIndex i0 = lib_index_load(); chk("select-all: index untouched", i0.n == n0, 1); lib_index_free(&i0); }
     ui.pl_selall = 0;
     lv_strlcpy(pl.items[0].tags.title, "ScanMe", sizeof pl.items[0].tags.title);
 
     /* background scan running: refusal message, index not touched again */
     ui.opt_scanning = 1;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("scan-running refusal message", strstr(ui.msg, "scan running") != NULL, 1);
     ui.opt_scanning = 0;
 
@@ -120,7 +119,7 @@ int main(void) {
     pl_add_file(&pl, gone);
     pl_select1(1);
     ui.msg[0] = 0;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("missing file -> red message", strstr(ui.msg, "cannot rescan") != NULL, 1);
 
     /* preemption: a real title change clears the message */

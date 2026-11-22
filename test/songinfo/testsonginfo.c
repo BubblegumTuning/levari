@@ -11,23 +11,18 @@
    (hand-muxed fixtures: real CRCs, ffmpeg packet shapes, untagged
    fallback pinned) and close
    through the X button on the window chrome.
-   Technique (see skill): #include ui.c, link every object EXCEPT
-   main.c.o AND ui.c.o AND the stale pre-split leftovers (decode.c.o,
-   stb_vorbis.c.o) + the dec_*.dir tier objects (canonical shape per
-   test/snapwin):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL -o build/testsonginfo \
-       test/songinfo/testsonginfo.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) \
-       $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-   Run with a FRESH scratch HOME/XDG_CONFIG_HOME set by the caller.
+   Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testsonginfo$'
+   Link = filtered levari_ui archive minus ui_info.c.o ui_pl.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
-#include "../../src/ui/ui.c"
+#include "../../src/ui/ui_info.c"
+#include "../../src/ui/ui_pl.c"
 #include <stdlib.h>
 
 static int fails;
@@ -338,20 +333,21 @@ int main(void) {
     fe.type = SDL_MOUSEBUTTONDOWN;
     fe.motion.x = trow.x + 5; fe.motion.y = trow.y + 9;   /* inside the box */
     fe.button.button = SDL_BUTTON_LEFT;
-    handle_info_mouse(&fe);
+    ui_handle_info_mouse(&fe);
     chk("click focuses track box", ui.info_focus, INFOI_TRACK);
-    chk("copy with focus copies", info_copy_sel(), 1);
+    chk("copy with focus copies", ui_info_copy_sel(), 1);
     {   /* the clipboard round-trip needs a video driver with clipboard
            support: accept either a match or driver refusal, never crash */
-        const char *got = SDL_GetClipboardText();
+        char *got = SDL_GetClipboardText(); /* SDL-allocated: caller must SDL_free */
         if (got && got[0]) chks("clipboard carries the value", got, "3/12");
         else printf("PASS clipboard carries the value (driver has no clipboard, skipped)\n");
+        if (got) SDL_free(got);
     }
     ui.pl_sel = 1;
     pl_menu_action(PM_INFO);          /* reopen on the cue row: focus clears */
     chk("reopen clears focus", ui.info_focus, -1);
     ui.info_focus = INFOI_COMMENT;    /* cue row has no comment */
-    chk("empty box copies nothing", info_copy_sel(), 0);
+    chk("empty box copies nothing", ui_info_copy_sel(), 0);
     Rect lastbox = info_row_rect(INFOI_N - 1);
     chk("copy rows fit height", lastbox.y + lastbox.h <= INFO_H, 1);
     chk("copy boxes fit width", lastbox.x + lastbox.w <= INFO_W, 1);
@@ -425,7 +421,7 @@ int main(void) {
     chks("flac: file split", ui.info_file, "info.flac");
 
     /* ---- multi-row selection falls back to the shift anchor ---- */
-    pl_multi_grow(2);
+    ui_pl_multi_grow(2);
     ui.pl_multi[0] = 0; ui.pl_multi[1] = 1; ui.pl_multi_n = 2;
     ui.pl_sel = 0;
     pl_menu_action(PM_INFO);
@@ -446,10 +442,10 @@ int main(void) {
     e.type = SDL_MOUSEBUTTONDOWN;
     e.motion.x = INFO_W - 12; e.motion.y = 10;      /* inside close_rect */
     e.button.button = SDL_BUTTON_LEFT;
-    handle_info_mouse(&e);
+    ui_handle_info_mouse(&e);
     chk("x: pressed armed", ui.pressed, IB_X);
     e.type = SDL_MOUSEBUTTONUP;
-    handle_info_mouse(&e);
+    ui_handle_info_mouse(&e);
     chk("x: closed", ui.info_visible, 0);
     chk("x: pressed cleared", ui.pressed, B_NONE);
     /* the window stays closed until the next menu invocation */

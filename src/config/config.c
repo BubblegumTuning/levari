@@ -1,7 +1,7 @@
 #include "config.h"
 #include "../tag/tag.h"
 #ifdef _WIN32
-#include "../compat/win32.h"
+#include "../platform/platform.h"
 #else
 #include <sys/stat.h>
 #include <sys/types.h>

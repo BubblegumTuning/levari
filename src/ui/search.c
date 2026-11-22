@@ -231,6 +231,65 @@ static void lib_load(void) {
 
 void search_lib_invalidate(void) { lib_loaded = 0; }
 
+/* ---------- PL-scope normalized-field cache ----------
+   Mirrors the LibEnt cache above for the playlist scope: run_search used
+   to norm() all four fields of every row on every keystroke. The cache is
+   keyed on the playlist identity + generation; EVERY mutation of rows or
+   searchable tags bumps Playlist.gen (pl_touch), so one rebuild absorbs a
+   keystroke storm. Touched only under sp->mtx (run_search holds it while
+   reading gen and rebuilding), so the gen read needs no extra ordering.
+   If the cache array cannot be allocated, the key never latches and
+   run_search falls back to the inline pass — OOM costs speed, never
+   results. */
+typedef struct { int row; char *nt, *na, *nal, *nf; } PRow;
+static PRow *pcache;
+static int pcache_n;
+static const Playlist *pcache_key;
+static unsigned long long pcache_gen;
+
+static void pc_free(void) {
+    for (int i = 0; i < pcache_n; i++) {
+        free(pcache[i].nt); free(pcache[i].na);
+        free(pcache[i].nal); free(pcache[i].nf);
+    }
+    free(pcache);
+    pcache = NULL; pcache_n = 0; pcache_key = NULL;
+}
+
+/* caller holds sp->mtx */
+static void pc_sync(const Playlist *pl) {
+    if (pcache_key == pl && pcache_gen == pl->gen) return;
+    pc_free();
+    if (pl->count > 0) {
+        pcache = malloc((size_t)pl->count * sizeof *pcache);
+        if (!pcache) return;   /* key stays lapsed: run_search uses the inline path */
+        for (int i = 0; i < pl->count; i++) {
+            const Track *t = &pl->items[i];
+            char fb[512];
+            const char *b = strrchr(t->path, '/');
+            b = b ? b + 1 : t->path;
+            lv_strlcpy(fb, b, sizeof fb);
+            char *dot = strrchr(fb, '.');
+            if (dot && dot > fb) *dot = 0;
+            PRow *e = &pcache[pcache_n];
+            e->row = i;
+            e->nt = norm_dup(t->tags.title);
+            e->na = norm_dup(t->tags.artist);
+            e->nal = norm_dup(t->tags.album);
+            e->nf = norm_dup(fb);
+            if (!e->nt || !e->na || !e->nal || !e->nf) {
+                /* same rule as lib_load: eval_fields derefs every F[f]
+                   without a NULL test, so an incomplete row never joins */
+                free(e->nt); free(e->na); free(e->nal); free(e->nf);
+                continue;
+            }
+            pcache_n++;
+        }
+    }
+    pcache_key = pl;
+    pcache_gen = pl->gen;
+}
+
 static int pl_find_path(const char *path) {
     int idx = -1;
     pthread_mutex_lock(&sp->mtx);
@@ -285,28 +344,43 @@ static void run_search(void) {
 
     if (scope == 0) {
         pthread_mutex_lock(&sp->mtx);
-        int n = sp->pl->count;
+        pc_sync(sp->pl);
+        int cached = pcache_key == sp->pl && pcache_gen == sp->pl->gen;
+        int n = cached ? pcache_n : sp->pl->count;
         Cand *c = n > 0 ? malloc((size_t)n * sizeof *c) : NULL;
         if (n > 0 && !c) { pthread_mutex_unlock(&sp->mtx); return; }
         int cn = 0;
-        for (int i = 0; i < n; i++) {
-            Track *t = &sp->pl->items[i];
-            char nt[768], na[768], nal[768], nf[768];
-            norm(t->tags.title, nt, sizeof nt);
-            norm(t->tags.artist, na, sizeof na);
-            norm(t->tags.album, nal, sizeof nal);
-            char fb[512];
-            const char *b = strrchr(t->path, '/');
-            b = b ? b + 1 : t->path;
-            lv_strlcpy(fb, b, sizeof fb);
-            char *dot = strrchr(fb, '.');
-            if (dot && dot > fb) *dot = 0;
-            norm(fb, nf, sizeof nf);
-            const char *F[4] = { nt, na, nal, nf };
-            int sc = eval_fields(F, nq, toks, ntok);
-            if (sc >= 0) { c[cn].score = sc; c[cn].seq = i; cn++; }
+        if (cached) {
+            for (int i = 0; i < pcache_n; i++) {
+                const char *F[4] = { pcache[i].nt, pcache[i].na,
+                                     pcache[i].nal, pcache[i].nf };
+                int sc = eval_fields(F, nq, toks, ntok);
+                if (sc >= 0) { c[cn].score = sc; c[cn].seq = pcache[i].row; cn++; }
+            }
+        } else {
+            /* the cache array did not allocate (or the list is empty):
+               the original per-keystroke pass, results identical */
+            for (int i = 0; i < sp->pl->count; i++) {
+                Track *t = &sp->pl->items[i];
+                char nt[768], na[768], nal[768], nf[768];
+                norm(t->tags.title, nt, sizeof nt);
+                norm(t->tags.artist, na, sizeof na);
+                norm(t->tags.album, nal, sizeof nal);
+                char fb[512];
+                const char *b = strrchr(t->path, '/');
+                b = b ? b + 1 : t->path;
+                lv_strlcpy(fb, b, sizeof fb);
+                char *dot = strrchr(fb, '.');
+                if (dot && dot > fb) *dot = 0;
+                norm(fb, nf, sizeof nf);
+                const char *F[4] = { nt, na, nal, nf };
+                int sc = eval_fields(F, nq, toks, ntok);
+                if (sc >= 0) { c[cn].score = sc; c[cn].seq = i; cn++; }
+            }
         }
-        qsort(c, (size_t)cn, sizeof *c, cand_cmp);
+        /* empty/one-candidate list leaves c NULL (or needs no work):
+           qsort's nonnull attribute makes qsort(NULL,0) a UBSan finding */
+        if (cn > 1) qsort(c, (size_t)cn, sizeof *c, cand_cmp);
         for (int i = 0; i < cn && nres < SRCH_MAXRES; i++) {
             Track *t = &sp->pl->items[c[i].seq];
             res_push(t->path, t->tags.title, t->tags.artist, c[i].seq);
@@ -323,7 +397,7 @@ static void run_search(void) {
             int sc = eval_fields(F, nq, toks, ntok);
             if (sc >= 0) { c[cn].score = sc; c[cn].seq = i; cn++; }
         }
-        qsort(c, (size_t)cn, sizeof *c, cand_cmp);
+        if (cn > 1) qsort(c, (size_t)cn, sizeof *c, cand_cmp);
         for (int i = 0; i < cn && nres < SRCH_MAXRES; i++) {
             LibEnt *e = &libs[c[i].seq];
             res_push(e->path, e->title, e->artist, pl_find_path(e->path));

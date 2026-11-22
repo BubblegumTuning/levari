@@ -1,6 +1,6 @@
 /* unit test: playlist multi-selection (ctrl-click toggle / shift-click range)
    with multi REM and multi SCAN. Pins the selection state machine driven
-   through the real handle_pl_mouse (modifiers read via a shadowed
+   through the real ui_handle_pl_mouse (modifiers read via a shadowed
    SDL_GetKeyboardState — SDL2 button events carry no modifier mask), the
    multi-REM p->cur invariant (stop iff the current row is removed; cur
    drops by the removed rows below it), and the multi-SCAN loop end to end
@@ -11,24 +11,19 @@
    arm threshold, deferred double-click play (eaten by a drag, surviving
    jitter), in-set press deferring the collapse so a drag carries the whole
    set, edge auto-scroll, and selection/cur riding the landed rows.
-   Technique (see skill): #include ui.c, link every object EXCEPT main.c.o
-   AND ui.c.o AND the stale pre-split leftovers (decode.c.o, stb_vorbis.c.o)
-   + the dec_*.dir tier objects (canonical shape per test/snapwin — the
-   leftovers carry no dec_ffmpeg_probe_info; dispatch.c.o supplies the
-   plain symbols and resolves through the tier objects):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL -o build/testplmultisel \
-       test/plmultisel/testplmultisel.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) \
-       $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-   Run with scratch HOME/XDG_CONFIG_HOME set by the caller.
+   Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testplmultisel$'
+   Link = filtered levari_ui archive minus ui.c.o ui_pl.c.o ui_file.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
 #include "../../src/ui/ui.c"
+#include "../../src/ui/ui_pl.c"
+#include "../../src/ui/ui_file.c"
 #include <stdlib.h>
 #include <sys/stat.h>
 
@@ -70,10 +65,10 @@ static void pl_click(int row, int ctrl, int shift, int clicks) {
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_PRESSED;
     e.button.clicks = (Uint8)clicks;
-    handle_pl_mouse(&e);
+    ui_handle_pl_mouse(&e);
     e.type = SDL_MOUSEBUTTONUP;
     e.button.state = SDL_RELEASED;
-    handle_pl_mouse(&e);
+    ui_handle_pl_mouse(&e);
     fake_keys[SDL_SCANCODE_LCTRL] = fake_keys[SDL_SCANCODE_LSHIFT] = 0;
 }
 
@@ -88,7 +83,7 @@ static void pl_down(int row, int clicks) {
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_PRESSED;
     e.button.clicks = (Uint8)clicks;
-    handle_pl_mouse(&e);
+    ui_handle_pl_mouse(&e);
 }
 static void pl_motion(int y) {
     SDL_Event e;
@@ -96,7 +91,7 @@ static void pl_motion(int y) {
     e.type = SDL_MOUSEMOTION;
     e.motion.x = 100; e.motion.y = y;
     e.motion.state = SDL_BUTTON_LMASK;   /* motion fields last */
-    handle_pl_mouse(&e);
+    ui_handle_pl_mouse(&e);
 }
 static void pl_up(int row) {
     SDL_Event e;
@@ -105,7 +100,7 @@ static void pl_up(int row) {
     e.motion.x = 100; e.motion.y = 40 + row * 17 + 8;
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_RELEASED;
-    handle_pl_mouse(&e);
+    ui_handle_pl_mouse(&e);
 }
 static const char *path_at(int i) { return pl.items[i].path; }
 
@@ -114,7 +109,7 @@ static int pl_key_del(void) {
     memset(&e, 0, sizeof e);
     e.type = SDL_KEYDOWN;
     e.key.keysym.sym = SDLK_DELETE;
-    return pl_key(&e);
+    return ui_pl_key(&e);
 }
 static int pl_key_ctrla(void) {
     SDL_Event e;
@@ -122,14 +117,14 @@ static int pl_key_ctrla(void) {
     e.type = SDL_KEYDOWN;
     e.key.keysym.sym = SDLK_a;
     e.key.keysym.mod = KMOD_CTRL;
-    return pl_key(&e);
+    return ui_pl_key(&e);
 }
 static int pl_key_homeend(int end) {
     SDL_Event e;
     memset(&e, 0, sizeof e);
     e.type = SDL_KEYDOWN;
     e.key.keysym.sym = end ? SDLK_END : SDLK_HOME;
-    return pl_key(&e);
+    return ui_pl_key(&e);
 }
 
 static char dir[LV_MAX_PATH], pa[LV_MAX_PATH], pb[LV_MAX_PATH], pmiss[LV_MAX_PATH];
@@ -160,7 +155,7 @@ static void pl_reset(int nrows) {
     }
     ui.pl_sel = -1;
     ui.pl_selall = 0;
-    pl_sel_reset();
+    ui_pl_sel_reset();
     ui.pl_scroll = 0;
     p.cur = -1;
     p.cmd = CMD_NONE;
@@ -192,32 +187,32 @@ int main(void) {
     pl_reset(5);
     pl_click(2, 0, 0, 1);
     chk("plain click: one row in set", ui.pl_multi_n, 1);
-    chk("plain click: row 2 selected", pl_sel_has(2), 1);
+    chk("plain click: row 2 selected", ui_pl_sel_has(2), 1);
     chk("plain click: anchor", ui.pl_sel, 2);
     chk("plain click: no play cmd on single click", (int)p.cmd, CMD_NONE);
 
     pl_click(4, 1, 0, 1);
     chk("ctrl-click adds: two rows", ui.pl_multi_n, 2);
-    chk("ctrl-click keeps row 2", pl_sel_has(2), 1);
-    chk("ctrl-click adds row 4", pl_sel_has(4), 1);
+    chk("ctrl-click keeps row 2", ui_pl_sel_has(2), 1);
+    chk("ctrl-click adds row 4", ui_pl_sel_has(4), 1);
 
     pl_click(2, 1, 0, 1);
     chk("ctrl-click toggles off", ui.pl_multi_n, 1);
-    chk("ctrl-click removed row 2", pl_sel_has(2), 0);
-    chk("ctrl-click kept row 4", pl_sel_has(4), 1);
+    chk("ctrl-click removed row 2", ui_pl_sel_has(2), 0);
+    chk("ctrl-click kept row 4", ui_pl_sel_has(4), 1);
     chk("ctrl-click moves anchor", ui.pl_sel, 2);
 
     pl_click(0, 0, 0, 1);
     pl_click(3, 0, 1, 1);
     chk("shift-click: range 0..3", ui.pl_multi_n, 4);
-    chk("shift range has 0", pl_sel_has(0), 1);
-    chk("shift range has 3", pl_sel_has(3), 1);
-    chk("shift range excludes 4", pl_sel_has(4), 0);
+    chk("shift range has 0", ui_pl_sel_has(0), 1);
+    chk("shift range has 3", ui_pl_sel_has(3), 1);
+    chk("shift range excludes 4", ui_pl_sel_has(4), 0);
     chk("shift-click keeps anchor", ui.pl_sel, 0);
 
     pl_click(1, 0, 1, 1);
     chk("second shift-click replaces range 0..1", ui.pl_multi_n, 2);
-    chk("range 0..1 excludes 2", pl_sel_has(2), 0);
+    chk("range 0..1 excludes 2", ui_pl_sel_has(2), 0);
 
     pl_click(0, 0, 0, 1);
     chk("plain click after shift: single", ui.pl_multi_n, 1);
@@ -230,8 +225,8 @@ int main(void) {
     pl_click(1, 1, 0, 1);
     chk("ctrl-click on select-all: all minus one", ui.pl_multi_n, 4);
     chk("ctrl-click on select-all: flag cleared", ui.pl_selall, 0);
-    chk("ctrl-click on select-all: clicked off", pl_sel_has(1), 0);
-    chk("ctrl-click on select-all: row 0 on", pl_sel_has(0), 1);
+    chk("ctrl-click on select-all: clicked off", ui_pl_sel_has(1), 0);
+    chk("ctrl-click on select-all: row 0 on", ui_pl_sel_has(0), 1);
 
     /* double-click plays only without modifiers */
     pl_click(2, 1, 0, 2);
@@ -248,7 +243,7 @@ int main(void) {
     pl_click(3, 1, 0, 1);
     p.cur = 3;
     p.cmd = CMD_NONE;
-    action(PB_REM);
+    ui_action(PB_REM);
     chk("multi REM: count 5 -> 2", pl.count, 2);
     {
         char want[LV_MAX_PATH];
@@ -266,17 +261,17 @@ int main(void) {
     p.cur = 3;
     p.cmd = CMD_NONE;
     ui.pl_multi[0] = 0; ui.pl_multi_n = 1;   /* direct: REM is what is under test */
-    action(PB_REM);
+    ui_action(PB_REM);
     chk("REM away from cur: no stop", (int)p.cmd, CMD_NONE);
     chk("REM away from cur: cur shifts", (long)p.cur, 2);
 
     pl_reset(5);
-    action(PB_REM);
+    ui_action(PB_REM);
     chk("REM with empty selection: untouched", pl.count, 5);
 
     pl_reset(5);
     ui.pl_selall = 1;
-    action(PB_REM);
+    ui_action(PB_REM);
     chk("REM select-all: clears", pl.count, 0);
     chk("REM select-all: cur -1", (long)p.cur, -1);
 
@@ -297,13 +292,13 @@ int main(void) {
     chk("END handled", pl_key_homeend(1), 1);
     chk("END selects last row", ui.pl_sel, 19);
     chk("END single selection", ui.pl_multi_n, 1);
-    chk("END set holds row 19", pl_sel_has(19), 1);
+    chk("END set holds row 19", ui_pl_sel_has(19), 1);
     chk("END scrolls to bottom", ui.pl_scroll, 12);
     ui.pl_selall = 1;
     chk("HOME handled", pl_key_homeend(0), 1);
     chk("HOME clears select-all flag", ui.pl_selall, 0);
     chk("HOME selects first row", ui.pl_sel, 0);
-    chk("HOME set holds only row 0", ui.pl_multi_n + (pl_sel_has(0) ? 0 : 100), 1);
+    chk("HOME set holds only row 0", ui.pl_multi_n + (ui_pl_sel_has(0) ? 0 : 100), 1);
     chk("HOME scrolls to top", ui.pl_scroll, 0);
 
     pl_reset(3);                     /* fits entirely: END must not scroll negative */
@@ -319,16 +314,16 @@ int main(void) {
     snprintf(pl.items[2].path, sizeof pl.items[2].path, "%s", pmiss);
     ui.pl_multi[0] = 0; ui.pl_multi[1] = 1; ui.pl_multi[2] = 2; ui.pl_multi_n = 3;
     ui.opt_scanning = 1;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("SCAN during background scan refuses", strcmp(ui.msg, "  scan running, wait") == 0, 1);
-    chk("refusal wrote no index", lib_index_load().n, 0);
+    { LibIndex t0 = lib_index_load(); chk("refusal wrote no index", t0.n, 0); lib_index_free(&t0); }
     ui.opt_scanning = 0;
 
     /* select-all remains the deliberate no-op (decision D) */
     ui.pl_selall = 1;
     ui.msg[0] = 0;
-    action(PB_SCAN);
-    chk("SCAN select-all: no-op", lib_index_load().n, 0);
+    ui_action(PB_SCAN);
+    { LibIndex t0 = lib_index_load(); chk("SCAN select-all: no-op", t0.n, 0); lib_index_free(&t0); }
     chk("SCAN select-all: silent", ui.msg[0], 0);
     ui.pl_selall = 0;
 
@@ -337,7 +332,7 @@ int main(void) {
     /* a CUE virtual row must be skipped, its parent-less path never indexed */
     pl.items[2].end_sec = 30;              /* missing.mp3 as virtual row: skip */
     ui.pl_multi_n = 3;
-    action(PB_SCAN);                        /* {a, b} index, virtual skips */
+    ui_action(PB_SCAN);                        /* {a, b} index, virtual skips */
     LibIndex ix = lib_index_load();
     chk("multi SCAN indexed both files", ix.n, 2);
     int seen_a = 0, seen_b = 0;
@@ -355,15 +350,15 @@ int main(void) {
     pl.items[2].end_sec = 0;
     ui.pl_multi_n = 3;
     ui.msg[0] = 0;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("SCAN batch with a dead row: summary msg", strcmp(ui.msg, "  cannot rescan") == 0, 1);
-    chk("SCAN batch still kept index at 2 rows (missing not appended)", lib_index_load().n, 2);
+    { LibIndex t0 = lib_index_load(); chk("SCAN batch still kept index at 2 rows (missing not appended)", t0.n, 2); lib_index_free(&t0); }
 
     /* re-SCAN after retag lands fresh values on the row and the index */
     write_tagged(pa, "CCC");
     ui.pl_multi[0] = 0; ui.pl_multi_n = 1;
     ui.msg[0] = 0;
-    action(PB_SCAN);
+    ui_action(PB_SCAN);
     chk("re-SCAN applies fresh tags to the row", strcmp(pl.items[0].tags.title, "CCC"), 0);
     ix = lib_index_load();
     int ccc = 0;
@@ -383,10 +378,10 @@ int main(void) {
         e.motion.x = 250; e.motion.y = 200;
         e.button.button = SDL_BUTTON_RIGHT;
         e.button.state = SDL_PRESSED;
-        handle_pl_mouse(&e);
+        ui_handle_pl_mouse(&e);
         chk("right-click opens the edit menu", ui.pl_menu, 1);
         chk("right-click selects nothing", ui.pl_multi_n, 1);
-        chk("right-click still selected row 3", pl_sel_has(3), 1);
+        chk("right-click still selected row 3", ui_pl_sel_has(3), 1);
         chk("right-click presses no button", ui.pressed, B_NONE);
         chk("right-click latches no drag", ui.drag, 0);
 
@@ -396,10 +391,10 @@ int main(void) {
         e.motion.x = 200; e.motion.y = 60;   /* over row 1, right of the menu */
         e.button.button = SDL_BUTTON_LEFT;
         e.button.state = SDL_PRESSED;
-        handle_pl_mouse(&e);
+        ui_handle_pl_mouse(&e);
         chk("outside click closes menu", ui.pl_menu, 0);
         chk("outside click did NOT select the row under it", ui.pl_multi_n, 1);
-        chk("selection unchanged by eaten click", pl_sel_has(3), 1);
+        chk("selection unchanged by eaten click", ui_pl_sel_has(3), 1);
         chk("eaten click pressed no button", ui.pressed, B_NONE);
 
         /* Esc closes while open, and claims; when closed it passes through */
@@ -408,11 +403,11 @@ int main(void) {
         k.type = SDL_KEYDOWN;
         k.key.keysym.sym = SDLK_ESCAPE;
         e.button.button = SDL_BUTTON_RIGHT;  /* reopen */
-        handle_pl_mouse(&e);
+        ui_handle_pl_mouse(&e);
         chk("reopen menu", ui.pl_menu, 1);
-        chk("Esc claims while menu open", pl_key(&k), 1);
+        chk("Esc claims while menu open", ui_pl_key(&k), 1);
         chk("Esc closed the menu", ui.pl_menu, 0);
-        chk("Esc passes through when closed", pl_key(&k), 0);
+        chk("Esc passes through when closed", ui_pl_key(&k), 0);
     }
     {
         /* click ON an item fires its action and closes: titles E D C B A,
@@ -426,10 +421,10 @@ int main(void) {
         e.motion.x = 250; e.motion.y = 200;
         e.button.button = SDL_BUTTON_RIGHT;
         e.button.state = SDL_PRESSED;
-        handle_pl_mouse(&e);
+        ui_handle_pl_mouse(&e);
         e.motion.x = 47; e.motion.y = 8;     /* SORT TITLE item center */
         e.button.button = SDL_BUTTON_LEFT;
-        handle_pl_mouse(&e);
+        ui_handle_pl_mouse(&e);
         chk("menu item closes menu", ui.pl_menu, 0);
         char want[LV_MAX_PATH];
         snprintf(want, sizeof want, "%s/r4.mp3", dir);   /* title "A" */
@@ -524,7 +519,7 @@ int main(void) {
     kk.type = SDL_KEYDOWN;
     kk.key.keysym.sym = SDLK_k;
     kk.key.keysym.mod = KMOD_CTRL;
-    chk("Ctrl+K claims in the playlist window", pl_key(&kk), 1);
+    chk("Ctrl+K claims in the playlist window", ui_pl_key(&kk), 1);
 
     /* keyboard shortcuts: claim only what they act on */
     pl_reset(5);
@@ -535,33 +530,33 @@ int main(void) {
         c.type = SDL_KEYDOWN;
         c.key.keysym.sym = SDLK_c;
         c.key.keysym.mod = KMOD_CTRL;
-        chk("Ctrl+C claims with a selection", pl_key(&c), 1);
+        chk("Ctrl+C claims with a selection", ui_pl_key(&c), 1);
         c.key.keysym.mod = 0;
-        chk("plain c falls through to the global hotkey", pl_key(&c), 0);
+        chk("plain c falls through to the global hotkey", ui_pl_key(&c), 0);
         SDL_Event d;
         memset(&d, 0, sizeof d);
         d.type = SDL_KEYDOWN;
         d.key.keysym.sym = SDLK_DOWN;
         /* plain arrows walk the playlist cursor now (they used to be
            the global volume hotkey) */
-        chk("plain Down claims (cursor walk)", pl_key(&d), 1);
-        chk("Down landed cursor on row 1", pl_sel_has(1) && ui.pl_multi_n == 1, 1);
+        chk("plain Down claims (cursor walk)", ui_pl_key(&d), 1);
+        chk("Down landed cursor on row 1", ui_pl_sel_has(1) && ui.pl_multi_n == 1, 1);
         d.key.keysym.sym = SDLK_UP;
-        chk("plain Up claims", pl_key(&d), 1);
-        chk("Up returned cursor to row 0", pl_sel_has(0) && ui.pl_multi_n == 1, 1);
+        chk("plain Up claims", ui_pl_key(&d), 1);
+        chk("Up returned cursor to row 0", ui_pl_sel_has(0) && ui.pl_multi_n == 1, 1);
         /* Ctrl+arrow stays unclaimed (modifier passes through) */
         d.key.keysym.sym = SDLK_DOWN;
         d.key.keysym.mod = KMOD_CTRL;
-        chk("Ctrl+Down passes through", pl_key(&d), 0);
+        chk("Ctrl+Down passes through", ui_pl_key(&d), 0);
         /* re-arm selection {0} for the Alt row-move test */
         d.key.keysym.mod = KMOD_ALT;
         ui.pl_multi[0] = 0; ui.pl_multi_n = 1;
         char r0[LV_MAX_PATH];
         snprintf(r0, sizeof r0, "%s/r0.mp3", dir);
-        chk("Alt+Down claims with a selection", pl_key(&d), 1);
+        chk("Alt+Down claims with a selection", ui_pl_key(&d), 1);
         chk("Alt+Down moved row 0 down", strcmp(pl.items[1].path, r0) == 0, 1);
         ui.pl_multi_n = 0;
-        chk("Alt+Down passes with no selection", pl_key(&d), 0);
+        chk("Alt+Down passes with no selection", ui_pl_key(&d), 0);
         /* volume now lives on +/- (and the numpad); '=' shares the + key
            on common layouts, so it raises too; arrows never touch it */
         p.vol = 64;
@@ -644,7 +639,7 @@ int main(void) {
         e.type = SDL_MOUSEBUTTONDOWN;
         e.button.button = SDL_BUTTON_LEFT;
         e.motion.x = FILE_W - 60 + 20; e.motion.y = FILE_H - 16 + 6;
-        handle_file_mouse(&e);
+        ui_handle_file_mouse(&e);
         chk("ADD DIR inert in SAVE mode", ui.pressed, B_NONE);
         ui.file_saving = 0;
     }
@@ -674,7 +669,7 @@ int main(void) {
             chk("drag order row1", strcmp(path_at(1), want1) == 0, 1);
             chk("drag order row2", strcmp(path_at(2), want2) == 0, 1);
         }
-        chk("selection rides to the landing", pl_sel_has(2), 1);
+        chk("selection rides to the landing", ui_pl_sel_has(2), 1);
         chk("set stays one row", ui.pl_multi_n, 1);
         chk("anchor follows", ui.pl_sel, 2);
         chk("cur follows the block", p.cur, 2);
@@ -703,7 +698,7 @@ int main(void) {
             snprintf(w, sizeof w, "%s/r1.mp3", dir);
             chk("dbl-drag landed at gap", strcmp(path_at(3), w) == 0, 1);
         }
-        chk("dbl-drag selection follows", pl_sel_has(3), 1);
+        chk("dbl-drag selection follows", ui_pl_sel_has(3), 1);
 
         /* press inside a multi-row set: the set survives the press and
            the drag carries ALL of it; a released press still collapses */
@@ -726,20 +721,20 @@ int main(void) {
             chk("set-drag order 3", strcmp(path_at(3), w3) == 0, 1);
         }
         chk("set-drag keeps two rows", ui.pl_multi_n, 2);
-        chk("set-drag rows remapped", pl_sel_has(2) && pl_sel_has(3), 1);
+        chk("set-drag rows remapped", ui_pl_sel_has(2) && ui_pl_sel_has(3), 1);
         pl_reset(5);
         pl_click(1, 0, 0, 1);
         pl_click(3, 1, 0, 1);
         pl_down(1, 1);
         pl_up(1);                                /* never moved: collapse */
         chk("released in-set press collapses", ui.pl_multi_n, 1);
-        chk("collapse lands on the pressed row", pl_sel_has(1), 1);
+        chk("collapse lands on the pressed row", ui_pl_sel_has(1), 1);
 
         /* press OUTSIDE the set collapses immediately (old semantics,
            so a drag from outside carries just that row) */
         pl_down(4, 1);
         chk("outside press collapses at down", ui.pl_multi_n, 1);
-        chk("outside press selects row", pl_sel_has(4), 1);
+        chk("outside press selects row", ui_pl_sel_has(4), 1);
         pl_up(4);                                /* no motion: no drop */
 
         /* edge auto-scroll: 3 visible lines, 10 rows, scrolled to 3;
@@ -755,7 +750,7 @@ int main(void) {
             e.motion.x = 100; e.motion.y = 40 + 17 + 8;   /* line 1 */
             e.button.button = SDL_BUTTON_LEFT;
             e.button.state = SDL_PRESSED;
-            handle_pl_mouse(&e);
+            ui_handle_pl_mouse(&e);
         }
         chk("auto-scroll pressed row 4", ui.pl_sel, 4);
         pl_motion(40 + 4);                       /* top-edge zone */

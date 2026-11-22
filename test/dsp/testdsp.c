@@ -1,8 +1,9 @@
 /* unit test: EQ band_mask (flat-band skip, denormal collapse) and the
-   WSOLA mono-mix coarse search. Standalone:
-     gcc -std=gnu11 -Isrc/dsp -o /tmp/td test/dsp/testdsp.c src/dsp/dsp.c -lm -lpthread
-     gcc -std=gnu11 -fsanitize=address,undefined -Isrc/dsp -o /tmp/td test/dsp/testdsp.c src/dsp/dsp.c -lm -lpthread
-*/
+   WSOLA mono-mix coarse search. CTest: cmake --build build && ctest --test-dir build -R '^testdsp$'.
+   The target compiles testdsp.c + dsp.c with -ffp-contract=off (the
+   bit-identical-chain pins compare a hand-written biquad against
+   eq_process: identical FP rules or the pin is meaningless). Sanitizer
+   shape: configure -DLV_SANITIZE=ON — the target inherits it wholesale. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,19 +76,74 @@ int main(void) {
     eq_process(&e, A, 4096, 2);
     chk("flat EQ output bit-identical to input", memcmp(A, in, sizeof in) == 0);
 
-    /* --- preamp with flat bands: exact gain, no band math --- */
-    e = mk(3, flat, 44100);
-    memcpy(A, in, sizeof in);
-    eq_process(&e, A, 4096, 2);
-    float g = (float)pow(10.0, 3.0 / 20.0);
-    int ok = 1;
-    for (int i = 0; i < 4096 * 2; i++) {
-        float v = (float)in[i] * g;
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        if (A[i] != (int16_t)v) { ok = 0; break; }
+    /* --- preamp with flat bands: integer Q14 path (opt item 3, 2026-11-17).
+       The pre-integer pin demanded bit-exactness against the float chain;
+       the integer path rounds Q14-to-nearest where float truncates, so the
+       deliberate contract is now the MEASURED envelope against the float
+       reference (worst deviations printed, pinned <=2 LSB), plus exact
+       saturation and cache-refresh pins. --- */
+    {
+        e = mk(3, flat, 44100);
+        memcpy(A, in, sizeof in);
+        eq_process(&e, A, 4096, 2);
+        float g3 = (float)pow(10.0, 3.0 / 20.0);
+        long w3 = 0;
+        for (int i = 0; i < 4096 * 2; i++) {
+            float v = (float)in[i] * g3;
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            long d = labs((long)A[i] - (long)(int16_t)v);
+            if (d > w3) w3 = d;
+        }
+        printf("  (deviation vs float ref, +3 dB random: %ld LSB)\n", w3);
+        chk("integer preamp within 2 LSB of float ref (+3 dB)", w3 <= 2);
+
+        /* the widest legitimate gain, EVERY int16 input (q-margin worst case) */
+        static int16_t big[65536], big2[65536];
+        for (int i = 0; i < 65536; i++) big2[i] = big[i] = (int16_t)(i - 32768);
+        EQ ex = mk(12, flat, 44100);
+        chk("+12 dB q stays inside the int32-safe gate", ex.preamp_q <= 65536);
+        eq_process(&ex, big2, 65536, 1);
+        float gx = (float)pow(10.0, 12.0 / 20.0);
+        long wx = 0;
+        for (int i = 0; i < 65536; i++) {
+            float v = (float)big[i] * gx;
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            long d = labs((long)big2[i] - (long)(int16_t)v);
+            if (d > wx) wx = d;
+        }
+        printf("  (deviation vs float ref, +12 dB exhaustive 65536: %ld LSB)\n", wx);
+        chk("integer preamp within 2 LSB of float ref (+12 dB, all int16)", wx <= 2);
+        chk("+12 dB clamps high exactly (no wrap)", big2[65535] == 32767);
+        chk("+12 dB clamps low exactly (no wrap)", big2[0] == -32768);
+
+        /* the consumer-side refresh: direct preamp_db writes (config load,
+           tests) must reach the very next chunk */
+        EQ cw = mk(0, flat, 44100);
+        cw.preamp_db = -6;
+        static int16_t four[4] = { 1000, -1000, 32767, -32768 };
+        eq_process(&cw, four, 4, 1);
+        float g6 = (float)pow(10.0, -6.0 / 20.0);
+        long d6 = labs((long)four[0] - (long)(int16_t)((float)1000 * g6));
+        chk("direct preamp_db write is seen without the setter", d6 <= 2);
+        int16_t after[4];
+        memcpy(after, four, sizeof after);   /* the -6 dB state, not the input */
+        cw.preamp_db = 0;
+        eq_process(&cw, four, 4, 1);
+        chk("unity after direct change skips untouched",
+            memcmp(four, after, sizeof four) == 0);
+
+        /* past the int32-safe gate the float path must stay (saturating,
+           never wrapping): a setter-clamped user can never send this, a
+           direct write or future slider could */
+        EQ ov = mk(0, flat, 44100);
+        ov.preamp_db = 40;
+        static int16_t sat[2] = { 30000, -30000 };
+        eq_process(&ov, sat, 2, 1);
+        chk("out-of-gate preamp clamps on the float path (no wrap)",
+            sat[0] == 32767 && sat[1] == -32768);
     }
-    chk("flat bands + 3 dB preamp is exact gain", ok);
 
     /* --- active bands match the reference chain on active bands --- */
     e = mk(2, one, 44100);

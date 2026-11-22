@@ -206,15 +206,15 @@ scan passes (see the ARM section and the pi block in the script).
 ## Windows build
 
 Cross-compile with MinGW-w64 (or build natively in MSYS2). Requires the
-SDL2 MinGW devel package from https://libsdl.org (SDL2-devel-mingw.zip)
-and a MinGW zlib (static preferred):
+SDL2 MinGW devel package from https://libsdl.org (SDL2-devel-mingw.zip);
+no zlib (the glyph blob inflates through the vendored raw-LZMA1 decoder):
 
-    x86_64-w64-mingw32-... # install mingw-w64 gcc/g++ and mingw-zlib
+    x86_64-w64-mingw32-... # install mingw-w64 gcc/g++
     cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=tools/mingw-w64-toolchain.cmake \
           -DSDL2_DIR=/path/to/SDL2-2.32.10/cmake -DCMAKE_BUILD_TYPE=Release
     cmake --build build-win
 
-Produces a self-contained `levari.exe` (console app; SDL2 and zlib are
+Produces a self-contained `levari.exe` (console app; SDL2 is
 linked statically, only system DLLs are required at runtime).
 On Windows the player uses the SDL audio backend (WASAPI under the
 hood), named pipes (`\\.\pipe\levari-<user>`) for daemon/CLI IPC,
@@ -225,24 +225,49 @@ build yet).
 
 ## Windows 98 legacy build (era floor)
 
-A separate pipeline for Windows 98 SE-class machines (i686): its own
+A separate pipeline for Windows 98 SE-class machines (i686, and not
+just any i686: no SSE — a Pentium II SIGILL'd on the Nov 11 prefix,
+which carried 3182 SSE insns from SDL's configure SIMD probes): its own
 flag `-DLV_WIN9X=ON`, its own build dir, its own release zip. The
 flagship Windows binary's floor never moves toward 98. The release.sh
 target is OPT-IN (`WIN98_RELEASE=1`) — the era build stays a
 possibility, not a regular release target; a default release run skips
 it with a notice. Status: the
-build and the import-table floor gate are verified; runtime on real 98
-hardware is not yet verified — treat the zip as experimental (see
+build and the import-table floor gate are verified; first real-hardware
+run (Pentium II) got past the loader entirely and died on SSE — fixed
+by the ISA floor below; full runtime verification continues (see
 docs/WIN98-NOTES.txt, which ships inside it).
 
 Host prereqs (RHEL-family): `sudo dnf install mingw32-gcc
-mingw32-gcc-c++ mingw32-zlib mingw32-zlib-static` (the static zlib is
-the CRB package; without libz.a the exe imports zlib1.dll).
+mingw32-gcc-c++` (no zlib since the glyph blob moved to the vendored
+LZMA decoder).
 
 One-time era SDL2 bootstrap — SDL 2.0.8 static, pinned sha256, zero
 source patches; default prefix `~/sdl2-win98`, or pass your own:
 
     tools/build_sdl2_win98.sh
+
+ISA floor (verified on real hardware, 2026-11-17): the era box is a
+Pentium II — no SSE. The SDL bootstrap therefore passes
+`--disable-sse2 --disable-sse --disable-mmx --disable-amd3dnow` (SDL
+2.0.8's configure otherwise probes those flags and APPENDS them to
+every file, overriding `-mno-*`), and the era toolchain file pins
+`-march=pentiumpro -mno-sse -mno-sse2` for the app tree. Do not
+remove either guard on a toolchain update: SDL's probes pass even on
+compilers whose defaults are already SIMD-clean, so the prefix built
+2026-11-11 (before this pinning) shipped SSE.
+`tools/win98_gate.py` now scans the full disassembly and fails on any
+`%xmm`/`%mmx` use.
+
+MSLU (runtime Unicode, decided by hardware 2026-11-17): SDL forces
+UNICODE mode and 9x's `*W` entry points are dead stubs, so without a
+Unicode layer SDL cannot create a window — the era exe silently died
+in `SDL_Init`. The era build now sets the PE Unicode-Aware flag
+post-link (`tools/win98_mslu.py`, asserted by gate section 6); the 98
+loader then uses `unicows.dll` (user-supplied beside the exe — never
+shipped; WIN98-NOTES.txt documents acquisition). Era builds also show
+the `SDL_Init` failure via `MessageBoxA` instead of losing it to the
+GUI subsystem's ownerless stderr.
 
 Then the player:
 
@@ -258,10 +283,11 @@ skips win98 packaging if it fires — the flagship zips still ship):
     file build-win98/levari.exe
     #   must report PE32 executable (GUI) Intel 80386
     python3 tools/win98_gate.py i686-w64-mingw32-objdump build-win98/levari.exe <version>
-    #   asserts: NT-only import denylist == 0 hits (every entry is
-    #   loader-rejecting on 9x kernel32/advapi32 — absent exports, not
-    #   deprecated ones), PE32 not PE32+, Intel 80386, GUI subsystem
-    #   with MajorSubsystemVersion 4, embedded v<version> + x86 tokens.
+    #   asserts: every imported (dll, name) is in the adjudicated
+    #   98-SE-delivered allow-list (an allow-list, not a deny-list —
+    #   the old deny-list missed loader-killers twice), PE32 not PE32+,
+    #   Intel 80386, GUI subsystem with MajorSubsystemVersion 4,
+    #   embedded v<version> + x86 tokens.
     #   The flagship build-win exe must FAIL this gate (control).
 
 Why this shape (measured, not folklore): no SDL2 release ever handled

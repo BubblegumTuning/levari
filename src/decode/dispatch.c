@@ -18,7 +18,7 @@
 #include <string.h>
 
 #define LV_TIER_EXTERN(SFX)                                                    \
-    extern Decoder   *dec_open##SFX(const char *path);                         \
+    extern Decoder   *dec_open##SFX(const char *path, const DecOpts *opts);  \
     extern int        dec_rate##SFX(const Decoder *d);                         \
     extern int        dec_channels##SFX(const Decoder *d);                     \
     extern long long  dec_total_frames##SFX(const Decoder *d);                 \
@@ -38,7 +38,7 @@ LV_TIER_EXTERN(_avx2)
 #endif
 
 typedef struct {
-    Decoder  *(*open)(const char *path);
+    Decoder  *(*open)(const char *path, const DecOpts *opts);
     int       (*rate)(const Decoder *d);
     int       (*channels)(const Decoder *d);
     long long (*total_frames)(const Decoder *d);
@@ -126,7 +126,7 @@ static DecTier *tier(void) {
     return &t;
 }
 
-Decoder *dec_open(const char *path) { return tier()->open(path); }
+Decoder *dec_open(const char *path, const DecOpts *opts) { return tier()->open(path, opts); }
 int dec_rate(const Decoder *d) { return tier()->rate(d); }
 int dec_channels(const Decoder *d) { return tier()->channels(d); }
 long long dec_total_frames(const Decoder *d) { return tier()->total_frames(d); }

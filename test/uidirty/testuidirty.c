@@ -19,18 +19,16 @@
         region passes present their rects via SDL_UpdateWindowSurfaceRects
         and NEVER the whole-window call; a full pass keeps the whole-window
         call; a NULL window presents nothing.
-   Technique + link recipe as in test/plmultisel (#include ui.c; every
-   levari.dir object EXCEPT main.c.o and ui.c.o, dispatch.c.o IN, the two
-   pre-split leftovers decode.c.o / stb_vorbis.c.o EXCLUDED, all dec_*.dir
-   tier objects IN):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL \
-       -o /tmp/tuidirty test/uidirty/testuidirty.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
+   Technique: #include ui.c (core: main_draw_regions/rgn_hit/draw_main/win_present_main).
+   Build, link and run are CTest targets now (refactor item 3 — the
+   find-glob recipes died with levari.dir's objects):
+     cmake --build build && ctest --test-dir build -R '^testuidirty$'
+   Link = filtered levari_ui archive minus ui.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
 #include "../../src/ui/ui.c"
 #include <stdlib.h>

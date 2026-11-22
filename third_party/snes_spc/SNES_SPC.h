@@ -176,13 +176,12 @@ private:
 		
 		struct
 		{
-			// padding to neutralize address overflow
-			union {
-				uint8_t padding1 [0x100];
-				uint16_t align; // makes compiler align data for 16-bit access
-			} padding1 [1];
-			uint8_t ram      [0x10000];
-			uint8_t padding2 [0x100];
+			/* Padding to neutralize address overflow. Must live in the same
+			   array as RAM (libgme b2dc7f0): a separate padding2[] is undefined
+			   behaviour when indexed from RAM[], and ASan/UBSan correctly
+			   report it as OOB (see fuzz crash opt_crash-7e2f…). */
+			uint8_t padding1 [0x100];
+			alignas(uint16_t) uint8_t ram [0x10000 + 0x100];
 		} ram;
 	};
 	state_t m;

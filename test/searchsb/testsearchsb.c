@@ -11,12 +11,9 @@
    clean); those pins run against a zeroed fake Player — do_jump remains
    untriggered.
 
-   Compile (from the repo root, after `cmake --build build`):
-
-     gcc -std=gnu11 test/searchsb/testsearchsb.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o ! -name search.c.o ! -name dispatch.c.o) \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       $(pkg-config --cflags --libs sdl2) -lz -lm -lpthread -ldl -lstdc++ -o build/testsearchsb
+   Build/run: cmake --build build && ctest --test-dir build -R '^testsearchsb$'
+   (target links filtered levari_ui minus search.c.o + engine + core + tier
+   objects; wrapper scratch env as everywhere)
 
    No SDL_Init and no real windows: every tested path is pure arithmetic
    over statics (row/do_jump and window-drag branches are deliberately
@@ -184,6 +181,74 @@ int main(void) {
         ke.key.keysym.sym = SDLK_PLUS;
         search_key(&ke);
         chk("empty results keep queue inert", fpl.count, 4);
+    }
+
+    /* ---- PL-scope normalized-field cache (2026-11-17, opt report) ----
+       run_search used to re-norm every row on every keystroke; the cache
+       is keyed on Playlist.gen. Pins: cached results identical to the
+       fresh pass, every mutation funnel re-validates (add, reverse,
+       remove), and the file-scan late-tag write-back bumps gen. The
+       fake-Player contract above applies unchanged: zeroed sp->mtx is a
+       valid initializer, run_search never touches the decoder. */
+    {
+        static Player cp;
+        static Playlist cpl;
+        sp = &cp; cp.pl = &cpl; pl_init(&cpl);
+        scope = 0;
+        pl_add_file(&cpl, "/x/alpha.mp3");
+        lv_strlcpy(cpl.items[0].tags.title, "Alpha Zeta", sizeof cpl.items[0].tags.title);
+        lv_strlcpy(cpl.items[0].tags.artist, "One", sizeof cpl.items[0].tags.artist);
+        pl_touch(&cpl);   /* exactly the lib_fill_playlist_ix contract */
+        pl_add_file(&cpl, "/x/beta.mp3");
+        lv_strlcpy(cpl.items[1].tags.title, "Beta", sizeof cpl.items[1].tags.title);
+        pl_touch(&cpl);
+        strcpy(query, "zeta");
+        run_search();
+        chk("PL cache: first pass finds one", nres, 1);
+        chk("PL cache: first row", res[0].pl_idx, 0);
+        run_search();   /* second keystroke: cached path */
+        chk("PL cache: cached pass identical", nres, 1);
+        chk("PL cache: cached row", res[0].pl_idx, 0);
+        chk("PL cache: disp built from tags", strcmp(res[0].disp, "Alpha Zeta - One") == 0, 1);
+
+        /* add: the new row joins on the next pass (append bump re-validates) */
+        pl_add_file(&cpl, "/x/zeta.mp3");
+        lv_strlcpy(cpl.items[2].tags.title, "Zeta Reticula", sizeof cpl.items[2].tags.title);
+        pl_touch(&cpl);
+        run_search();
+        chk("PL cache: add re-validates", nres, 2);
+        chk("PL cache: start-match outscores word-start", res[0].pl_idx, 2);
+        chk("PL cache: second match follows", res[1].pl_idx, 0);
+
+        /* reverse: cached seq entries must land on the NEW row indices */
+        pl_reverse(&cpl, NULL);
+        run_search();
+        chk("PL cache: reverse remaps", nres, 2);
+        chk("PL cache: zeta now row 0", res[0].pl_idx, 0);
+        chk("PL cache: alpha now row 2", res[1].pl_idx, 2);
+
+        /* remove the match: gone from results, no stale row */
+        pl_remove(&cpl, 2);
+        run_search();
+        chk("PL cache: remove re-validates", nres, 1);
+        chk("PL cache: removed row absent", res[0].pl_idx, 0);
+
+        /* clear: empty list, empty results (cache survives as a no-op) */
+        pl_clear(&cpl);
+        run_search();
+        chk("PL cache: cleared list finds none", nres, 0);
+
+        /* the file-I/O mutator: a late tag write-back must bump gen.
+           Runs from the repo root like every gate here. */
+        {
+            static Playlist sp2;
+            pl_init(&sp2);
+            pl_add_file(&sp2, "test/tone.wav");   /* a real file with no tags */
+            unsigned long long g0 = sp2.gen;
+            pl_scan_tags(&sp2, NULL);             /* single-threaded context */
+            chk("pl_scan_tags write-back bumps gen", sp2.gen != g0, 1);
+            pl_clear(&sp2);
+        }
     }
 
     printf(fails ? "%d FAILURES\n" : "all pass\n", fails);

@@ -46,6 +46,10 @@ void eq_init(EQ *e, double rate) {
     pthread_mutex_init(&e->mtx, NULL);
     e->enabled = 0;
     e->preamp_db = 0;
+    /* NAN != every value, so the first eq_process always refreshes */
+    e->preamp_cache_db = NAN;
+    e->preamp_gain = 1.0f;
+    e->preamp_q = 16384;
     for (int i = 0; i < EQ_BANDS; i++) e->band_db[i] = 0;
     e->rate = rate;
     eq_design_locked(e);
@@ -129,9 +133,33 @@ static inline float run(Biquad *b, float x) {
 void eq_process(EQ *e, int16_t *buf, int frames, int ch) {
     pthread_mutex_lock(&e->mtx);
     if (!e->enabled) { pthread_mutex_unlock(&e->mtx); return; }
+    /* one pow() per change, not per chunk: every writer of preamp_db,
+       setter or direct, is caught by the consumer-side comparison */
+    if (e->preamp_db != e->preamp_cache_db) {
+        e->preamp_cache_db = e->preamp_db;
+        e->preamp_gain = (float)pow(10.0, e->preamp_db / 20.0);
+        e->preamp_q = (int32_t)(e->preamp_gain * 16384.0f + 0.5f);
+    }
     unsigned mask = e->band_mask;
-    float g = (float)pow(10.0, e->preamp_db / 20.0);
-    if (!mask && g == 1.0f) { pthread_mutex_unlock(&e->mtx); return; }
+    int32_t q = e->preamp_q;
+    if (!mask && q == 16384) { pthread_mutex_unlock(&e->mtx); return; }
+    if (!mask && q <= 65536) {
+        /* preamp-only integer path: the slider clamps at +12 dB (gain
+           3.9811, q 65251), so |buf*q| <= 32768 * 65251 < 2^31 even at
+           the 65536 gate — no overflow is representable. Rounding is
+           Q14 round-to-nearest; the float path truncates toward zero,
+           so the paths may differ by ~1 LSB (pinned <=2 in test/dsp):
+           accepted deviation, the float path stays for any active band. */
+        for (int i = 0, n = frames * ch; i < n; i++) {
+            int32_t v = ((int32_t)buf[i] * q + 8192) >> 14;
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            buf[i] = (int16_t)v;
+        }
+        pthread_mutex_unlock(&e->mtx);
+        return;
+    }
+    float g = e->preamp_gain;
     for (int f = 0; f < frames; f++) {
         for (int c = 0; c < ch; c++) {
             int idx = f * ch + c;

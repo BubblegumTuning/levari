@@ -1,73 +1,12 @@
-/* struct ucred (SO_PEERCRED) is a GNU extension in glibc headers */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
-#endif
 #include "daemon.h"
 #include "../common.h"
 #include "../config/config.h"
-#include "peercred.h"
-#ifdef _WIN32
-#include "../compat/win32.h"
-#else
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#endif
+#include "../compat/win98_diag.h" /* lv98_tracef (no-op off-era) */
+#include "../platform/sock.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-
-void lv_sock_path(char *out, size_t n) {
-    if (cfg.socket_path[0]) { lv_expand_home(cfg.socket_path, out, n); return; }
-#ifdef _WIN32
-    char user[256];
-    lv_user_tag(user, sizeof user);
-    snprintf(out, n, "\\\\.\\pipe\\levari-%s", user);
-#else
-    const char *xdg = getenv("XDG_RUNTIME_DIR");
-    if (xdg && *xdg) snprintf(out, n, "%s/levari-%d.sock", xdg, (int)getuid());
-    else snprintf(out, n, "/tmp/levari-%d.sock", (int)getuid());
-#endif
-}
-
-#ifndef _WIN32
-int lv_tmp_fallback(void) {
-    const char *xdg = getenv("XDG_RUNTIME_DIR");
-    return !cfg.socket_path[0] && !(xdg && *xdg);
-}
-
-/* where the daemon publishes its /tmp-fallback socket path: the config
-   dir is the user's own — no other local user can write it */
-void lv_sock_ptr_file(char *out, size_t n) {
-    char d[LV_MAX_PATH];
-    cfg_path(d, sizeof d);
-    if (!lv_dirname(d)) { out[0] = 0; return; }
-    snprintf(out, n, "%s/socket", d);
-}
-
-int lv_sock_pointer(char *out, size_t n) {
-    if (!lv_tmp_fallback()) return 0;
-    char f[LV_MAX_PATH];
-    lv_sock_ptr_file(f, sizeof f);
-    if (!f[0]) return 0;
-    FILE *h = fopen(f, "r");
-    if (!h) return 0;
-    char line[512];
-    int ok = 0;
-    if (fgets(line, sizeof line, h)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-        /* must fit sun_path or connect would silently truncate */
-        if (line[0] && strlen(line) < sizeof ((struct sockaddr_un *)0)->sun_path) {
-            lv_strlcpy(out, line, n);
-            ok = 1;
-        }
-    }
-    fclose(h);
-    return ok;
-}
-#endif
 
 /* client-side resolution: published /tmp path first, then the default */
 static void sock_resolve(char *out, size_t n) {
@@ -77,93 +16,18 @@ static void sock_resolve(char *out, size_t n) {
     lv_sock_path(out, n);
 }
 
-#ifdef _WIN32
-typedef HANDLE conn_t;
-#define CONN_BAD INVALID_HANDLE_VALUE
-
-static conn_t conn_open(const char *path) {
-    return CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                       OPEN_EXISTING, 0, NULL);
-}
-static long conn_read(conn_t c, void *b, size_t n) {
-    DWORD r = 0;
-    return ReadFile(c, b, (DWORD)n, &r, NULL) ? (long)r : -1;
-}
-static void conn_close(conn_t c) { CloseHandle(c); }
-#else
-typedef int conn_t;
-#define CONN_BAD (-1)
-
-static conn_t conn_open(const char *path) {
-    int c = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (c < 0) return CONN_BAD;
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sun_family = AF_UNIX;
-    lv_strlcpy(sa.sun_path, path, sizeof sa.sun_path);
-    if (connect(c, (struct sockaddr *)&sa, sizeof sa) < 0) {
-        close(c);
-        return CONN_BAD;
-    }
-    /* with XDG_RUNTIME_DIR unset the path falls back to /tmp: verify the
-       listener we just connected to is ours, not a pre-bound impostor */
-    if (!peer_is_self(c)) {
-        close(c);
-        return CONN_BAD;
-    }
-    return c;
-}
-static long conn_read(conn_t c, void *b, size_t n) {
-    ssize_t r = read(c, b, n);
-    return r < 0 ? -1 : (long)r;
-}
-static void conn_close(conn_t c) { close(c); }
-#endif
-
-static int conn_write(conn_t c, const void *b, size_t n) {
-    /* loop: a short write would leave the daemon waiting for the rest
-       of the line (and the newline with it) */
-    const char *p = b;
-    while (n) {
-        long w;
-#ifdef _WIN32
-        DWORD d = 0;
-        w = WriteFile(c, p, (DWORD)n, &d, NULL) ? (long)d : -1;
-#else
-        w = (long)write(c, p, n);
-#endif
-        if (w <= 0) return -1;
-        p += w; n -= (size_t)w;
-    }
-    return 0;
-}
-/* the server answers with one '\n'-terminated line; a single read can
-   come back short (segmented sockets, the 4 KB pipe buffer vs a 4096+B
-   response), so loop until the newline or EOF */
-static long conn_read_line(conn_t c, char *buf, size_t n) {
-    size_t off = 0;
-    while (off < n - 1) {
-        long r = conn_read(c, buf + off, n - 1 - off);
-        if (r <= 0) break;
-        off += (size_t)r;
-        buf[off] = 0;
-        if (strchr(buf, '\n')) break;
-    }
-    return (long)off;
-}
-
 int cli_request(const char *cmd, char *resp, size_t rn) {
     if (rn) resp[0] = 0;
     char path[512];
     sock_resolve(path, sizeof path);
-    conn_t c = conn_open(path);
-    if (c == CONN_BAD) return 2;
+    lv_conn_t c = lv_conn_open(path);
+    if (c == LV_CONN_BAD) return 2;
     char line[8192];
     snprintf(line, sizeof line, "%s\n", cmd);
-    if (conn_write(c, line, strlen(line)) < 0) { conn_close(c); return 2; }
+    if (lv_conn_write(c, line, strlen(line)) < 0) { lv_conn_close(c); return 2; }
     char buf[8192];
-    long n = conn_read_line(c, buf, sizeof buf);
-    conn_close(c);
+    long n = lv_conn_read_line(c, buf, sizeof buf);
+    lv_conn_close(c);
     if (n <= 0) return 2;
     buf[n] = 0;
     lv_strlcpy(resp, buf, rn);
@@ -210,20 +74,90 @@ int cli_run(int argc, char **argv) {
             break;
         }
     }
+#if defined(LV_WIN9X) && defined(_WIN32)
+    /* batch 29: this box has no named pipes (daemon.h note) — the
+       client half of the file conversation: stamp the request,
+       poll for the stamped answer (server polls at 250 ms, so the
+       full round is bounded ~1 s; 12 s client patience). */
+    char reqp[MAX_PATH], respp[MAX_PATH];
+    if (lv_ipc_file(reqp, sizeof reqp, "req") != 0 ||
+        lv_ipc_file(respp, sizeof respp, "resp") != 0) {
+        fprintf(stderr, "levari: cannot locate module dir for IPC\n");
+        return 2;
+    }
+    {
+        unsigned tok = (unsigned)GetTickCount();
+        char stamped[8208];
+        HANDLE f;
+        char resp[8192];
+        char rtok[32];
+        int t, got = 0;
+        snprintf(stamped, sizeof stamped, "T%u %s\n", tok, line);
+        f = CreateFileA(reqp, GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f == INVALID_HANDLE_VALUE) {
+            lv98_tracef("cli:open FAIL gle=%lu", GetLastError());
+            fprintf(stderr, "levari: cannot write %s (exe dir not writable?)\n",
+                    reqp);
+            return 2;
+        }
+        {
+            DWORD w;
+            WriteFile(f, stamped, (DWORD)strlen(stamped), &w, NULL);
+        }
+        CloseHandle(f);
+        lv98_tracef("cli:file req tok=%u", tok);
+        snprintf(rtok, sizeof rtok, "T%u ", tok);
+        for (t = 0; t < 48 && !got; t++) {
+            DWORD n = 0;
+            f = CreateFileA(respp, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (f != INVALID_HANDLE_VALUE) {
+                ReadFile(f, resp, (DWORD)sizeof resp - 1, &n, NULL);
+                CloseHandle(f);
+                resp[n] = 0;
+                if (n > 0 && strncmp(resp, rtok, strlen(rtok)) == 0)
+                    got = 1;
+            }
+            if (!got) Sleep(250);
+        }
+        if (!got) {
+            lv98_tracef("cli:timeout");
+            fprintf(stderr,
+                    "levari: no response after 12 s (is a GUI instance running?)\n");
+            return 2;
+        }
+        {
+            char *body = resp + strlen(rtok);
+            char *nl = strchr(body, '\n');
+            if (nl) *nl = 0;
+            lv98_tracef("cli:ok n=%d", (int)strlen(body));
+            fputs(body, stdout);
+            fputs("\n", stdout);
+            return body[0] == 'E' && body[1] == 'R' ? 1 : 0;
+        }
+    }
+#else
     char path[512];
     sock_resolve(path, sizeof path);
-    conn_t c = conn_open(path);
-    if (c == CONN_BAD) {
+    lv_conn_t c = lv_conn_open(path);
+    if (c == LV_CONN_BAD) {
         fprintf(stderr, "levari: no running instance (no socket at %s)\n", path);
         return 2;
     }
     strcat(line, "\n");
-    if (conn_write(c, line, strlen(line) + 1) < 0) { conn_close(c); return 2; }
+    if (lv_conn_write(c, line, strlen(line) + 1) < 0) { lv_conn_close(c); return 2; }
     char resp[8192];
-    long n = conn_read_line(c, resp, sizeof resp);
-    conn_close(c);
+    long n = lv_conn_read_line(c, resp, sizeof resp);
+    lv_conn_close(c);
     if (n <= 0) { fprintf(stderr, "levari: no response\n"); return 2; }
     resp[n] = 0;
+    /* batch 27: the conversation happened — bytes counted BEFORE the
+       trailing newline is echoed; the user saw the resp on console */
+    lv98_tracef("cli:ok n=%ld", n);
     fputs(resp, stdout);
     return resp[0] == 'E' && resp[1] == 'R' ? 1 : 0;
+#endif
 }

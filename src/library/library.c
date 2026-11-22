@@ -1,12 +1,11 @@
 #include "library.h"
 #include "../tag/tag.h"
 #include "../decode/decode.h"
-#include "../daemon/daemon.h"
 #include "../playlist/playlist.h"
 #include "../common.h"
 #include "../config/config.h"
 #ifdef _WIN32
-#include "../compat/win32.h"
+#include "../platform/platform.h"
 #endif
 #include <dirent.h>
 #include <errno.h>
@@ -121,7 +120,7 @@ static void esc_field(char *dst, size_t dn, const char *src) {
    2-byte pair) but callers hand in buffers sized by the line reader, not
    by a contract — take the bound like esc_field does. In-place calls pass
    the string length as dn: output can never exceed input there. */
-static void unesc_field(char *dst, size_t dn, const char *src, size_t sn) {
+void lib_unesc_field(char *dst, size_t dn, const char *src, size_t sn) {
     if (dn == 0) return;
     char *d = dst;
     const char *de = dst + dn - 1;
@@ -135,7 +134,7 @@ static void unesc_field(char *dst, size_t dn, const char *src, size_t sn) {
 }
 
 /* the in-place string carries its own NUL, so the buffer is len+1 bytes */
-void lib_unesc_path(char *p) { size_t l = strlen(p); unesc_field(p, l + 1, p, l); }
+void lib_unesc_path(char *p) { size_t l = strlen(p); lib_unesc_field(p, l + 1, p, l); }
 
 /* fgets splits an index row longer than the line buffer: the tail half
    would re-parse as a garbage row and self-corrupt the index, so drain
@@ -242,14 +241,14 @@ static void scan_dir(const char *dir, ScanCtx *c) {
     while ((de = readdir(d))) {
         if (de->d_name[0] == '.') continue;
         char full[LV_MAX_PATH];
-        snprintf(full, sizeof full, "%s/%s", dir, de->d_name);
+        lv_path_join(full, sizeof full, dir, de->d_name);
         struct stat st;
         /* lstat: a symlinked directory must not be descended, or a
            symlink cycle in the tree recurses until the stack dies */
         if (lstat(full, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
 #ifdef _WIN32
-            /* MinGW maps lstat->stat (compat/win32.h), so junctions and
+            /* MinGW maps lstat->stat (platform/platform.h), so junctions and
                other reparse points look exactly like real directories in
                st_mode; a junction pointing at an ancestor recurses until
                the stack dies. Skipping reparse dirs is the Windows
@@ -277,7 +276,8 @@ static void scan_dir(const char *dir, ScanCtx *c) {
                    only opened for formats that need it for length */
                 dur = tag_probe(full, st.st_size, &t);
                 if (!dur) {
-                    Decoder *dec = dec_open(full);
+                    DecOpts dopts = { .allow_large = cfg.allow_large };
+                    Decoder *dec = dec_open(full, &dopts);
                     if (dec) {
                         long long tot = dec_total_frames(dec);
                         /* long long before the cast: a crafted container
@@ -306,28 +306,6 @@ static void scan_dir(const char *dir, ScanCtx *c) {
     closedir(d);
 }
 
-static int cmd_scan(const char *dir, FILE *out) {
-    char abs[LV_MAX_PATH], exp[LV_MAX_PATH];
-    lv_expand_home(dir, exp, sizeof exp);
-    if (!realpath(exp, abs)) { fprintf(out, "levari: no such dir: %s\n", dir); return 1; }
-    char dirs[1][LV_MAX_PATH];
-    lv_strlcpy(dirs[0], abs, LV_MAX_PATH);
-    int added = 0, seen = 0, skipped = 0;
-    if (lib_scan_add(dirs, 1, 1, &added, &seen, &skipped) != 0) {
-        char idx[LV_MAX_PATH];
-        lib_index_path(idx, sizeof idx);
-        fprintf(out, "levari: cannot write %s\n", idx);
-        return 1;
-    }
-    char idx[LV_MAX_PATH];
-    lib_index_path(idx, sizeof idx);
-    fprintf(out, "scanned %d files into %s\n", seen, idx);
-    if (skipped)
-        fprintf(out, "levari: %d paths longer than %d chars were not indexed\n",
-                skipped, LV_MAX_PATH / 2);
-    return 0;
-}
-
 static int cmpstr(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
@@ -353,7 +331,7 @@ int lib_scan_add(const char dirs[][LV_MAX_PATH], int n, int with_tags, int *adde
             if (nl) *nl = 0;
             if (!line[0]) continue;
             size_t sl = strlen(line);
-            unesc_field(line, sl + 1, line, sl); /* in-place: only shrinks */
+            lib_unesc_field(line, sl + 1, line, sl); /* in-place: only shrinks */
             if (sn == cap) {
                 cap = cap ? cap * 2 : 256;
                 char **s2 = realloc(sorted, (size_t)cap * sizeof *sorted);
@@ -412,7 +390,7 @@ LibIndex lib_index_load(void) {
         if (nl) *nl = 0;
         char *p1 = line;
         char *p2 = strchr(p1, '\t'); if (!p2) continue; *p2++ = 0;
-        if (v2) { size_t sl = strlen(p1); unesc_field(p1, sl + 1, p1, sl); } /* match real paths */
+        if (v2) { size_t sl = strlen(p1); lib_unesc_field(p1, sl + 1, p1, sl); } /* match real paths */
         char *p3 = strchr(p2, '\t'); if (!p3) continue; *p3++ = 0;
         char *p4 = strchr(p3, '\t'); if (!p4) continue; *p4++ = 0;
         char *p5 = strchr(p4, '\t');
@@ -494,6 +472,7 @@ void lib_fill_playlist_ix(Playlist *p, const LibIndex *ix) {
         if (hit->track) t->tags.track = hit->track;
         if (hit->dur) t->duration = hit->dur;
         t->notag = hit->notag;
+        pl_touch(p);   /* tags filled from the index: a cached normalized row would be stale */
     }
 }
 
@@ -567,7 +546,7 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
             if (tl >= sizeof key) tl = sizeof key - 1;
             memcpy(key, line, tl);
             key[tl] = 0;
-            unesc_field(key, sizeof key, key, tl);
+            lib_unesc_field(key, sizeof key, key, tl);
             if (!strcmp(key, rp)) hit = n;
         }
         if (n == cap) {
@@ -704,7 +683,7 @@ int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
         if (!statable) tl = sizeof esc - 1;
         memcpy(esc, row, tl);
         esc[tl] = 0;
-        unesc_field(path, sizeof path, esc, tl);
+        lib_unesc_field(path, sizeof path, esc, tl);
         struct stat st;
         int gone, err;
         if (!statable) { gone = 0; err = EIO; }
@@ -849,99 +828,4 @@ int lib_url_index_save(const char *url) {
         if (rename(tmp, p) != 0) { remove(tmp); return -1; }
     }
     return 0;
-}
-
-static int cmd_list(const char *filter, FILE *out) {
-    char idx[LV_MAX_PATH];
-    lib_index_path(idx, sizeof idx);
-    FILE *f = fopen(idx, "r");
-    if (!f) { fprintf(out, "(library empty)\n"); return 0; }
-    char line[2 * LV_MAX_PATH + 1024];
-    int v2 = lib_idx_header(f);
-    int shown = 0;
-    int gr;
-    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
-        if (gr == 2) continue; /* over-long row: already drained */
-        if (filter && !lv_stristr(line, filter)) continue;
-        /* display the real path, not the escaped field */
-        char *tab = strchr(line, '\t');
-        if (v2 && tab) {
-            char path[2 * LV_MAX_PATH];
-            unesc_field(path, sizeof path, line, (size_t)(tab - line));
-            /* two fputs: snprintf'ing into line while tab points inside
-               it overlaps in/out and is formally undefined */
-            fputs(path, out);
-            fputs(tab, out);
-        } else fputs(line, out);
-        shown++;
-    }
-    fclose(f);
-    if (!shown) fprintf(out, "(no matches)\n");
-    return 0;
-}
-
-static int cmd_play(const char *query, FILE *out) {
-    char idx[LV_MAX_PATH];
-    lib_index_path(idx, sizeof idx);
-    FILE *f = fopen(idx, "r");
-    if (!f) { fprintf(out, "levari: library empty\n"); return 1; }
-    char line[2 * LV_MAX_PATH + 1024];
-    int v2 = lib_idx_header(f);
-    char cmd[8192] = "play";
-    int n = 0;
-    int gr;
-    while ((gr = lib_idx_getline(f, line, sizeof line)) != 0) {
-        if (gr == 2) continue; /* over-long row: already drained */
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-        if (query && *query && !lv_stristr(line, query)) continue;
-        char *tab = strchr(line, '\t');
-        if (tab) *tab = 0;
-        if (v2) { size_t sl = strlen(line); unesc_field(line, sl + 1, line, sl); } /* queue real paths */
-        /* cli_append_arg quotes (and escapes embedded quotes in) paths
-           that need it: the play tokenizer splits bare args on spaces */
-        if (cli_append_arg(cmd, sizeof cmd - 1, line) != 0) break;
-        n++;
-    }
-    fclose(f);
-    if (!n) { fprintf(out, "levari: no matches\n"); return 1; }
-    char resp[8192];
-    int rc = cli_request(cmd, resp, sizeof resp);
-    if (rc == 2) { fprintf(out, "levari: no running instance\n"); return 2; }
-    fputs(resp, out);
-    return rc;
-}
-
-int lib_run(const char *sub, const char *arg, FILE *out) {
-    if (!sub || !*sub) { fprintf(out, "usage: levari library scan|list|play|verify [arg]\n"); return 1; }
-    if (!strcmp(sub, "scan")) {
-        if (arg && *arg) return cmd_scan(arg, out);
-        if (cfg.lib_dir_n) {
-            for (int i = 0; i < cfg.lib_dir_n; i++) cmd_scan(cfg.lib_dirs[i], out);
-            return 0;
-        }
-        fprintf(out, "usage: levari library scan <dir>\n");
-        return 1;
-    }
-    if (!strcmp(sub, "list")) return cmd_list(arg, out);
-    if (!strcmp(sub, "play")) return cmd_play(arg, out);
-    if (!strcmp(sub, "verify") && !arg) {
-        int kept = 0, purged = 0, unreach = 0;
-        char bank[LV_MAX_PATH] = "";
-        int rc = lib_index_verify(&kept, &purged, &unreach, bank, sizeof bank);
-        if (rc == -3) { fprintf(out, "levari: index pre-v2 and ambiguous: run a full scan\n"); return 1; }
-        if (rc != 0) { fprintf(out, "levari: verify failed (index untouched)\n"); return 1; }
-        fprintf(out, "verify: kept %d, dropped %d, unreachable kept %d",
-                kept, purged, unreach);
-        if (purged && bank[0]) fprintf(out, " (banked in %s)", bank);
-        fprintf(out, "\n");
-        return 0;
-    }
-    fprintf(out, "usage: levari library scan [dir] | list [filter] | play [query] | verify\n");
-    return 1;
-}
-
-int lib_cmd(int argc, char **argv) {
-    if (argc < 2) { printf("usage: levari library scan|list|play|verify [arg]\n"); return 1; }
-    return lib_run(argv[1], argc > 2 ? argv[2] : NULL, stdout);
 }

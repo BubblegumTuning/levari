@@ -7,7 +7,7 @@
 #include <stdlib.h>
 
 #define MCP_LATEST_VERSION "2024-11-05"
-#define LEVARI_MCP_VERSION LV_VERSION /* single source: CMake project version */
+#define LEVARI_MCP_VERSION LV_BUILD_ID /* single source: CMake project version + dev identity */
 
 static const char *SUPPORTED[] = {"2024-11-05", "2025-03-26", "2025-06-18"};
 

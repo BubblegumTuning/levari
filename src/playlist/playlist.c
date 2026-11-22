@@ -1,6 +1,6 @@
 #include "playlist.h"
 #ifdef _WIN32
-#include "../compat/win32.h"
+#include "../platform/platform.h"
 #endif
 #include <unistd.h>
 #include <limits.h>
@@ -9,11 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-void pl_init(Playlist *p) { p->items = NULL; p->count = p->cap = 0; }
+void pl_init(Playlist *p) { p->items = NULL; p->count = p->cap = 0; p->gen++; }
 
 void pl_clear(Playlist *p) {
     free(p->items);
     p->items = NULL; p->count = p->cap = 0;
+    pl_touch(p);
 }
 
 static int ensure(Playlist *p, int need) {
@@ -59,10 +60,10 @@ static void pl_add_dir(Playlist *p, const char *dir) {
     qsort(names, (size_t)n, sizeof *names, cmpstr);
     for (int i = 0; i < n; i++) {
         char full[LV_MAX_PATH];
-        snprintf(full, sizeof full, "%s/%s", dir, names[i]);
+        lv_path_join(full, sizeof full, dir, names[i]);
         struct stat st;
         /* lstat: never descend into a symlinked directory (cycle guard).
-           On Windows lstat is plain stat (compat/win32.h) and follows
+           On Windows lstat is plain stat (platform/platform.h) and follows
            junctions, so refuse reparse points outright: a junction loop
            would recurse until the stack overflows. */
 #ifdef _WIN32
@@ -102,7 +103,12 @@ int pl_add_file(Playlist *p, const char *path) {
     } else {
         char cwd[PATH_MAX];
         if (getcwd(cwd, sizeof cwd))
-            snprintf(t->path, sizeof t->path, "%s/%s", cwd, path);
+            /* era rule (batch 24): never raw-join the cwd — getcwd returns
+               "C:\" at a drive root, so "%s/%s" poisoned argv paths with
+               "C:\/test.mp3" (hardware: plyr:dead on argv files while the
+               browser's native-joined rows played). lv_path_join trims the
+               trailing separator and emits native slashes. */
+            lv_path_join(t->path, sizeof t->path, cwd, path);
         else
             lv_strlcpy(t->path, path, sizeof t->path);
     }
@@ -110,6 +116,7 @@ int pl_add_file(Playlist *p, const char *path) {
     t->duration = 0;
     t->notag = 0;
     t->start_sec = t->end_sec = 0;
+    pl_touch(p);
     return 0;
 }
 
@@ -125,12 +132,14 @@ void pl_insert(Playlist *p, int idx, const char *path) {
     t->duration = 0;
     t->notag = 0;
     t->start_sec = t->end_sec = 0;
+    pl_touch(p);
 }
 
 void pl_remove(Playlist *p, int idx) {
     if (idx < 0 || idx >= p->count) return;
     memmove(&p->items[idx], &p->items[idx + 1], (size_t)(p->count - idx - 1) * sizeof(Track));
     p->count--;
+    pl_touch(p);
 }
 
 int pl_load_m3u(Playlist *p, const char *m3u) {
@@ -305,6 +314,7 @@ int pl_load_pls(Playlist *p, const char *pls) {
         }
     }
     free(ent);
+    pl_touch(p);   /* the TitleN fills above land AFTER the appends' bumps */
     return 0;
 }
 
@@ -421,6 +431,7 @@ int pl_load_cue(Playlist *p, const char *cue) {
             if (c) t->duration = c;
         }
     }
+    pl_touch(p);   /* TITLE/PERFORMER fills above wrote searchable tags after the appends' bumps */
     return 0;
 }
 
@@ -450,8 +461,10 @@ void pl_scan_tags(Playlist *p, pthread_mutex_t *mtx) {
         if (mtx) pthread_mutex_lock(mtx);
         /* the row may have moved or changed while we were reading: only
            write back if item i is still the file we probed */
-        if (i < p->count && !strcmp(p->items[i].path, path))
+        if (i < p->count && !strcmp(p->items[i].path, path)) {
             p->items[i].tags = tags;
+            pl_touch(p);   /* a row whose tags arrived late must not keep a stale cache */
+        }
         if (mtx) pthread_mutex_unlock(mtx);
     }
 }
@@ -517,6 +530,7 @@ static void apply_newpos(Playlist *p, const int *newpos, int *cur) {
         }
     }
     free(done);
+    pl_touch(p);   /* the single funnel for sort/reverse/shuffle/move/drop */
     if (cur && *cur >= 0 && *cur < n) *cur = newpos[*cur];
 }
 
@@ -860,6 +874,7 @@ int pl_clip_paste(Playlist *p, int at, int *cur) {
             (size_t)(p->count - at) * sizeof(Track));
     for (int i = 0; i < clip_n; i++) p->items[at + i] = clip[i];
     p->count += clip_n;
+    pl_touch(p);
     /* paste BELOW cur leaves cur alone; paste at/above it shifts it */
     if (cur && *cur >= 0 && at <= *cur) *cur += clip_n;
     return 0;

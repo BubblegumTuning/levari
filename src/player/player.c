@@ -1,6 +1,13 @@
 #include "player.h"
+#if defined(LV_WIN9X) && defined(_WIN32)
+#include "../compat/win98_wake.h" /* the ONLY TU that includes it: era
+                                     wake ops on p->wake (windows.h
+                                     stays out of every other TU) */
+#include <process.h>              /* _beginthreadex (batch 23 matrix) */
+#endif
 #include "../audio/audio.h"
-#include "../library/library.h"
+#include "../config/config.h"    /* DecOpts at dec_open: caller-owned policy */
+#include "../compat/win98_diag.h"
 #include <unistd.h>
 #include <time.h>
 
@@ -11,6 +18,12 @@
    toward small indexes. xorshift64+ seeded once, Lemire's multiply-shift
    reduction keeps it unbiased without a modulo */
 static uint64_t rng_state;
+
+/* urlIndex bank (D5): the file itself is the library module's, so the
+   player calls a hook and main wires lib_url_index_save into it — the
+   player must not know the library exists. Unset hook = no banking. */
+static int (*url_index_save_hook)(const char *url);
+void pl_player_set_url_save(int (*fn)(const char *url)) { url_index_save_hook = fn; }
 
 static int rng_below(int n) { /* caller holds p->mtx */
     rng_state ^= rng_state << 13;
@@ -56,16 +69,37 @@ static void close_dec(Player *p) {
     p->pos_frames = 0;
 }
 
+/* Seek-abort poll (DecOpts): an SPC fast-forward seek polls this between
+   skip chunks; any command already posted (stop, track change, a newer
+   seek) abandons the skip so the command loop reaches it within one chunk
+   instead of queueing behind up to ~100 s of emulation. Read under p->mtx
+   like every other cmd consumer (the cmd/seek_frame scalars are a set). */
+static int seek_cmd_pending(void *ctx) {
+    Player *p = (Player *)ctx;
+    int pend;
+    pthread_mutex_lock(&p->mtx);
+    pend = (p->cmd != CMD_NONE);
+    pthread_mutex_unlock(&p->mtx);
+    return pend;
+}
+
 static void load_track_locked(Player *p, int idx, int report) {
     Playlist *pl = p->pl;
     if (idx < 0 || idx >= pl->count) { close_dec(p); p->state = ST_STOP; return; }
     close_dec(p);
     p->ab_a = p->ab_b = -1;
-    Decoder *d = dec_open(pl->items[idx].path);
+    /* the ingest policy is the caller's: read LARGE live so a settings
+       change takes effect at the next track, exactly like the old
+       decode-side cfg read */
+    DecOpts dopts = { .allow_large = cfg.allow_large,
+                      .seek_abort = seek_cmd_pending,
+                      .seek_abort_ctx = p };
+    Decoder *d = dec_open(pl->items[idx].path, &dopts);
     if (!d) {
         /* report=0 only inside load_track_alive's walk, where a dead row
            is a fact of life, not an error to print once per row */
         if (report) fprintf(stderr, "levari: cannot decode %s\n", pl->items[idx].path);
+        lv98_tracef("plyr:dead row=%d [%s]", idx, pl->items[idx].path);
         p->state = ST_STOP;
         return;
     }
@@ -75,6 +109,7 @@ static void load_track_locked(Player *p, int idx, int report) {
         ao_close();
         if (ao_open(dec_rate(d), dec_channels(d)) != 0) {
             fprintf(stderr, "levari: no audio output (ALSA unavailable)\n");
+            lv98_tracef("plyr:ao-fail rate=%d ch=%d", dec_rate(d), dec_channels(d));
             dec_close(d);
             p->state = ST_STOP;
             return;
@@ -86,6 +121,8 @@ static void load_track_locked(Player *p, int idx, int report) {
     p->rate = dec_rate(d);
     p->ch = dec_channels(d);
     p->total_frames = dec_total_frames(d);
+    lv98_tracef("plyr:ok row=%d rate=%d ch=%d frames=%d",
+                idx, p->rate, p->ch, (int)p->total_frames);
     p->pos_frames = 0;
     p->track_start = 0;
     p->track_end = 0;
@@ -140,8 +177,10 @@ static void load_track(Player *p, int idx, int report) {
     pthread_mutex_lock(&p->mtx);
     if (need_tags && idx >= 0 && idx < p->pl->count &&
         !strcmp(p->pl->items[idx].path, path) &&
-        !p->pl->items[idx].tags.title[0])
+        !p->pl->items[idx].tags.title[0]) {
         p->pl->items[idx].tags = tags;
+        pl_touch(p->pl);   /* the search cache must see tags that arrive this late */
+    }
     load_track_locked(p, idx, report);
     pthread_mutex_unlock(&p->mtx);
 }
@@ -213,6 +252,11 @@ static void apply_pan(int16_t *buf, int frames, int ch, int pan) {
 static void *player_thread(void *arg) {
     Player *p = arg;
     static int16_t buf[CHUNK * 2];
+    /* batch 21: thread-exists proof — if pl_player_start's rc is 0 but
+       this never logs, the thread was created but never ran (era
+       thread-startup metal, not the wake, is guilty) */
+    static int th_n;
+    if (!th_n++) lv98_tracef("plyr:thread");
     dsp_flush_denormals(); /* eq_process runs here; silence decays its
                               state into denormals and the whole thread
                               crawls without FTZ/DAZ */
@@ -250,8 +294,14 @@ static void *player_thread(void *arg) {
                 break;
             case CMD_SEEK:
                 if (p->dec) {
-                    dec_seek(p->dec, seek_frame);
-                    p->pos_frames = seek_frame;
+                    /* -1 only for an aborted SPC fast-forward (or a failed
+                       reload): the decoder sits at an unknown mid-skip
+                       position, so leave pos_frames at its last truthful
+                       value — the pending command that aborted the seek
+                       redefines transport state on the next loop pass.
+                       The flush still drops the pre-seek stale audio. */
+                    if (dec_seek(p->dec, seek_frame) == 0)
+                        p->pos_frames = seek_frame;
                     ao_flush();
                     if (p->state == ST_PAUSE) { p->state = ST_PLAY; ao_resume(); }
                 }
@@ -285,9 +335,11 @@ static void *player_thread(void *arg) {
                    under p->mtx, so the write under it is all the plumbing
                    needed */
                 pthread_mutex_lock(&p->mtx);
-                if (p->cur >= 0 && p->cur < p->pl->count)
+                if (p->cur >= 0 && p->cur < p->pl->count) {
                     lv_strlcpy(p->pl->items[p->cur].tags.title, icy,
                                sizeof p->pl->items[p->cur].tags.title);
+                    pl_touch(p->pl);   /* live title change: re-normalizes that row */
+                }
                 pthread_mutex_unlock(&p->mtx);
             }
             int got = dec_read(p->dec, buf, CHUNK);
@@ -329,8 +381,8 @@ static void *player_thread(void *arg) {
                     if (p->cur >= 0 && p->cur < p->pl->count)
                         lv_strlcpy(upath, p->pl->items[p->cur].path, sizeof upath);
                     pthread_mutex_unlock(&p->mtx);
-                    if (lv_is_url(upath))
-                        lib_url_index_save(upath);
+                    if (lv_is_url(upath) && url_index_save_hook)
+                        url_index_save_hook(upath);
                 }
                 if (p->ab_b >= 0 && p->pos_frames >= p->ab_b) {
                     long long a = p->ab_a >= 0 ? p->ab_a : p->track_start;
@@ -359,16 +411,36 @@ static void *player_thread(void *arg) {
             /* paused/stopped: sleep until a command or quit instead of a
                20 ms poll (50 wake-ups per second forever drained power
                on battery boards for nothing) */
+            /* batch 21: first-park proof. plyr:thread + plyr:park +
+               pstm but no pwake = the wait itself is still wedged;
+               plyr:thread without plyr:park = stuck handling the first
+               command (plyr:* load probes localize further) */
+            static int pk_n;
+            if (!pk_n++) lv98_tracef("plyr:park");
             pthread_mutex_lock(&p->mtx);
             while (!p->quit && p->cmd == CMD_NONE)
-                pthread_cond_wait(&p->wake, &p->mtx);
+                LV_WAKE_WAIT(&p->wake, &p->mtx);
             pthread_mutex_unlock(&p->mtx);
+            {   /* batch 20: parked-wait wake probe (cap 8) */
+                static int pw_n;
+                if (pw_n < 8) {
+                    pw_n++;
+                    lv98_tracef("pwake cmd=%d quit=%d", (int)p->cmd, (int)p->quit);
+                }
+            }
         }
     }
     close_dec(p);
     ao_close();
     return NULL;
 }
+
+#if defined(LV_WIN9X) && defined(_WIN32)
+/* trampoline: LPTHREAD_START_ROUTINE shape over player_thread (batch 22) */
+static unsigned __stdcall lv98_thread_entry(void *a) {
+    return (unsigned)(size_t)player_thread(a);
+}
+#endif
 
 void pl_player_init(Player *p, Playlist *pl) {
     memset(p, 0, sizeof *p);
@@ -381,33 +453,86 @@ void pl_player_init(Player *p, Playlist *pl) {
     p->track_start = p->track_end = 0;
     pthread_mutex_init(&p->mtx, NULL);
     pthread_mutex_init(&p->viz_mtx, NULL);
-    pthread_cond_init(&p->wake, NULL);
+    LV_WAKE_INIT(&p->wake);
     eq_init(&p->eq, 44100);
     rng_state = (uint64_t)time(NULL) ^ ((uint64_t)(unsigned)getpid() << 32) ^ 0x9E3779B97F4A7C15ull;
     if (!rng_state) rng_state = 0xA5A5A5A5u;
 }
 
 void pl_player_start(Player *p) {
-    pthread_create(&p->th, NULL, player_thread, p);
+#if defined(LV_WIN9X) && defined(_WIN32)
+    /* batch 23: thread-create matrix. Batch 22 hardware settled that
+       raw CreateThread(NULL,512K,entry,p,0,NULL) ALSO fails on this
+       box — gle=87 ERROR_INVALID_PARAMETER, so not starvation — while
+       winpthread's _beginthreadex route failed as EAGAIN (batch 21;
+       it passes an explicit 2 MB stack). 9x kernel32 argument-checking
+       quirks are never adjudicated from memory (house law): walk the
+       era-plausible shapes in order, log each, keep the first handle
+       that opens. t1 isolates the explicit stack (winpthread's known
+       failure ingredient) via the msvcrt classic with default stack;
+       t2 isolates lpThreadId=NULL; t3 is the classic create-suspended
+       + ResumeThread shape with the pinned stack. All three APIs are
+       already imported; reap is identical (kernel HANDLE). */
+    /* _beginthreadex takes unsigned*, CreateThread LPDWORD — two
+       variables, no casts (GCC15 rejects the pointer mismatch) */
+    unsigned btid = 0;
+    DWORD tid = 0;
+    p->th = (HANDLE)_beginthreadex(NULL, 0, lv98_thread_entry, p, 0, &btid);
+    lv98_tracef("thr:t1 h=%p gle=%lu", p->th, p->th ? 0UL : GetLastError());
+    if (!p->th) {
+        p->th = CreateThread(NULL, 0,
+                             (LPTHREAD_START_ROUTINE)lv98_thread_entry, p, 0, &tid);
+        lv98_tracef("thr:t2 h=%p gle=%lu", p->th, p->th ? 0UL : GetLastError());
+    }
+    if (!p->th) {
+        p->th = CreateThread(NULL, 512 * 1024,
+                             (LPTHREAD_START_ROUTINE)lv98_thread_entry, p,
+                             CREATE_SUSPENDED, &tid);
+        lv98_tracef("thr:t3 h=%p gle=%lu", p->th, p->th ? 0UL : GetLastError());
+        if (p->th) ResumeThread(p->th);
+    }
+    lv98_tracef("plyr:thr h=%p gle=%lu", p->th, p->th ? 0UL : GetLastError());
+#else
+    int rc = pthread_create(&p->th, NULL, player_thread, p);
+    lv98_tracef("plyr:thr rc=%d", rc);
+#endif
 }
 
 void pl_player_stop(Player *p) {
-    /* quit under the lock + broadcast: the thread may be parked in
-       pthread_cond_wait, and a bare store would leave it sleeping
-       forever (the wait predicate re-reads quit under the same mutex) */
+    /* quit under the lock + wake: the thread may be parked in the
+       wake wait, and a bare store would leave it sleeping forever
+       (the wait predicate re-reads quit under the same mutex). Era
+       (batch 21): the broadcast macro maps to one event kick (single
+       waiter); flagship keeps pthread_cond_broadcast verbatim */
     pthread_mutex_lock(&p->mtx);
     p->quit = 1;
-    pthread_cond_broadcast(&p->wake);
+    LV_WAKE_BROADCAST(&p->wake);
     pthread_mutex_unlock(&p->mtx);
+#if defined(LV_WIN9X) && defined(_WIN32)
+    if (p->th) {                 /* CreateThread failed: nothing to reap */
+        WaitForSingleObject(p->th, INFINITE); /* wake guarantees the exit */
+        CloseHandle(p->th);
+    }
+#else
     pthread_join(p->th, NULL);
+#endif
 }
 
 void pl_post(Player *p, int cmd, int arg) {
+    /* batch 20: wake-war probes — pstm = command posted, pstmok =
+       post completed (cond_signal returned), pwake = player thread
+       exited the parked wait. pstm without pwake = the wait is
+       wedged (winpthread cond on era); pstm without pstmok =
+       cond_signal itself hung. */
+    static int pstm_n;
+    int probe = pstm_n < 64 ? ++pstm_n : 0;
+    if (probe) lv98_tracef("pstm %d arg=%d", cmd, arg);
     pthread_mutex_lock(&p->mtx);
     p->cmd_arg = arg;
     p->cmd = cmd;
-    pthread_cond_signal(&p->wake);
+    LV_WAKE_SIGNAL(&p->wake);
     pthread_mutex_unlock(&p->mtx);
+    if (probe) lv98_tracef("pstmok %d", cmd);
 }
 
 void pl_post_seek(Player *p, double frac) {
@@ -424,7 +549,7 @@ void pl_post_seek(Player *p, double frac) {
         long long frame = base + (long long)(frac * (double)(endf - base));
         p->seek_frame = frame;
         p->cmd = CMD_SEEK;
-        pthread_cond_signal(&p->wake);
+        LV_WAKE_SIGNAL(&p->wake);
     }
     pthread_mutex_unlock(&p->mtx);
 }

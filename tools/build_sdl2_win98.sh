@@ -48,7 +48,9 @@ cd "$tmp/SDL2-$ver"
 echo "== configuring (host i686-w64-mingw32, static, era CFLAGS)"
 ./configure --host=i686-w64-mingw32 --build=x86_64-pc-linux-gnu \
     --prefix="$prefix" --enable-static --disable-shared \
-    CFLAGS="-O2 -std=gnu11" >/dev/null
+    --disable-sse2 --disable-sse --disable-mmx --disable-amd3dnow \
+    --disable-altivec --disable-arm-neon --disable-arm-simd \
+    CFLAGS="-O2 -std=gnu11 -march=pentiumpro -mno-sse -mno-sse2" >/dev/null
 make -j"$(nproc)" >/dev/null
 make install >/dev/null
 

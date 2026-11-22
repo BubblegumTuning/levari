@@ -3,10 +3,10 @@
    the Xlib takeover half never compiles active here (LV_X8BIT off), so
    the test needs SDL + X headers only for types, no X server.
 
-   Build (from repo root):
-     cc -Isrc $(pkg-config --cflags sdl2) \
-        test/x8bit/testx8bit.c -o /tmp/testx8bit $(pkg-config --libs sdl2)
-   Run: /tmp/testx8bit   (exit 0 = all pins pass)
+   Build/run: cmake --build build && ctest --test-dir build -R '^testx8bit$'
+   (target = this TU + SDL only, no project libs — and it must stay that
+   way: levari_ui carries LV_X8BIT and this test pins the LV_X8BIT-OFF
+   quantizer shape)
    NOTE: without -DLV_X8BIT the Xlib half of x8bit.c compiles out, so this
    test needs no X headers and no X server — the quantizer is plain C. */
 #include "../../src/ui/x8bit.c"

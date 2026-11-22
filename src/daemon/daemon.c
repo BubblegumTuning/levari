@@ -7,13 +7,11 @@
 #include "../library/library.h"
 #include "../config/config.h"
 #include "../common.h"
-#include "peercred.h"
+#include "../platform/sock.h"
+#include "../platform/platform.h"   /* lv_user_tag (era lv_ipc_file); shims */
 #ifdef _WIN32
-#include "../compat/win32.h"
 #include <sddl.h>
 #else
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <poll.h>
@@ -21,13 +19,25 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <errno.h>
+#include "../compat/win98_diag.h" /* lv98_tracef (no-op off-era; WIN32
+                                     srv probes compile in flagship-win
+                                     too, so the include cannot be era-only) */
+#if defined(LV_WIN9X) && defined(_WIN32)
+#include <process.h>              /* _beginthreadex (batch 26) */
+#endif
 #ifndef _WIN32
 #include <time.h>
 #endif
 
 #define VOL_STEP 8
 
+#if defined(LV_WIN9X) && defined(_WIN32)
+/* era: winpthread pthread_create is dead on the box (EAGAIN every
+   boot, batch 21) — the handle lives natively (player.c pattern) */
+static void *srv_th;
+#else
 static pthread_t srv_th;
+#endif
 static Player *srv_p;
 static volatile int srv_quit;
 
@@ -172,6 +182,7 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
             p->pl->items = np.items;
             p->pl->count = np.count;
             p->pl->cap = np.cap;
+            pl_touch(p->pl);   /* the swap rewrites every row: any cache on the old gen dies */
             pthread_mutex_unlock(&p->mtx);
             pl_post(p, CMD_PLAY, 0);
         } else {
@@ -321,7 +332,7 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
         }
         if (*rest) {
             if (lv_is_url(rest)) {
-                /* D3 (master ruling): URLs are never playlist rows — the
+                /* D3 (design ruling): URLs are never playlist rows — the
                    transient play verb above is the sanctioned door; the
                    house polite refusal mirrors the live-seek wording */
                 snprintf(resp, rn, "ERR url rows are not allowed in playlists: use play <url> (transient)");
@@ -371,8 +382,115 @@ static DWORD WINAPI pipe_flush_thr(void *arg) {
     return 0;
 }
 
+#if defined(LV_WIN9X) && defined(_WIN32)
+int lv_ipc_file(char *out, size_t n, const char *what) {
+    char exe[MAX_PATH];
+    DWORD k = GetModuleFileNameA(NULL, exe, sizeof exe);
+    char *slash = NULL;
+    char user[256];
+    char *p;
+    if (!k) return -1;
+    for (p = exe; *p; p++)
+        if (*p == '\\') slash = p;
+    if (!slash) return -1;
+    *slash = 0;
+    lv_user_tag(user, sizeof user);
+    snprintf(out, n, "%s\\levari-%s.%s", exe, user, what);
+    return 0;
+}
+#endif
+
 static void *srv_thread(void *arg) {
     (void)arg;
+#if defined(LV_WIN9X) && defined(_WIN32)
+    /* batch 29: this box's kernel32 refuses CreateNamedPipeA outright
+       (batch-28 hardware: gle=120 ERROR_CALL_NOT_IMPLEMENTED even on
+       the SYNCHRONOUS create — the same dead-kernel-object family as
+       CreateSemaphore). The era server therefore conducts the CLI
+       conversation over two plain files next to the exe (module dir
+       = hardware-proven writable: the trace log lives there),
+       polling at 250 ms with box-accepted Sleep. Protocol (see
+       daemon.h): request file "T<tick> <cmd>", answer echoes the
+       token; the server processes a request once by tracking the
+       last token. No deletes, no locks, no new imports. */
+    char reqp[MAX_PATH], respp[MAX_PATH];
+    if (lv_ipc_file(reqp, sizeof reqp, "req") != 0 ||
+        lv_ipc_file(respp, sizeof respp, "resp") != 0) {
+        lv98_tracef("srv:ipc NOPATH");
+        return NULL;
+    }
+    {   static int ok_n;
+        if (ok_n < 1) { ok_n++; lv98_tracef("srv:ipc OK"); } }
+    unsigned last_tok = 0;
+    while (!srv_quit) {
+        char line[8192];
+        DWORD n = 0;
+        HANDLE f = CreateFileA(reqp, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            ReadFile(f, line, (DWORD)sizeof line - 1, &n, NULL);
+            CloseHandle(f);
+        }
+        if (n > 0) {
+            line[n] = 0;
+            char *sp = strchr(line, ' ');
+            unsigned tok = sp && line[0] == 'T'
+                               ? (unsigned)strtoul(line + 1, NULL, 10) : 0;
+            if (sp && tok != 0 && tok != last_tok) {
+                char *nl;
+                char *cmd = sp + 1;
+                last_tok = tok;
+                nl = strchr(cmd, '\n');
+                if (nl) *nl = 0;
+                {   /* first token of the accepted command (cap 3; high
+                       bytes dotted — the log stays 7-bit) */
+                    static int cmd_n;
+                    if (cmd_n < 3) {
+                        cmd_n++;
+                        char tk[25];
+                        size_t ti = 0;
+                        while (ti < 24 && cmd[ti] && cmd[ti] != ' ' &&
+                               cmd[ti] != '\t') {
+                            tk[ti] = (unsigned char)cmd[ti] >= 128
+                                         ? '.' : cmd[ti];
+                            ti++;
+                        }
+                        tk[ti] = 0;
+                        lv98_tracef("srv:cmd [%s]", tk);
+                    }
+                }
+                {   char resp[4096];
+                    char stamped[4160];
+                    int sl;
+                    DWORD w = 0;
+                    handle_cmd(srv_p, cmd, resp, sizeof resp);
+                    sl = snprintf(stamped, sizeof stamped, "T%u %s\n",
+                                  tok, resp);
+                    f = CreateFileA(respp, GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (f == INVALID_HANDLE_VALUE)
+                        lv98_tracef("srv:wfail gle=%lu", GetLastError());
+                    else {
+                        if (sl > 0)
+                            WriteFile(f, stamped, (DWORD)strlen(stamped),
+                                      &w, NULL);
+                        CloseHandle(f);
+                        {   static int conn_n;
+                            if (conn_n < 3) {
+                                conn_n++;
+                                lv98_tracef("srv:conn n=%d", conn_n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Sleep(250);
+    }
+    return NULL;
+#else
     char path[512];
     lv_sock_path(path, sizeof path);
     /* owner-only pipe: with a NULL security descriptor the pipe inherits the
@@ -403,7 +521,18 @@ static void *srv_thread(void *arg) {
         HANDLE h = CreateNamedPipeA(path, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                     1, 0, 4096, 1000, sap);
-        if (h == INVALID_HANDLE_VALUE) { if (psd) LocalFree(psd); return NULL; }
+        if (h == INVALID_HANDLE_VALUE) {
+            /* batch 27: era pipe honesty — FILE_FLAG_OVERLAPPED named
+               pipes are an open era question; if creation dies the
+               thread exits and this is the ONLY trace that says so */
+            lv98_tracef("srv:pipe FAIL gle=%lu", GetLastError());
+            if (psd) LocalFree(psd);
+            return NULL;
+        }
+        {   /* first successful creation = server listening (cap 1) */
+            static int ok_n;
+            if (ok_n < 1) { ok_n++; lv98_tracef("srv:pipe OK"); }
+        }
         pthread_mutex_lock(&pipe_mtx);
         cur_pipe = h;
         pthread_mutex_unlock(&pipe_mtx);
@@ -428,6 +557,10 @@ static void *srv_thread(void *arg) {
             if (conn.hEvent) CloseHandle(conn.hEvent);
             CloseHandle(h);
             continue;
+        }
+        {   /* batch 27: a client arrived (cap 3) */
+            static int conn_n;
+            if (conn_n < 3) { conn_n++; lv98_tracef("srv:conn n=%d", conn_n); }
         }
         /* read one newline-framed line under a deadline over the WHOLE
            line: the per-read 1 s wait only bounds silence — a client
@@ -466,6 +599,23 @@ static void *srv_thread(void *arg) {
             if (off > 0) {
                 char *nl = strchr(line, '\n');
                 if (nl) *nl = 0;
+                {   /* batch 27: first token of the accepted command
+                       (cap 3; OEM/high bytes dotted — log stays 7-bit) */
+                    static int cmd_n;
+                    if (cmd_n < 3) {
+                        cmd_n++;
+                        char tok[25];
+                        size_t ti = 0;
+                        while (ti < 24 && line[ti] && line[ti] != ' ' &&
+                               line[ti] != '\t') {
+                            tok[ti] = (unsigned char)line[ti] >= 128
+                                          ? '.' : line[ti];
+                            ti++;
+                        }
+                        tok[ti] = 0;
+                        lv98_tracef("srv:cmd [%s]", tok);
+                    }
+                }
                 char resp[4096];
                 handle_cmd(srv_p, line, resp, sizeof resp);
                 size_t rl = strlen(resp);
@@ -586,13 +736,33 @@ static void *srv_thread(void *arg) {
     }
     if (psd) LocalFree(psd);
     return NULL;
+#endif
 }
+
+#if defined(LV_WIN9X) && defined(_WIN32)
+static unsigned __stdcall lv98_srv_entry(void *a) {
+    srv_thread(a);
+    return 0;
+}
+#endif
 
 int srv_start(Player *p) {
     srv_p = p;
     srv_quit = 0;
     cur_pipe = INVALID_HANDLE_VALUE;
+#if defined(LV_WIN9X) && defined(_WIN32)
+    /* batch 26: era-native spawn — _beginthreadex default stack +
+       real tid is THE hardware-proven shape (t1, won three boots
+       running); no matrix, the shape decided. If it ever fails the
+       era daemon simply has no server thread, exactly the pre-batch
+       behavior — never a regression. */
+    unsigned btid = 0;
+    srv_th = (void *)_beginthreadex(NULL, 0, lv98_srv_entry, NULL, 0, &btid);
+    lv98_tracef("srv:thr h=%p gle=%lu", srv_th,
+                srv_th ? 0UL : GetLastError());
+#else
     pthread_create(&srv_th, NULL, srv_thread, NULL);
+#endif
     return 0;
 }
 
@@ -605,7 +775,22 @@ void srv_stop(void) {
     HANDLE cp = cur_pipe;
     if (cp != INVALID_HANDLE_VALUE) CancelIoEx(cp, NULL);
     pthread_mutex_unlock(&pipe_mtx);
+#if defined(LV_WIN9X) && defined(_WIN32)
+    if (srv_th) {
+        /* batch 28: the era server may sit in a BLOCKING synchronous
+           ConnectNamedPipe that CancelIo need not interrupt (9x pipe
+           cancel semantics are not adjudicated from memory) — cap the
+           reap at 2 s and let process exit kill the thread; closing
+           the handle of a running thread is legal. Shutdown must
+           never hang on the pipe. */
+        DWORD rc = WaitForSingleObject((HANDLE)srv_th, 2000);
+        CloseHandle((HANDLE)srv_th);
+        srv_th = NULL;
+        lv98_tracef("srv:stop rc=%lu", rc);
+    }
+#else
     pthread_join(srv_th, NULL);
+#endif
 }
 
 #else /* POSIX */
@@ -615,12 +800,8 @@ static void *srv_thread(void *arg) {
     while (!srv_quit) {
         struct pollfd pf = {listen_fd, POLLIN, 0};
         if (poll(&pf, 1, 200) <= 0) continue;
-        int c = accept(listen_fd, NULL, NULL);
+        int c = lv_conn_accept(listen_fd);   /* peer-verified (sock.h) */
         if (c < 0) continue;
-        /* with XDG_RUNTIME_DIR unset the socket path falls back to
-           world-writable /tmp: refuse a peer owned by another uid so a
-           pre-bound impostor cannot harvest our status/title responses */
-        if (!peer_is_self(c)) { close(c); continue; }
         /* bound the read: a client that connects and sends nothing must
            not park the server thread forever (that deadlocks CLI/MCP),
            and the client sends up to 8 KB in one line — one read() into
@@ -665,23 +846,6 @@ static void *srv_thread(void *arg) {
     return NULL;
 }
 
-/* 1 if a live listener at path belongs to this uid. a connect failure
-   (stale socket) or a foreign peer returns 0 and the caller proceeds to
-   unlink+bind. */
-static int self_listener(const char *path) {
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sun_family = AF_UNIX;
-    lv_strlcpy(sa.sun_path, path, sizeof sa.sun_path);
-    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (probe < 0) return 0;
-    int self = 0;
-    if (connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0)
-        self = peer_is_self(probe);
-    close(probe);
-    return self;
-}
-
 int srv_start(Player *p) {
     srv_p = p;
     srv_quit = 0;
@@ -698,7 +862,7 @@ int srv_start(Player *p) {
            unpredictable name instead and publish it in our config dir,
            which no other user can write; the squat becomes useless. */
         char pub[512];
-        if (lv_sock_pointer(pub, sizeof pub) && self_listener(pub)) {
+        if (lv_sock_pointer(pub, sizeof pub) && lv_listener_own(pub)) {
             fprintf(stderr, "levari: another instance is already running; daemon disabled\n");
             return -1;
         }
@@ -707,27 +871,12 @@ int srv_start(Player *p) {
         if (u) { if (fread(&rnd, 1, sizeof rnd, u) != sizeof rnd) rnd = 0; fclose(u); }
         if (!rnd) rnd = (unsigned)time(NULL) ^ ((unsigned)getpid() << 16);
         snprintf(path, sizeof path, "/tmp/levari-%d-%08x.sock", (int)getuid(), rnd);
-    } else if (self_listener(path)) {
+    } else if (lv_listener_own(path)) {
         fprintf(stderr, "levari: another instance is already running; daemon disabled\n");
         return -1;
     }
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sun_family = AF_UNIX;
-    lv_strlcpy(sa.sun_path, path, sizeof sa.sun_path);
-    listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    listen_fd = lv_listener_bind(path);
     if (listen_fd < 0) return -1;
-    unlink(path);   /* only our own stale socket can sit at this name */
-    /* bind with a private umask so the socket is never group/other
-       connectable, even briefly before the chmod */
-    mode_t old_mask = umask(0077);
-    int bind_rc = bind(listen_fd, (struct sockaddr *)&sa, sizeof sa);
-    umask(old_mask);
-    if (bind_rc < 0) {
-        close(listen_fd); listen_fd = -1; return -1;
-    }
-    chmod(path, 0600);
-    if (listen(listen_fd, 4) < 0) { close(listen_fd); listen_fd = -1; return -1; }
     if (fallback) {
         char pf[512];
         lv_sock_ptr_file(pf, sizeof pf);

@@ -1,5 +1,6 @@
 /* P0 URL gate boundary pins — pure-function level (no ffmpeg, no net).
-   build: gcc -std=gnu11 -I../../src -o testurlgate testurlgate.c && ./testurlgate */
+   build/run: cmake --build build && ctest --test-dir build -R '^testurlgate$'
+   (target = this TU alone, -Isrc) */
 #include <stdio.h>
 #include "common.h"
 

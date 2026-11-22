@@ -16,7 +16,16 @@ typedef struct {
 typedef struct {
     Track *items;
     int count, cap;
+    /* bumped by EVERY mutation of the rows or their searchable tags
+       (pl_touch): consumers that cache per-row derived data (the search
+       window's normalized-field cache) key their cache on it. Read/write
+       inherits the caller's playlist-lock discipline — the bump always
+       sits next to an existing items/tags write, never synchronized
+       independently. */
+    unsigned long long gen;
 } Playlist;
+
+static inline void pl_touch(Playlist *p) { p->gen++; }
 
 void pl_init(Playlist *p);
 void pl_clear(Playlist *p);

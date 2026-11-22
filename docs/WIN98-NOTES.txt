@@ -1,12 +1,34 @@
 levari — Windows 98 legacy build (EXPERIMENTAL)
 
 This zip holds the era build of levari: a separate pipeline targeting
-Windows 98-class machines (i686, Windows 98 SE era Win32). Its import
+Windows 98-class machines (i686 without SSE or MMX — every Win98-era
+CPU works, including Pentium II and K6; the build needs no instructions
+beyond Pentium Pro). Its import
 table is verified to contain only DLLs stock to Windows 98 SE, but its
-runtime behaviour on real 98 hardware is NOT yet verified — consider
-this build experimental, and please report anything odd.
+runtime behaviour on real 98 hardware is NOT yet fully verified —
+consider this build experimental, and please report anything odd.
 
 Notes:
+
+* The window needs one extra file that you place yourself:
+  unicows.dll (Microsoft Layer for Unicode on Windows 95/98/ME).
+  Every SDL2 release talks to Windows in UTF-16, and Windows 98's
+  Unicode APIs are non-functional stubs; Microsoft's official shim
+  makes those calls work. Copy unicows.dll into the folder that
+  holds levari.exe. It comes from Microsoft's "Microsoft Layer for
+  Unicode" redistributable (msunic package; also found on VC6/old
+  Platform SDK media) — we do not ship the DLL itself. Without it
+  the program exits immediately without a window; with the file in
+  place everything runs as usual. If you run the program from a
+  command prompt and Windows reports it "requires the Microsoft
+  Layer for Unicode", the file is missing or misnamed.
+
+* If the program exits or crashes without a window, it leaves a file
+  levari_w98.log in the same folder. Its last lines say exactly where
+  it got to (or record the crash address). Please attach that file to
+  a bug report — it turns a silent failure into a diagnosis. Every
+  start appends a new "=== boot" section, so several attempts stay
+  side by side; delete the file to start fresh.
 
 * Audio needs no extra DLLs. This build reaches audio through winmm
   (stock); SDL's DirectSound backend is loaded dynamically at runtime
@@ -19,6 +41,18 @@ Notes:
   is distributed by Microsoft as a free redistributable and is NOT
   shipped in this zip (same posture as the OPL3 bank: our code ships,
   third-party data stays user-supplied).
+
+* CLI on 9x: on NT-class systems the exe re-attaches to the parent
+  console so CLI verbs (status, library, ...) print. That console API
+  does not exist on 98; this build reports it not-implemented, so CLI
+  verbs execute but stay silent (the player and its daemon pipe still
+  work) — drive the program through the GUI on 98.
+
+* Typing: modern Windows text-input plumbing is reported not-implemented
+  and replaced by the 95-era ToAscii path, so typing into fields works
+  including shift states; dead keys and IME composition are simplified
+  (hardware item to re-check). Joystick hotplug degrades from
+  WM_DEVICECHANGE to SDL's polling detection; no other features change.
 
 * Build recipe (reproducible): tools/build_sdl2_win98.sh bootstraps the
   pinned era SDL prefix; the app itself then builds with

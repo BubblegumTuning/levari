@@ -1,21 +1,17 @@
 /* unit test: the ADV-tab LEGACY cycle button (OPTB_TENC) end to end —
-   hand-built SDL_Events drive handle_opt_mouse (down, up), the cycle
+   hand-built SDL_Events drive ui_handle_opt_mouse (down, up), the cycle
    advances, tag_set_legacy_default takes live effect, and opt_save
-   persists cfg.tag_legacy_encoding. Technique (see skill): #include ui.c,
-   link every object EXCEPT main.c.o, ui.c.o, decode.c.o AND
-   stb_vorbis.c.o (dispatch.c.o MUST stay — it defines
-   dec_open/dec_ffmpeg_probe_info that ui.c refs; the two excluded TUs
-   are pre-split leftovers that collide with the dec_*.dir tier objects):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/to \
-       test/optenc/testoptenc.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-   Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
+   persists cfg.tag_legacy_encoding. Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testoptenc$'
+   Link = filtered levari_ui archive minus ui_opt.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy. /tmp/scratch-p2 (its fixture dir) is pre-made by the wrapper.
 */
-#include "../../src/ui/ui.c"
+#include "../../src/ui/ui_opt.c"
 #include <stdlib.h>
 
 static Player fake_pl;
@@ -38,11 +34,11 @@ static void click(int x, int y) {
     e.type = SDL_MOUSEBUTTONDOWN;
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_PRESSED;
-    e.motion.x = x; e.motion.y = y;   /* handle_opt_mouse reads motion.* */
-    handle_opt_mouse(&e);
+    e.motion.x = x; e.motion.y = y;   /* ui_handle_opt_mouse reads motion.* */
+    ui_handle_opt_mouse(&e);
     e.type = SDL_MOUSEBUTTONUP;
     e.button.state = SDL_RELEASED;
-    handle_opt_mouse(&e);
+    ui_handle_opt_mouse(&e);
 }
 
 int main(void) {
@@ -98,12 +94,12 @@ int main(void) {
     chk("config file carries the value", strstr(buf, "tag.legacy_encoding = cp1251") != NULL, 1);
 
     /* close WITHOUT save: cfg is cp1251 (just persisted); cycle live to utf8,
-       then opt_close must roll tag.c's live default back to cfg (cp1251) so
+       then ui_opt_close must roll tag.c's live default back to cfg (cp1251) so
        the button re-read on next open and the decoder never disagree. */
     click(r.x + r.w / 2, r.y + r.h / 2);  /* cp1251 -> utf8, applied live */
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("live before close: utf8 forced", strcmp(t.title, "\xcd\xb3") == 0, 1);
-    opt_close();
+    ui_opt_close();
     tag_init(&t); tag_read("/tmp/scratch-p2/to-cyr.mp3", &t);
     chk("close-without-save reverts live default to cfg (cp1251)",
         strcmp(t.title, "\xd0\x9d\xd1\x96") == 0, 1);

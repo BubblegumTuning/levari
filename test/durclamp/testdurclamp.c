@@ -3,19 +3,10 @@
    2000000000 s used to poison the footer sum (int wrap, footer read
    0:00). Both parsers now gate every value through the LV_DUR_MAX
    hazard ceiling (tag.h): out of range means 0 = unknown, the row is
-   kept, the scan backfill supplies the real length later. Run with
-   argv[1] = a fresh scratch dir for the fixtures. Technique (see skill):
-   #include playlist.c, link every object EXCEPT main.c.o, playlist.c.o,
-   decode.c.o and stb_vorbis.c.o (dispatch.c.o MUST stay; the two
-   excluded TUs are pre-split leftovers that collide with the dec_*.dir
-   tier objects):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/tag $SDL -o /tmp/td \
-       test/durclamp/testdurclamp.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name playlist.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
+   kept, the scan backfill supplies the real length later. Build/run: cmake --build build && ctest --test-dir build -R '^testdurclamp$'
+   — the wrapper appends its fresh scratch dir as argv[1] (--scratch-arg).
+   Technique: #include playlist.c; link = filtered levari_core archive
+   minus playlist.c.o + levari_engine + core deps + tier/ffab objects
 */
 #include "../../src/playlist/playlist.c"
 #include <assert.h>

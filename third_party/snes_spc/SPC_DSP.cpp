@@ -195,9 +195,56 @@ inline void SPC_DSP::run_counters()
 		m.counter = simple_counter_range - 1;
 }
 
+/* LEVARI PATCH (PERFORMANCE): reciprocal-multiply read_counter —
+ * ARM1176 has no hardware divide. Measured 2026-11-22 on real Pi 1
+ * silicon (exact production flag string, best-of-11): -1.0..-1.9% on
+ * 4 SPC fixtures, output FNV bit-identical vs shipped. */
+// Reciprocal multipliers so read_counter() needs no hardware divide (ARMv6/Pi Zero has none,
+// older x86 takes 20-30 cycles, and the envelope code calls this once per voice per sample).
+// magic = floor(2^32 / rate) + 1 gives the exact quotient for every numerator below 2^16
+// (the largest numerator here is 30719 + 1040); verified exhaustively for all 32 rates.
+static unsigned const counter_magic [32] =
+{
+	0x0002221Eu, // 30721
+	0x00200001u, // 2048
+	0x002AAAABu, // 1536
+	0x00333334u, // 1280
+	0x00400001u, // 1024
+	0x00555556u, // 768
+	0x00666667u, // 640
+	0x00800001u, // 512
+	0x00AAAAABu, // 384
+	0x00CCCCCDu, // 320
+	0x01000001u, // 256
+	0x01555556u, // 192
+	0x0199999Au, // 160
+	0x02000001u, // 128
+	0x02AAAAABu, // 96
+	0x03333334u, // 80
+	0x04000001u, // 64
+	0x05555556u, // 48
+	0x06666667u, // 40
+	0x08000001u, // 32
+	0x0AAAAAABu, // 24
+	0x0CCCCCCDu, // 20
+	0x10000001u, // 16
+	0x15555556u, // 12
+	0x1999999Au, // 10
+	0x20000001u, // 8
+	0x2AAAAAABu, // 6
+	0x33333334u, // 5
+	0x40000001u, // 4
+	0x55555556u, // 3
+	0x80000001u, // 2
+	0 // 1: rate 1, handled in read_counter
+};
+
 inline unsigned SPC_DSP::read_counter( int rate )
 {
-	return ((unsigned) m.counter + counter_offsets [rate]) % counter_rates [rate];
+	unsigned x = (unsigned) m.counter + counter_offsets [rate];
+	if ( rate >= 31 ) return 0; // rate 1: x % 1
+	unsigned q = (unsigned) (((unsigned long long) x * counter_magic [rate]) >> 32);
+	return x - q * counter_rates [rate];
 }
 
 
@@ -306,9 +353,9 @@ inline void SPC_DSP::decode_brr( voice_t* v )
 		
 		// Shift sample based on header
 		int const shift = header >> 4;
-		s = (s << shift) >> 1;
+		s = (s * (1 << shift)) >> 1; // multiply: left shift of a negative value is undefined
 		if ( shift >= 0xD ) // handle invalid range
-			s = (s >> 25) << 11; // same as: s = (s < 0 ? -0x800 : 0)
+			s = (s >> 25) * 0x800; // same as: s = (s < 0 ? -0x800 : 0)
 		
 		// Apply IIR filter (8 is the most commonly used)
 		int const filter = header & 0x0C;
@@ -387,7 +434,12 @@ MISC_CLOCK( 30 )
 
 inline VOICE_CLOCK( V1 )
 {
-	m.t_dir_addr = m.t_dir * 0x100 + m.t_srcn * 4;
+	/* LEVARI PATCH: dir<<8 + srcn*4 can reach 0x102FC (255*0x100 + 255*4),
+	 * past the ram[0x10000+0x100] tail — the V2 sample-pointer
+	 * read ran up to 0x2FC beyond the SNES_SPC object (heap-buffer-overflow
+	 * under ASan, fuzz night runs 2026-11-14/15). Mask to the 64K space as
+	 * the echo pointer already does (t_echo_ptr) and as the hardware wraps. */
+	m.t_dir_addr = (m.t_dir * 0x100 + m.t_srcn * 4) & 0xFFFF;
 	m.t_srcn = VREG(v->regs,srcn);
 }
 inline VOICE_CLOCK( V2 )

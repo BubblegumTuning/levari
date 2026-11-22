@@ -76,8 +76,8 @@ Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA */
 // TODO: remove non-wrapping versions?
 #define SPC_NO_SP_WRAPAROUND 0
 
-#define SET_SP( v )     (sp = ram + 0x101 + (v))
-#define GET_SP()        (sp - 0x101 - ram)
+#define SET_SP( v )     (sp = ram + 0x101 + ((uint8_t) v))
+#define GET_SP()        (uint8_t (sp - 0x101 - ram))
 
 #if SPC_NO_SP_WRAPAROUND
 #define PUSH16( v )     (sp -= 2, SET_LE16( sp, v ))
@@ -294,8 +294,7 @@ loop:
 				REGS [i] = (uint8_t) data;
 				
 				// Registers other than $F2 and $F4-$F7
-				//if ( i != 2 && i != 4 && i != 5 && i != 6 && i != 7 )
-				if ( ((~0x2F00 << (bits_in_int - 16)) << i) < 0 ) // 12%
+				if ( i != 2 && (i < 4 || i > 7) ) // 12%
 					cpu_write_smp_reg( data, rel_time, i );
 			}
 		}
@@ -485,7 +484,7 @@ loop:
 	
 	case 0xAF: // MOV (X)+,A
 		WRITE_DP( 0, x, a + no_read_before_write  );
-		x++;
+		x = (uint8_t) (x + 1);
 		goto loop;
 	
 // 5. 8-BIT LOGIC OPERATION COMMANDS
@@ -808,7 +807,7 @@ loop:
 		unsigned temp = y * a;
 		a = (uint8_t) temp;
 		nz = ((temp >> 1) | temp) & 0x7F;
-		y = temp >> 8;
+		y = (uint8_t) (temp >> 8);
 		nz |= y;
 		goto loop;
 	}
@@ -838,6 +837,7 @@ loop:
 		
 		nz = (uint8_t) a;
 		a = (uint8_t) a;
+		y = (uint8_t) y;
 		
 		goto loop;
 	}
@@ -1004,7 +1004,7 @@ loop:
 	case 0x7F: // RET1
 		temp = *sp;
 		SET_PC( GET_LE16( sp + 1 ) );
-		sp += 3;
+		SET_SP( GET_SP() + 3 );
 		goto set_psw;
 	case 0x8E: // POP PSW
 		POP( temp );
@@ -1178,12 +1178,11 @@ loop:
 		goto loop;
 	
 	case 0xFF:{// STOP
-		// handle PC wrap-around
-		unsigned addr = GET_PC() - 1;
-		if ( addr >= 0x10000 )
+		// handle PC wrap-around (libgme 775efcd: the previous check of
+		// GET_PC()-1 >= 0x10000 could loop forever when STOP sits at the
+		// end of RAM and PC wraps to 0)
+		if ( pc == 0x0000 )
 		{
-			addr &= 0xFFFF;
-			SET_PC( addr );
 			dprintf( "SPC: PC wrapped around\n" );
 			goto loop;
 		}

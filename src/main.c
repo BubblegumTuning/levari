@@ -7,12 +7,12 @@
 #include "library/library.h"
 #include "config/config.h"
 #include "common.h"
+#include "platform/platform.h"
 #include <stdio.h>
 #ifndef _WIN32
 #include <signal.h>
-#else
-#include "compat/win32.h"
 #endif
+#include "compat/win98_diag.h"
 
 static int is_cli_cmd(const char *s) {
     static const char *CMDS[] = {"play","pause","resume","toggle","stop","next","prev",
@@ -39,7 +39,8 @@ static void print_usage(void) {
 }
 
 static int probe(const char *path) {
-    Decoder *d = dec_open(path);
+    DecOpts dopts = { .allow_large = cfg.allow_large };
+    Decoder *d = dec_open(path, &dopts);
     if (!d) { printf("%-24s FAIL open\n", path); return 1; }
     Tags t; tag_init(&t); tag_read(path, &t);
     int16_t buf[2048 * 2];
@@ -57,15 +58,14 @@ static Player player;
 static Playlist playlist;
 
 int main(int argc, char **argv) {
+    lv98_diag_init();
+    lv98_tracef("main:enter argc=%d", argc);
 #ifdef _WIN32
     /* GUI-subsystem exe (no console window on double-click): when invoked as
-       a CLI verb, re-attach to the parent console so output is visible */
-    if (argc > 1 && (is_cli_cmd(argv[1]) || !strcmp(argv[1], "library") || is_help(argv[1]))) {
-        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            freopen("CONOUT$", "w", stdout);
-            freopen("CONOUT$", "w", stderr);
-        }
-    }
+       a CLI verb, re-attach to the parent console so output is visible
+       (platform/console.c) */
+    if (argc > 1 && (is_cli_cmd(argv[1]) || !strcmp(argv[1], "library") || is_help(argv[1])))
+        lv_console_reattach();
 #else
     /* daemon/CLI sockets: a client dying mid-response must not kill us */
     signal(SIGPIPE, SIG_IGN);
@@ -90,6 +90,12 @@ int main(int argc, char **argv) {
     int selftest = 0;
     pl_init(&playlist);
     pl_player_init(&player, &playlist);
+    /* layering wiring: the player banks working URLs only through this
+       hook (library), and the UI reads the ffmpeg probe / MPRIS Raise
+       only through these (decode, mpris) — see ui.h, player.h */
+    pl_player_set_url_save(lib_url_index_save);
+    ui_set_ffprobe(dec_ffmpeg_probe_info);
+    ui_set_raise_hook(mpris_take_raise);
     if (cfg.shuffle_remember > 0 && cfg.shuffle > 0) player.shuffle = 1;
     player.fade_stop = cfg.fade_stop > 0;
 
@@ -120,16 +126,27 @@ int main(int argc, char **argv) {
     }
 
     pl_player_start(&player);
+    lv98_tracef("pl_player_start:done");
     srv_start(&player);
+    lv98_tracef("srv_start:done");
     mpris_start(&player);
+    lv98_tracef("mpris_start:done");
     if (playlist.count > 0) pl_post(&player, CMD_PLAY, 0);
     if (selftest > 0) ui_deadline_ms = (unsigned)(selftest * 1000);
+    lv98_tracef("ui_run:enter");
     int ui_rc = ui_run(&player, show_pl);
+    lv98_tracef("ui_run:rc=%d", ui_rc);
     mpris_stop();
     srv_stop();
     printf("selftest: cur=%d state=%d pos=%lld/%lld rate=%d\n",
            player.cur, player.state, player.pos_frames, player.total_frames, player.rate);
     pl_player_stop(&player);
+    /* batch 21: the whole "clean exit" proof so far stopped at
+       ui_run:rc=0, which prints BEFORE the join in pl_player_stop —
+       a wedged player thread would zombie-hang here with the window
+       already gone. This line after the join is the first honest
+       exit proof; its absence next round means the join hung */
+    lv98_tracef("main:exit");
     if (save_to) pl_save_m3u(&playlist, save_to);
     pl_clear(&playlist);
     /* ui_run's -1 means video is dead (SDL_Init, window creation, or an

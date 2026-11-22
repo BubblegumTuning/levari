@@ -42,8 +42,19 @@ static inline void lv_fmt_time(char *buf, size_t n, long long sec) {
 }
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.3.7"
+#define LV_VERSION "0.3.8"
 #endif
+
+/* Dev-build identity (see the dev-identity block in CMakeLists.txt): the
+   suffix is empty exactly at a release cut commit with a clean tree, and
+   "-dev-<shortsha>" everywhere else. LV_VERSION alone stays the bare
+   release version — the library index header embeds it under a 31-byte
+   budget and must not churn per commit; display and MCP strings use
+   LV_BUILD_ID. Hand-compiled TUs without the CMake define get no suffix. */
+#ifndef LV_DEV_SUFFIX
+#define LV_DEV_SUFFIX ""
+#endif
+#define LV_BUILD_ID LV_VERSION LV_DEV_SUFFIX
 
 /* build architecture, shown in the options title bar before the version
    so a release binary can be identified at a glance (x86-64 vs arm32...) */
@@ -258,7 +269,14 @@ static inline void lv_path_join(char *out, size_t n, const char *dir, const char
     if (dn && (dir[dn - 1] == '/' || dir[dn - 1] == '\\'))
         snprintf(out, n, "%s%s", dir, rel);
     else
+#ifdef _WIN32
+        /* native separator: Win9x file APIs do NOT translate '/' (batch
+           17/18 hardware: a "%s/%s" join poisoned stat AND the browser's
+           dir state); modern Windows accepts both, backslash is canonical */
+        snprintf(out, n, "%s\\%s", dir, rel);
+#else
         snprintf(out, n, "%s/%s", dir, rel);
+#endif
 }
 
 /* logical drive roots from a GetLogicalDrives-style bitmask (bit 0 = "A:").

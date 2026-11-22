@@ -29,7 +29,7 @@
 #include "../config/config.h"
 #include "../tag/tag.h"
 #ifdef _WIN32
-#include "../compat/win32.h"
+#include "../platform/platform.h"
 #else
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -423,6 +423,9 @@ struct Decoder {
     const FFApi *ffapi;     /* the ABI variant that produced u.ff — MUST be
                                outside the union: it lives beside u.ff, not over it */
 #endif
+    int (*seek_abort)(void *ctx);  /* DecOpts poll banked at open; consulted
+                                      by lv_fmt_spc_seek between skip chunks */
+    void *seek_abort_ctx;
 };
 
 /* validate an mpeg audio frame header as a layer-iii frame and return its
@@ -515,7 +518,532 @@ static int sniff(const char *path, int *fmt) {
     return -1;
 }
 
-Decoder *dec_open(const char *path) {
+static int lv_fmt_mp3_read(Decoder *d, int16_t *out, int frames) {
+        size_t got = mp3dec_ex_read(&d->u.mp3, (mp3d_sample_t*)out, (size_t)frames * d->ch);
+    return (int)(got / (size_t)d->ch);
+}
+
+static int lv_fmt_ogg_read(Decoder *d, int16_t *out, int frames) {
+return stb_vorbis_get_samples_short_interleaved(d->u.ov, d->ch, (short*)out, frames * d->ch);
+}
+
+static int lv_fmt_flac_read(Decoder *d, int16_t *out, int frames) {
+return (int)drflac_read_pcm_frames_s16(d->u.flac, (drflac_uint64)frames, out);
+}
+
+static int lv_fmt_oggflac_read(Decoder *d, int16_t *out, int frames) {
+return (int)drflac_read_pcm_frames_s16(d->u.oflac.fl, (drflac_uint64)frames, out);
+}
+
+static int lv_fmt_wav_read(Decoder *d, int16_t *out, int frames) {
+return (int)drwav_read_pcm_frames_s16(d->u.wav, (drwav_uint64)frames, out);
+}
+
+static int lv_fmt_mod_read(Decoder *d, int16_t *out, int frames) {
+        int got = ModPlug_Read(d->u.mp, out, frames * 4); /* s16 stereo -> 4 bytes/frame */
+    return got > 0 ? got / 4 : 0;
+}
+
+static int lv_fmt_spc_read(Decoder *d, int16_t *out, int frames) {
+        Spc *s = d->u.sp;
+    if (s->end_at && s->played >= s->end_at) return 0;
+    int n = frames;
+    if (s->end_at && s->played + n > s->end_at)
+        n = (int)(s->end_at - s->played);
+    if (spc_play(s->spc, n * 2, (short *)out) != NULL) return 0;
+    spc_filter_run(s->filter, (short *)out, n * 2);
+    long long from = s->played;
+    s->played += n;
+    if (!s->end_at) {
+        /* silence trim: the emulated DSP reports whether any voice
+           keyed on since the last check; quiet + no key-ons for
+           SPC_SILENCE frames means the song has ended */
+        int loud = 0;
+        for (int i = 0; i < n * 2; i++)
+            if (out[i] < -32 || out[i] > 32) { loud = 1; break; }
+        if (loud) { s->silent = 0; s->heard = 1; }
+        else if (spc_check_kon(s->spc)) s->silent = 0;
+        else if (s->heard && (s->silent += n) >= SPC_SILENCE) {
+            s->end_at = s->played + SPC_FADE;
+            s->fade_at = s->played;
+        }
+        if (!s->end_at && s->played >= SPC_MAX) {
+            s->end_at = s->played + SPC_FADE;
+            s->fade_at = s->played;
+        }
+    }
+    if (s->fade_at >= 0 && s->played > s->fade_at) {
+        /* linear ramp to silence across the fade window; frames
+           before fade_at keep unity gain via the span clamp */
+        long long span = s->end_at - s->fade_at;
+        for (int i = 0; i < n; i++) {
+            long long g = s->end_at - (from + i);
+            if (g > span) g = span;
+            if (g < 0) g = 0;
+            out[i * 2]     = (int16_t)((long long)out[i * 2]     * g / span);
+            out[i * 2 + 1] = (int16_t)((long long)out[i * 2 + 1] * g / span);
+        }
+    }
+    return n;
+}
+
+static int lv_fmt_opus_read(Decoder *d, int16_t *out, int frames) {
+        Opus *o = d->u.op;
+    int copied = 0;
+    while (copied < frames) {
+        if (o->buf_i < o->buf_n) {
+            int take = frames - copied < o->buf_n - o->buf_i ? frames - copied : o->buf_n - o->buf_i;
+            memcpy(out + (size_t)copied * d->ch, o->buf + (size_t)o->buf_i * d->ch,
+                   (size_t)take * d->ch * 2);
+            o->buf_i += take;
+            copied += take;
+            continue;
+        }
+        const unsigned char *pkt;
+        int len;
+        if (ogg_next_packet(o, &pkt, &len) != 0) break;
+        int n = opus_dec(o->dec, pkt, len, o->tmp, 5760, 0);
+        if (n <= 0) continue;
+        int off = 0;
+        if (o->discard > 0) {
+            int sk = (long long)n < o->discard ? n : (int)o->discard;
+            o->discard -= sk;
+            off = sk;
+            n -= sk;
+            if (n <= 0) continue;
+        }
+        memcpy(o->buf, o->tmp + (size_t)off * d->ch, (size_t)n * d->ch * 2);
+        o->buf_n = n;
+        o->buf_i = 0;
+    }
+    return copied;
+}
+
+static int lv_fmt_ffmpeg_read(Decoder *d, int16_t *out, int frames) {
+#ifdef HAVE_FFMPEG
+    return d->ffapi->read(d->u.ff, out, frames);
+#endif
+    return -1;
+}
+
+static int lv_fmt_mp3_seek(Decoder *d, long long frame) {
+return mp3dec_ex_seek(&d->u.mp3, (uint64_t)frame * d->ch) == 0 ? 0 : -1;
+}
+
+static int lv_fmt_ogg_seek(Decoder *d, long long frame) {
+return stb_vorbis_seek(d->u.ov, (unsigned int)frame) ? 0 : -1;
+}
+
+static int lv_fmt_flac_seek(Decoder *d, long long frame) {
+return drflac_seek_to_pcm_frame(d->u.flac, (drflac_uint64)frame) ? 0 : -1;
+}
+
+static int lv_fmt_oggflac_seek(Decoder *d, long long frame) {
+return drflac_seek_to_pcm_frame(d->u.oflac.fl, (drflac_uint64)frame) ? 0 : -1;
+}
+
+static int lv_fmt_wav_seek(Decoder *d, long long frame) {
+return drwav_seek_to_pcm_frame(d->u.wav, (drwav_uint64)frame) ? 0 : -1;
+}
+
+static int lv_fmt_mod_seek(Decoder *d, long long frame) {
+ModPlug_Seek(d->u.mp, (int)(frame * 1000 / d->rate)); /* order-approximate */
+    return 0;
+}
+
+static int lv_fmt_spc_seek(Decoder *d, long long frame) {
+        Spc *s = d->u.sp;
+    if (frame < 0) frame = 0;
+    if (frame > (1LL << 30)) return -1; /* spc_skip takes an int count */
+    if (spc_load_spc(s->spc, s->data, s->size) != NULL) return -1;
+    spc_clear_echo(s->spc);
+    spc_filter_clear(s->filter);
+    s->played = 0;
+    s->silent = 0;
+    s->heard = 0;
+    /* end_at/fade_at are absolute stream positions: they stay valid
+       across a seek, no recompute needed */
+    /* Chunked skip with an abort poll: SPC seek is an emulated
+       fast-forward (~12 ms CPU per declared second), so a crafted
+       long-tag file could otherwise block the player thread for up
+       to the 0x1FFF tag-gate ~100 s, unreachable by STOP. Polling
+       between chunks lets a posted command (stop, track change)
+       abandon the skip; the song then sits where the skip got to,
+       s->played tracks it, and the caller's command replays from
+       there. The long long accumulator also bounds the per-call
+       count without the old (int)(frame*2) truncation at 2^30. */
+    long long skipped = 0;
+    while (skipped < frame) {
+        if (d->seek_abort && d->seek_abort(d->seek_abort_ctx)) return -1;
+        long long want = frame - skipped;
+        int chunk = want > 8192 ? 8192 : (int)want;
+        if (spc_skip(s->spc, chunk * 2) != NULL) return -1;
+        skipped += chunk;
+        s->played = skipped;
+    }
+    return 0;
+}
+
+static int lv_fmt_opus_seek(Decoder *d, long long frame) {
+        Opus *o = d->u.op;
+    long long target = frame + o->pre_skip;
+    o->next_off = o->data_off;
+    o->eof = 0;
+    o->nseg = 0;
+    o->seg_i = 0;
+    o->buf_n = o->buf_i = 0;
+    o->pkt_len = 0;
+    long long prev = 0; /* first audio page emits from sample 0 */
+    for (;;) {
+        if (ogg_load_page(o) != 0) return -1;
+        if (o->page_granule >= 0 && o->page_granule >= target) break;
+        if (o->page_granule > prev) prev = o->page_granule;
+    }
+    /* decoding restarts at the found page's first packet, so that page
+       emits samples [prev, page_granule): discard what precedes the
+       target. (The old page_granule - target landed at
+       prev + page_granule - 2*target: exact only at page center, up
+       to a full page off at the edges.) */
+    o->discard = target - prev;
+    opus_ctl(o->dec, 4007 /* OPUS_RESET_STATE */);
+    return 0;
+}
+
+static int lv_fmt_ffmpeg_seek(Decoder *d, long long frame) {
+#ifdef HAVE_FFMPEG
+    return d->ffapi->seek(d->u.ff, frame);
+#endif
+    return -1;
+}
+
+static void lv_fmt_mp3_close(Decoder *d) {
+mp3dec_ex_close(&d->u.mp3);
+}
+
+static void lv_fmt_ogg_close(Decoder *d) {
+stb_vorbis_close(d->u.ov);
+}
+
+static void lv_fmt_flac_close(Decoder *d) {
+drflac_close(d->u.flac);
+}
+
+static void lv_fmt_oggflac_close(Decoder *d) {
+drflac_close(d->u.oflac.fl); free(d->u.oflac.buf);
+}
+
+static void lv_fmt_wav_close(Decoder *d) {
+drwav_uninit(d->u.wav); free(d->u.wav);
+}
+
+static void lv_fmt_mod_close(Decoder *d) {
+ModPlug_Unload(d->u.mp);
+}
+
+static void lv_fmt_spc_close(Decoder *d) {
+        Spc *s = d->u.sp;
+    if (s->spc) spc_delete(s->spc);
+    if (s->filter) spc_filter_delete(s->filter);
+    free(s->data);
+    free(s);
+}
+
+static void lv_fmt_opus_close(Decoder *d) {
+        Opus *o = d->u.op;
+    if (o->dec) opus_destroy(o->dec);
+    if (o->f) fclose(o->f);
+    free(o);
+}
+
+static void lv_fmt_ffmpeg_close(Decoder *d) {
+#ifdef HAVE_FFMPEG
+    d->ffapi->close(d->u.ff);
+#endif
+}
+
+#ifdef HAVE_FFMPEG
+/* fmt ffmpeg open */
+static int lv_fmt_ffmpeg_open(Decoder *d, const char *path, int url) {
+    /* one dispatch: the runtime pair matched an ABI variant in
+       ff_pick; that variant owns every libav touch from here on
+       (session shape, whitelist, interrupt cb — see ffab.c). The fmt
+       re-tag covers the OGGFLAC/MOD fallbacks, which re-enter here. */
+    const FFApi *api = ff_pick();
+    if (!api) return -1;
+    d->fmt = F_FFMPEG;
+    int rate = 0, ch = 0;
+    long long total = 0;
+    FFContext *fx = api->open(path, url, &rate, &ch, &total);
+    if (!fx) return -1;
+    d->ffapi = api;
+    d->u.ff = fx;
+    d->rate = rate;
+    d->ch = ch;
+    d->total = total;
+    return 0;
+}
+#endif
+
+/* fmt mp3 open */
+static int lv_fmt_mp3_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        if (mp3dec_ex_open(&d->u.mp3, path, MP3D_SEEK_TO_SAMPLE) != 0) return -1;
+    d->ch = d->u.mp3.info.channels;
+    d->rate = d->u.mp3.info.hz;
+    /* Without MP3D_DO_NOT_SCAN the open scan-counts EXACT samples over
+       the whole stream even when no Xing/VBRI tag exists. The old
+       vbr_tag_found gate discarded that count for tag-less VBR files
+       and fell to the first-frame CBR estimate — a stream opening on
+       an 8 kbps silence frame inflated length ~9x. With no Xing there
+       is no delay/padding subtraction, and the decoder emits exactly
+       the samples it counts, so trust samples; keep the size-based
+       estimate only when the scan produced nothing. */
+    /* A frameless (tag-only / garbage-header) stream opens SUCCESSFULLY
+       with samples == 0 AND channels == 0 — minimp3_ex fills info only
+       from decoded frames. Integer 0/0 traps exactly like n/0: an
+       unguarded division here SIGFPE'd the scan thread mid-scan
+       (journal 'trap divide error' in lvscan). Skip the division and
+       let the validity gate at the end of dec_open reject the decoder. */
+    d->total = d->ch > 0 ? (long long)d->u.mp3.samples / d->ch : 0;
+    if (d->total == 0) {
+    int kbps = d->u.mp3.info.bitrate_kbps;
+        long long fs = 0;
+        FILE *f = fopen(path, "rb");
+        if (f) { fseek(f, 0, SEEK_END); fs = ftell(f); fclose(f); }
+        if (kbps > 0 && fs > 0)
+            d->total = fs * 8LL * d->rate / ((long long)kbps * 1000);
+    }
+    return 0;
+}
+
+/* fmt ogg open */
+static int lv_fmt_ogg_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        int err;
+    d->u.ov = stb_vorbis_open_filename(path, &err, NULL);
+    if (!d->u.ov) return -1;
+    stb_vorbis_info info = stb_vorbis_get_info(d->u.ov);
+    d->ch = info.channels;
+    d->rate = info.sample_rate;
+    d->total = (long long)stb_vorbis_stream_length_in_samples(d->u.ov);
+    return 0;
+}
+
+/* fmt opus open */
+static int lv_fmt_opus_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        if (opus_syms() != 0) return -1;
+    Opus *o = calloc(1, sizeof *o);
+    if (!o) return -1;
+    o->f = fopen(path, "rb");
+    if (!o->f) { free(o); return -1; }
+    const unsigned char *pkt;
+    int len;
+    if (ogg_next_packet(o, &pkt, &len) != 0 || len < 19 || memcmp(pkt, "OpusHead", 8)) goto opusfail;
+    if (pkt[8] != 1 || pkt[16] != 0) goto opusfail; /* version 1, channel mapping family 0 */
+    d->ch = pkt[9];
+    o->pre_skip = rd16(pkt + 10);
+    if (ogg_next_packet(o, &pkt, &len) != 0 || len < 8 || memcmp(pkt, "OpusTags", 8)) goto opusfail;
+    o->data_off = o->next_off; /* audio starts on the page after OpusTags */
+    int err = 0;
+    o->dec = opus_create(48000, d->ch, &err);
+    if (!o->dec || err) goto opusfail;
+    d->rate = 48000;
+    o->discard = o->pre_skip;
+    long long g = ogg_last_granule(o);
+    d->total = g > o->pre_skip ? g - o->pre_skip : 0;
+    d->u.op = o;
+opusfail:
+    if (o->dec) opus_destroy(o->dec);
+    if (o->f) fclose(o->f);
+    free(o);
+    return -1;
+    return 0;
+}
+
+/* fmt flac open */
+static int lv_fmt_flac_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        d->u.flac = drflac_open_file(path, NULL);
+    if (!d->u.flac) return -1;
+    d->ch = (int)d->u.flac->channels;
+    d->rate = (int)d->u.flac->sampleRate;
+    d->total = (long long)d->u.flac->totalPCMFrameCount;
+    return 0;
+}
+
+/* fmt oggflac open */
+static int lv_fmt_oggflac_open(Decoder *d, const char *path, int url) {
+    (void)url;
+    /* demux to a native stream in memory (same slurp policy as the
+       modplug path; 64MB cap) and hand it to drflac */
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseeko(f, 0, SEEK_END);
+    long long fs = ftello(f);
+    unsigned char *raw = NULL, *stream = NULL;
+    size_t olen = 0;
+    long long total = 0;
+    if (fs > 0 && fs <= (64LL << 20)) {
+    raw = malloc((size_t)fs);
+        if (raw && fseeko(f, 0, SEEK_SET) == 0 &&
+            fread(raw, 1, (size_t)fs, f) == (size_t)fs)
+            stream = oggflac_demux(raw, (size_t)fs, &olen, &total);
+        free(raw);
+    }
+    fclose(f);
+    if (stream) {
+    drflac *dc = drflac_open_memory(stream, olen, NULL);
+        if (dc) {
+        d->u.oflac.fl = dc;
+            d->u.oflac.buf = stream;
+            d->ch = (int)dc->channels;
+            d->rate = (int)dc->sampleRate;
+            d->total = (long long)dc->totalPCMFrameCount
+                       ? (long long)dc->totalPCMFrameCount : total;
+            return 0; /* success: drflac reads through the banked buffer */
+        }
+        free(stream);
+    }
+#ifdef HAVE_FFMPEG
+    return lv_fmt_ffmpeg_open(d, path, url); /* exotic variant or over the cap: let libav try (fmt re-tag inside) */
+#else
+    return -1;
+#endif
+}
+
+/* fmt wav open */
+static int lv_fmt_wav_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        drwav *w = malloc(sizeof *w);
+    if (!w) return -1;
+    if (!drwav_init_file(w, path, NULL)) { free(w); return -1; }
+    d->u.wav = w;
+    d->ch = (int)d->u.wav->channels;
+    d->rate = (int)d->u.wav->sampleRate;
+    d->total = (long long)d->u.wav->totalPCMFrameCount;
+    return 0;
+}
+
+/* fmt mod open */
+static int lv_fmt_mod_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        static int mp_settings_done;
+    if (!mp_settings_done) {
+    ModPlug_Settings st;
+        ModPlug_GetSettings(&st);
+        st.mChannels = 2;
+        st.mBits = 16;
+        st.mFrequency = 44100;
+        st.mResamplingMode = MODPLUG_RESAMPLE_SPLINE;
+        st.mFlags = MODPLUG_ENABLE_OVERSAMPLING;
+        ModPlug_SetSettings(&st);
+        mp_settings_done = 1;
+    }
+    long long fs = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    fs = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = NULL;
+    if (fs > 0 && fs <= (64LL << 20)) buf = malloc((size_t)fs);
+    if (!buf || fread(buf, 1, (size_t)fs, f) != (size_t)fs) {
+    free(buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    d->u.mp = ModPlug_Load(buf, (int)fs); /* libmodplug copies what it needs */
+    free(buf);
+    if (!d->u.mp) {
+#ifdef HAVE_FFMPEG
+    return lv_fmt_ffmpeg_open(d, path, url); /* exotic variant: let libav try (fmt re-tag inside) */
+#else
+        return -1;
+#endif
+    }
+    d->ch = 2;
+    d->rate = 44100;
+    int ms = ModPlug_GetLength(d->u.mp);
+    d->total = ms > 0 ? (long long)ms * 441 / 10 : 0;
+    return 0;
+}
+
+/* fmt spc open */
+static int lv_fmt_spc_open(Decoder *d, const char *path, int url) {
+    (void)url;
+        long long fs = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    fs = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = NULL;
+    /* spc_min_file_size: the fixed layout (header + 64K RAM + DSP
+       regs) must be fully present; trailer data is optional */
+    if (fs >= 0x10180 && fs <= (64LL << 20)) buf = malloc((size_t)fs);
+    if (!buf || fread(buf, 1, (size_t)fs, f) != (size_t)fs) {
+    free(buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    SNES_SPC *spc = spc_new();
+    SPC_Filter *flt = spc_filter_new();
+    if (!spc || !flt || spc_load_spc(spc, buf, (long)fs) != NULL) {
+    if (spc) spc_delete(spc);
+        if (flt) spc_filter_delete(flt);
+        free(buf);
+        return -1;
+    }
+    spc_clear_echo(spc); /* many rips carry garbage in the echo region */
+    Spc *s = calloc(1, sizeof *s);
+    if (!s) {
+    spc_delete(spc);
+        spc_filter_delete(flt);
+        free(buf);
+        return -1;
+    }
+    s->spc = spc; s->filter = flt; s->data = buf; s->size = (long)fs;
+    s->fade_at = -1;
+    int secs = spc_tag_duration(buf, (long)fs);
+    if (secs) {
+    s->end_at = (long long)secs * SPC_RATE + SPC_FADE;
+        s->fade_at = (long long)secs * SPC_RATE;
+    }
+    d->u.sp = s;
+    d->ch = 2;
+    d->rate = SPC_RATE;
+    d->total = s->end_at;
+    return 0;
+}
+
+typedef struct {
+    int  (*open)(Decoder *d, const char *path, int url);
+    int  (*read)(Decoder *d, int16_t *out, int frames);
+    int  (*seek)(Decoder *d, long long frame);
+    void (*close)(Decoder *d);
+} DecFmt;
+#define DEC_ENTRY(k) { lv_fmt_##k##_open, lv_fmt_##k##_read, lv_fmt_##k##_seek, lv_fmt_##k##_close }
+
+/* ONE table per format: adding a backend means adding four statics + one
+   entry here, not touching the four dispatch sites */
+static const DecFmt DEC_FMT[] = {
+    [F_MP3]     = DEC_ENTRY(mp3),
+    [F_OGG]     = DEC_ENTRY(ogg),
+    [F_OPUS]    = DEC_ENTRY(opus),
+    [F_FLAC]    = DEC_ENTRY(flac),
+    [F_OGGFLAC] = DEC_ENTRY(oggflac),
+    [F_WAV]     = DEC_ENTRY(wav),
+#ifdef HAVE_FFMPEG
+    [F_FFMPEG]  = DEC_ENTRY(ffmpeg),
+#endif
+    [F_MOD]     = DEC_ENTRY(mod),
+    [F_SPC]     = DEC_ENTRY(spc),
+};
+
+Decoder *dec_open(const char *path, const DecOpts *opts) {
     int fmt = F_UNKNOWN;
     /* URL boundary (P0 gate): lv_is_url is the ONE place the string's
        shape decides; only the allowlisted schemes reach libavformat.
@@ -557,7 +1085,7 @@ Decoder *dec_open(const char *path) {
        the user opted in; tag_probe is unaffected (fixed 128KB head). */
 #define LV_LARGE_FILE (256LL << 20)   /* the named cap: keep the ADV-page
                                          copy ("over 256 MB") in sync */
-    if (!cfg.allow_large) {
+    if (!(opts && opts->allow_large)) {
         struct stat st;
         if (stat(path, &st) == 0 && (long long)st.st_size > LV_LARGE_FILE) {
             fprintf(stderr, "levari: %s is %lld MB, over the 256 MB ingest "
@@ -566,256 +1094,19 @@ Decoder *dec_open(const char *path) {
             return NULL;
         }
     }
+
+    if (fmt <= F_UNKNOWN || fmt >= (int)(sizeof DEC_FMT / sizeof DEC_FMT[0]) || !DEC_FMT[fmt].open) return NULL;
     Decoder *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->fmt = fmt;
-    switch (fmt) {
-    case F_MP3: {
-        if (mp3dec_ex_open(&d->u.mp3, path, MP3D_SEEK_TO_SAMPLE) != 0) goto fail;
-        d->ch = d->u.mp3.info.channels;
-        d->rate = d->u.mp3.info.hz;
-        /* Without MP3D_DO_NOT_SCAN the open scan-counts EXACT samples over
-           the whole stream even when no Xing/VBRI tag exists. The old
-           vbr_tag_found gate discarded that count for tag-less VBR files
-           and fell to the first-frame CBR estimate — a stream opening on
-           an 8 kbps silence frame inflated length ~9x. With no Xing there
-           is no delay/padding subtraction, and the decoder emits exactly
-           the samples it counts, so trust samples; keep the size-based
-           estimate only when the scan produced nothing. */
-        /* A frameless (tag-only / garbage-header) stream opens SUCCESSFULLY
-           with samples == 0 AND channels == 0 — minimp3_ex fills info only
-           from decoded frames. Integer 0/0 traps exactly like n/0: an
-           unguarded division here SIGFPE'd the scan thread mid-scan
-           (journal 'trap divide error' in lvscan). Skip the division and
-           let the validity gate at the end of dec_open reject the decoder. */
-        d->total = d->ch > 0 ? (long long)d->u.mp3.samples / d->ch : 0;
-        if (d->total == 0) {
-            int kbps = d->u.mp3.info.bitrate_kbps;
-            long long fs = 0;
-            FILE *f = fopen(path, "rb");
-            if (f) { fseek(f, 0, SEEK_END); fs = ftell(f); fclose(f); }
-            if (kbps > 0 && fs > 0)
-                d->total = fs * 8LL * d->rate / ((long long)kbps * 1000);
-        }
-        break;
-    }
-    case F_OGG: {
-        int err;
-        d->u.ov = stb_vorbis_open_filename(path, &err, NULL);
-        if (!d->u.ov) goto fail;
-        stb_vorbis_info info = stb_vorbis_get_info(d->u.ov);
-        d->ch = info.channels;
-        d->rate = info.sample_rate;
-        d->total = (long long)stb_vorbis_stream_length_in_samples(d->u.ov);
-        break;
-    }
-    case F_FLAC: {
-        d->u.flac = drflac_open_file(path, NULL);
-        if (!d->u.flac) goto fail;
-        d->ch = (int)d->u.flac->channels;
-        d->rate = (int)d->u.flac->sampleRate;
-        d->total = (long long)d->u.flac->totalPCMFrameCount;
-        break;
-    }
-    case F_OGGFLAC: {
-        /* demux to a native stream in memory (same slurp policy as the
-           modplug path; 64MB cap) and hand it to drflac */
-        FILE *f = fopen(path, "rb");
-        if (!f) goto fail;
-        fseeko(f, 0, SEEK_END);
-        long long fs = ftello(f);
-        unsigned char *raw = NULL, *stream = NULL;
-        size_t olen = 0;
-        long long total = 0;
-        if (fs > 0 && fs <= (64LL << 20)) {
-            raw = malloc((size_t)fs);
-            if (raw && fseeko(f, 0, SEEK_SET) == 0 &&
-                fread(raw, 1, (size_t)fs, f) == (size_t)fs)
-                stream = oggflac_demux(raw, (size_t)fs, &olen, &total);
-            free(raw);
-        }
-        fclose(f);
-        if (stream) {
-            drflac *dc = drflac_open_memory(stream, olen, NULL);
-            if (dc) {
-                d->u.oflac.fl = dc;
-                d->u.oflac.buf = stream;
-                d->ch = (int)dc->channels;
-                d->rate = (int)dc->sampleRate;
-                d->total = (long long)dc->totalPCMFrameCount
-                           ? (long long)dc->totalPCMFrameCount : total;
-                break;
-            }
-            free(stream);
-        }
-#ifdef HAVE_FFMPEG
-        d->fmt = F_FFMPEG; /* exotic variant or over the cap: let libav try */
-        goto ffmpeg;
-#else
-        goto fail;
-#endif
-        break;
-    }
-    case F_OPUS: {
-        if (opus_syms() != 0) goto fail;
-        Opus *o = calloc(1, sizeof *o);
-        if (!o) goto fail;
-        o->f = fopen(path, "rb");
-        if (!o->f) { free(o); goto fail; }
-        const unsigned char *pkt;
-        int len;
-        if (ogg_next_packet(o, &pkt, &len) != 0 || len < 19 || memcmp(pkt, "OpusHead", 8)) goto opusfail;
-        if (pkt[8] != 1 || pkt[16] != 0) goto opusfail; /* version 1, channel mapping family 0 */
-        d->ch = pkt[9];
-        o->pre_skip = rd16(pkt + 10);
-        if (ogg_next_packet(o, &pkt, &len) != 0 || len < 8 || memcmp(pkt, "OpusTags", 8)) goto opusfail;
-        o->data_off = o->next_off; /* audio starts on the page after OpusTags */
-        int err = 0;
-        o->dec = opus_create(48000, d->ch, &err);
-        if (!o->dec || err) goto opusfail;
-        d->rate = 48000;
-        o->discard = o->pre_skip;
-        long long g = ogg_last_granule(o);
-        d->total = g > o->pre_skip ? g - o->pre_skip : 0;
-        d->u.op = o;
-        break;
-    opusfail:
-        if (o->dec) opus_destroy(o->dec);
-        if (o->f) fclose(o->f);
-        free(o);
-        goto fail;
-    }
-    case F_WAV: {
-        drwav *w = malloc(sizeof *w);
-        if (!w) goto fail;
-        if (!drwav_init_file(w, path, NULL)) { free(w); goto fail; }
-        d->u.wav = w;
-        d->ch = (int)d->u.wav->channels;
-        d->rate = (int)d->u.wav->sampleRate;
-        d->total = (long long)d->u.wav->totalPCMFrameCount;
-        break;
-    }
-    case F_MOD: {
-        static int mp_settings_done;
-        if (!mp_settings_done) {
-            ModPlug_Settings st;
-            ModPlug_GetSettings(&st);
-            st.mChannels = 2;
-            st.mBits = 16;
-            st.mFrequency = 44100;
-            st.mResamplingMode = MODPLUG_RESAMPLE_SPLINE;
-            st.mFlags = MODPLUG_ENABLE_OVERSAMPLING;
-            ModPlug_SetSettings(&st);
-            mp_settings_done = 1;
-        }
-        long long fs = 0;
-        FILE *f = fopen(path, "rb");
-        if (!f) goto fail;
-        fseek(f, 0, SEEK_END);
-        fs = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        unsigned char *buf = NULL;
-        if (fs > 0 && fs <= (64LL << 20)) buf = malloc((size_t)fs);
-        if (!buf || fread(buf, 1, (size_t)fs, f) != (size_t)fs) {
-            free(buf);
-            fclose(f);
-            goto fail;
-        }
-        fclose(f);
-        d->u.mp = ModPlug_Load(buf, (int)fs); /* libmodplug copies what it needs */
-        free(buf);
-        if (!d->u.mp) {
-#ifdef HAVE_FFMPEG
-            d->fmt = F_FFMPEG; /* exotic module variant: let libav try */
-            goto ffmpeg;
-#else
-            goto fail;
-#endif
-        }
-        d->ch = 2;
-        d->rate = 44100;
-        int ms = ModPlug_GetLength(d->u.mp);
-        d->total = ms > 0 ? (long long)ms * 441 / 10 : 0;
-        break;
-    }
-    case F_SPC: {
-        long long fs = 0;
-        FILE *f = fopen(path, "rb");
-        if (!f) goto fail;
-        fseek(f, 0, SEEK_END);
-        fs = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        unsigned char *buf = NULL;
-        /* spc_min_file_size: the fixed layout (header + 64K RAM + DSP
-           regs) must be fully present; trailer data is optional */
-        if (fs >= 0x10180 && fs <= (64LL << 20)) buf = malloc((size_t)fs);
-        if (!buf || fread(buf, 1, (size_t)fs, f) != (size_t)fs) {
-            free(buf);
-            fclose(f);
-            goto fail;
-        }
-        fclose(f);
-        SNES_SPC *spc = spc_new();
-        SPC_Filter *flt = spc_filter_new();
-        if (!spc || !flt || spc_load_spc(spc, buf, (long)fs) != NULL) {
-            if (spc) spc_delete(spc);
-            if (flt) spc_filter_delete(flt);
-            free(buf);
-            goto fail;
-        }
-        spc_clear_echo(spc); /* many rips carry garbage in the echo region */
-        Spc *s = calloc(1, sizeof *s);
-        if (!s) {
-            spc_delete(spc);
-            spc_filter_delete(flt);
-            free(buf);
-            goto fail;
-        }
-        s->spc = spc; s->filter = flt; s->data = buf; s->size = (long)fs;
-        s->fade_at = -1;
-        int secs = spc_tag_duration(buf, (long)fs);
-        if (secs) {
-            s->end_at = (long long)secs * SPC_RATE + SPC_FADE;
-            s->fade_at = (long long)secs * SPC_RATE;
-        }
-        d->u.sp = s;
-        d->ch = 2;
-        d->rate = SPC_RATE;
-        d->total = s->end_at;
-        break;
-    }
-#ifdef HAVE_FFMPEG
-    case F_FFMPEG: {
-    ffmpeg:
-        {
-        /* one dispatch: the runtime pair matched an ABI variant in
-           ff_pick; that variant owns every libav touch from here on
-           (session shape, whitelist, interrupt cb — see ffab.c) */
-        const FFApi *api = ff_pick();
-        if (!api) goto fail;
-        int rate = 0, ch = 0;
-        long long total = 0;
-        FFContext *fx = api->open(path, url, &rate, &ch, &total);
-        if (!fx) goto fail;
-        d->ffapi = api;
-        d->u.ff = fx;
-        d->rate = rate;
-        d->ch = ch;
-        d->total = total;
-        }
-        break;
-    }
-#endif
-    default: goto fail;
-    }
+    d->seek_abort = opts ? opts->seek_abort : NULL;
+    d->seek_abort_ctx = opts ? opts->seek_abort_ctx : NULL;
+    if (DEC_FMT[fmt].open(d, path, url) != 0) { free(d); return NULL; }
     /* the whole pipeline (player buffers, pan, viz, WSOLA, ALSA) assumes
        at most stereo; vorbis allows 255 channels, flac 32, wav 65535, so
        a multichannel file here would overflow the fixed sample buffers */
     if (d->ch <= 0 || d->ch > 2 || d->rate <= 0) { dec_close(d); return NULL; }
     return d;
-fail:
-    free(d);
-    return NULL;
 }
 
 int dec_rate(const Decoder *d) { return d->rate; }
@@ -836,201 +1127,15 @@ int dec_take_title(Decoder *d, char *out, size_t n) {
 }
 
 int dec_read(Decoder *d, int16_t *out, int frames) {
-    switch (d->fmt) {
-    case F_MP3: {
-        size_t got = mp3dec_ex_read(&d->u.mp3, (mp3d_sample_t*)out, (size_t)frames * d->ch);
-        return (int)(got / (size_t)d->ch);
-    }
-    case F_OGG:
-        return stb_vorbis_get_samples_short_interleaved(d->u.ov, d->ch, (short*)out, frames * d->ch);
-    case F_FLAC:
-        return (int)drflac_read_pcm_frames_s16(d->u.flac, (drflac_uint64)frames, out);
-    case F_OGGFLAC:
-        return (int)drflac_read_pcm_frames_s16(d->u.oflac.fl, (drflac_uint64)frames, out);
-    case F_WAV:
-        return (int)drwav_read_pcm_frames_s16(d->u.wav, (drwav_uint64)frames, out);
-    case F_MOD: {
-        int got = ModPlug_Read(d->u.mp, out, frames * 4); /* s16 stereo -> 4 bytes/frame */
-        return got > 0 ? got / 4 : 0;
-    }
-    case F_SPC: {
-        Spc *s = d->u.sp;
-        if (s->end_at && s->played >= s->end_at) return 0;
-        int n = frames;
-        if (s->end_at && s->played + n > s->end_at)
-            n = (int)(s->end_at - s->played);
-        if (spc_play(s->spc, n * 2, (short *)out) != NULL) return 0;
-        spc_filter_run(s->filter, (short *)out, n * 2);
-        long long from = s->played;
-        s->played += n;
-        if (!s->end_at) {
-            /* silence trim: the emulated DSP reports whether any voice
-               keyed on since the last check; quiet + no key-ons for
-               SPC_SILENCE frames means the song has ended */
-            int loud = 0;
-            for (int i = 0; i < n * 2; i++)
-                if (out[i] < -32 || out[i] > 32) { loud = 1; break; }
-            if (loud) { s->silent = 0; s->heard = 1; }
-            else if (spc_check_kon(s->spc)) s->silent = 0;
-            else if (s->heard && (s->silent += n) >= SPC_SILENCE) {
-                s->end_at = s->played + SPC_FADE;
-                s->fade_at = s->played;
-            }
-            if (!s->end_at && s->played >= SPC_MAX) {
-                s->end_at = s->played + SPC_FADE;
-                s->fade_at = s->played;
-            }
-        }
-        if (s->fade_at >= 0 && s->played > s->fade_at) {
-            /* linear ramp to silence across the fade window; frames
-               before fade_at keep unity gain via the span clamp */
-            long long span = s->end_at - s->fade_at;
-            for (int i = 0; i < n; i++) {
-                long long g = s->end_at - (from + i);
-                if (g > span) g = span;
-                if (g < 0) g = 0;
-                out[i * 2]     = (int16_t)((long long)out[i * 2]     * g / span);
-                out[i * 2 + 1] = (int16_t)((long long)out[i * 2 + 1] * g / span);
-            }
-        }
-        return n;
-    }
-    case F_OPUS: {
-        Opus *o = d->u.op;
-        int copied = 0;
-        while (copied < frames) {
-            if (o->buf_i < o->buf_n) {
-                int take = frames - copied < o->buf_n - o->buf_i ? frames - copied : o->buf_n - o->buf_i;
-                memcpy(out + (size_t)copied * d->ch, o->buf + (size_t)o->buf_i * d->ch,
-                       (size_t)take * d->ch * 2);
-                o->buf_i += take;
-                copied += take;
-                continue;
-            }
-            const unsigned char *pkt;
-            int len;
-            if (ogg_next_packet(o, &pkt, &len) != 0) break;
-            int n = opus_dec(o->dec, pkt, len, o->tmp, 5760, 0);
-            if (n <= 0) continue;
-            int off = 0;
-            if (o->discard > 0) {
-                int sk = (long long)n < o->discard ? n : (int)o->discard;
-                o->discard -= sk;
-                off = sk;
-                n -= sk;
-                if (n <= 0) continue;
-            }
-            memcpy(o->buf, o->tmp + (size_t)off * d->ch, (size_t)n * d->ch * 2);
-            o->buf_n = n;
-            o->buf_i = 0;
-        }
-        return copied;
-    }
-    case F_FFMPEG: {
-#ifdef HAVE_FFMPEG
-        return d->ffapi->read(d->u.ff, out, frames);
-#endif
-        return -1;
-    }
-    }
-    return -1;
+    return DEC_FMT[d->fmt].read(d, out, frames);
 }
 
 int dec_seek(Decoder *d, long long frame) {
-    switch (d->fmt) {
-    case F_MP3:
-        return mp3dec_ex_seek(&d->u.mp3, (uint64_t)frame * d->ch) == 0 ? 0 : -1;
-    case F_OGG:
-        return stb_vorbis_seek(d->u.ov, (unsigned int)frame) ? 0 : -1;
-    case F_FLAC:
-        return drflac_seek_to_pcm_frame(d->u.flac, (drflac_uint64)frame) ? 0 : -1;
-    case F_OGGFLAC:
-        return drflac_seek_to_pcm_frame(d->u.oflac.fl, (drflac_uint64)frame) ? 0 : -1;
-    case F_WAV:
-        return drwav_seek_to_pcm_frame(d->u.wav, (drwav_uint64)frame) ? 0 : -1;
-    case F_MOD:
-        ModPlug_Seek(d->u.mp, (int)(frame * 1000 / d->rate)); /* order-approximate */
-        return 0;
-    case F_SPC: {
-        Spc *s = d->u.sp;
-        if (frame < 0) frame = 0;
-        if (frame > (1LL << 30)) return -1; /* spc_skip takes an int count */
-        if (spc_load_spc(s->spc, s->data, s->size) != NULL) return -1;
-        spc_clear_echo(s->spc);
-        spc_filter_clear(s->filter);
-        s->played = 0;
-        s->silent = 0;
-        s->heard = 0;
-        /* end_at/fade_at are absolute stream positions: they stay valid
-           across a seek, no recompute needed */
-        if (frame > 0 && spc_skip(s->spc, (int)(frame * 2)) != NULL) return -1;
-        s->played = frame;
-        return 0;
-    }
-    case F_OPUS: {
-        Opus *o = d->u.op;
-        long long target = frame + o->pre_skip;
-        o->next_off = o->data_off;
-        o->eof = 0;
-        o->nseg = 0;
-        o->seg_i = 0;
-        o->buf_n = o->buf_i = 0;
-        o->pkt_len = 0;
-        long long prev = 0; /* first audio page emits from sample 0 */
-        for (;;) {
-            if (ogg_load_page(o) != 0) return -1;
-            if (o->page_granule >= 0 && o->page_granule >= target) break;
-            if (o->page_granule > prev) prev = o->page_granule;
-        }
-        /* decoding restarts at the found page's first packet, so that page
-           emits samples [prev, page_granule): discard what precedes the
-           target. (The old page_granule - target landed at
-           prev + page_granule - 2*target: exact only at page center, up
-           to a full page off at the edges.) */
-        o->discard = target - prev;
-        opus_ctl(o->dec, 4007 /* OPUS_RESET_STATE */);
-        return 0;
-    }
-    case F_FFMPEG: {
-#ifdef HAVE_FFMPEG
-        return d->ffapi->seek(d->u.ff, frame);
-#endif
-        return -1;
-    }
-    }
-    return -1;
+    return DEC_FMT[d->fmt].seek(d, frame);
 }
 
 void dec_close(Decoder *d) {
     if (!d) return;
-    switch (d->fmt) {
-    case F_MP3: mp3dec_ex_close(&d->u.mp3); break;
-    case F_OGG: stb_vorbis_close(d->u.ov); break;
-    case F_FLAC: drflac_close(d->u.flac); break;
-    case F_OGGFLAC: drflac_close(d->u.oflac.fl); free(d->u.oflac.buf); break;
-    case F_WAV: drwav_uninit(d->u.wav); free(d->u.wav); break;
-    case F_MOD: ModPlug_Unload(d->u.mp); break;
-    case F_SPC: {
-        Spc *s = d->u.sp;
-        if (s->spc) spc_delete(s->spc);
-        if (s->filter) spc_filter_delete(s->filter);
-        free(s->data);
-        free(s);
-        break;
-    }
-    case F_OPUS: {
-        Opus *o = d->u.op;
-        if (o->dec) opus_destroy(o->dec);
-        if (o->f) fclose(o->f);
-        free(o);
-        break;
-    }
-    case F_FFMPEG: {
-#ifdef HAVE_FFMPEG
-        d->ffapi->close(d->u.ff);
-#endif
-        break;
-    }
-    }
+    DEC_FMT[d->fmt].close(d);
     free(d);
 }

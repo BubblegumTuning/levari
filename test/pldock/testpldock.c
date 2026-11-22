@@ -7,22 +7,17 @@
    No display server needed: the test binary shadows SDL_GetWindowPosition,
    SDL_SetWindowPosition, SDL_GetWindowSize and SDL_GetGlobalMouseState —
    executable definitions win over libSDL2 at link time (same PLT trick as
-   the I/O interposers) — and drives the real handle_pl_mouse /
-   handle_file_mouse paths plus the exact latched-drag guard line from the
-   ui_run loop. Technique otherwise as in test/optenc: #include ui.c, link
-   every object EXCEPT main.c.o, ui.c.o and the stale tier-split leftovers
-   (decode.c.o, stb_vorbis.c.o) + the dec_*.dir tier objects (canonical
-   shape per test/snapwin; the pre-split leftovers carry no
-   dec_ffmpeg_probe_info and dispatch.c.o is not linked — linking them
-   leaves that symbol undefined):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL \
-       -o build/testpldock test/pldock/testpldock.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
+   the I/O interposers) — and drives the real ui_handle_pl_mouse /
+   ui_handle_file_mouse paths plus the exact latched-drag guard line from the
+   ui_run loop. Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testpldock$'
+   Link = filtered levari_ui archive minus ui.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
    Coverage note: the search window's own copy of the drag arithmetic is
    NOT exercised here (its window lives inside search.c); the fix there is
    structurally identical to drag_move_snap and compile-verified only.
@@ -106,19 +101,19 @@ static int drag_pl_undock(int step, int nsteps, int release_over_main) {
     gmb = 0;
     mkdown(&e, 10, 10);
     loop_guard(&e);
-    handle_pl_mouse(&e);
+    ui_handle_pl_mouse(&e);
     if (ui.drag != 4) { fails++; printf("FAIL playlist title press latched drag (drag=%d)\n", ui.drag); return -999; }
     for (int i = 0; i < nsteps; i++) {
         gmy += step;
         mkmotion(&e, gmx - fw_pl.x, gmy - fw_pl.y);
         loop_guard(&e);
-        handle_pl_mouse(&e);
+        ui_handle_pl_mouse(&e);
     }
     int lx = gmx - fw_pl.x, ly = gmy - fw_pl.y;
     mkup(&e, lx, ly);
     loop_guard(&e);
     if (release_over_main) handle_main_mouse(&e); /* release arrives at the MAIN window */
-    else handle_pl_mouse(&e);
+    else ui_handle_pl_mouse(&e);
     return fw_pl.y - dock_y;
 }
 
@@ -130,17 +125,17 @@ static int drag_file_undock(int step, int nsteps) {
     gmb = 0;
     mkdown(&e, 10, 10);
     loop_guard(&e);
-    handle_file_mouse(&e);
+    ui_handle_file_mouse(&e);
     if (ui.drag != 9) { fails++; printf("FAIL file title press latched drag (drag=%d)\n", ui.drag); return -999; }
     for (int i = 0; i < nsteps; i++) {
         gmx += step;
         mkmotion(&e, gmx - fw_file.x, gmy - fw_file.y);
         loop_guard(&e);
-        handle_file_mouse(&e);
+        ui_handle_file_mouse(&e);
     }
     mkup(&e, gmx - fw_file.x, gmy - fw_file.y);
     loop_guard(&e);
-    handle_file_mouse(&e);
+    ui_handle_file_mouse(&e);
     return fw_file.x - dock_x;
 }
 

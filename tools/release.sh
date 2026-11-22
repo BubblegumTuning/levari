@@ -14,6 +14,19 @@ cd "$root"
 ver=$(sed -n 's/^project(levari VERSION \([0-9.]\+\).*/\1/p' CMakeLists.txt)
 [ -n "$ver" ] || { echo "no version found in CMakeLists.txt" >&2; exit 1; }
 
+# Dev-identity preflight: a release runs at exactly the "Version $ver. ..."
+# commit on a clean tree (untracked files tolerated — they never enter the
+# binaries), which is where CMake computes the empty LV_DEV_SUFFIX. Anywhere
+# else the binaries embed $ver-dev-<sha> and the exact-token gate in
+# package() below refuses to ship them.
+head_subj=$(git log -1 --format=%s 2>/dev/null || true)
+case "$head_subj" in
+    "Version $ver. "*) ;;
+    *) echo "release must run at the 'Version $ver. ...' commit (HEAD subject: ${head_subj:-not a git tree})" >&2; exit 1 ;;
+esac
+[ -z "$(git status --porcelain --untracked-files=no 2>/dev/null || true)" ] || {
+    echo "refusing to release from a tree with uncommitted tracked changes" >&2; exit 1; }
+
 out=dist/release
 rm -rf "$out"
 mkdir -p "$out"
@@ -29,6 +42,21 @@ build() { # build <builddir> [extra cmake args...]
 package() { # package <target> <arch> <builddir> <binary> [extra files...]
     local target=$1 arch=$2 bdir=$3 bin=$4; shift 4
     [ -f "$bdir/$bin" ] || { echo "missing $bdir/$bin" >&2; exit 1; }
+    # Dev-identity gate: the C-side literals fully concatenate, so the GUI
+    # embeds "<arch> v<ver>" (or " v<ver>" on the title path) and a dev
+    # build embeds "<arch> v<ver>-dev-<sha>". The discriminating check is
+    # that NO embedded string may carry the "$ver-dev" suffix, and the
+    # positive check that the version token is present at all.
+    # PIPEFAIL TRAP (0.3.8 cut): NEVER make this a `strings | grep -q`
+    # pipeline — when the token IS present grep -q exits at the first
+    # match, strings takes SIGPIPE (rc 141), and under `set -o pipefail`
+    # the pipeline reads as FAILED: a healthy binary aborts as a false
+    # "stale build" (bit the 0.3.8 cut twice). Process substitution keeps
+    # grep's verdict the pipeline's verdict in both directions.
+    grep -q -- "$ver-dev" <(strings -a "$bdir/$bin") && {
+        echo "$bdir/$bin is a DEV build (embeds $ver-dev-<sha>) — refusing to package" >&2; exit 1; }
+    grep -q "v$ver" <(strings -a "$bdir/$bin") || {
+        echo "$bdir/$bin embeds no version token v$ver (stale build?)" >&2; exit 1; }
     local stem=levari-$target.$arch.$ver
     local stage=$out/$stem
     mkdir -p "$stage"
@@ -111,8 +139,10 @@ if [ "${WIN98_RELEASE:-0}" != "1" ]; then
     echo "== win98 skipped: opt-in only — WIN98_RELEASE=1 to build it (era target, hardware-unverified, not a regular release)"
 elif [ -z "$w98skip" ]; then
     build build-rel-win98 -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-win98-toolchain.cmake" -DSDL2_DIR="$w98sdl" -DLV_WIN9X=ON
-    # the era twin of the legacy ISA gate: import denylist == 0 hits,
-    # PE32 i386 (not PE32+), GUI subsystem MajorSubsystemVersion 4,
+    # the era twin of the legacy ISA gate: every imported (dll, name)
+    # is in the adjudicated 98-class allow-list (allow-list, not
+    # deny-list), PE32 i386 (not PE32+), GUI subsystem
+    # MajorSubsystemVersion 4,
     # embedded v<ver> + x86 tokens — a miss means the image would not
     # even load on 98 (tools/win98_gate.py; the flagship win exe is the
     # standing control that FAILS it). A firing gate SKIPS packaging

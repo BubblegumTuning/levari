@@ -1,16 +1,8 @@
 /* urlIndex writer/reader pins (streaming-plan D5 gate).
 
-   Compile (from the repo root, after `cmake --build build`); run with a
-   scratch HOME set by the caller (the file lands at $HOME/.levari/urlIndex):
-
-     gcc -std=gnu11 -Isrc test/urlidx/testurlidx.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o \
-         ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) \
-       $(find build -name 'libsnes_spc.a' | head -1) \
-       $(pkg-config --libs sdl2) -lz -lm -lpthread -ldl -lstdc++ \
-       -o build/testurlidx
+   Build/run: cmake --build build && ctest --test-dir build -R '^testurlidx$'
+   (full link + tier/ffab; wrapper scratch HOME — the file lands at
+   $HOME/.levari/urlIndex inside the scratch)
 
    Pins (plan: "urlIndex writer tests — ... length cap; tampered rows
    (bad scheme / CR / oversize) load inert and never auto-open nor

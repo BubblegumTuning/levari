@@ -6,7 +6,22 @@
 
 typedef struct Decoder Decoder;
 
-Decoder *dec_open(const char *path);
+/* ingest policy handed in by the CALLER at open: decode owns no global
+   config state, so the large-file opt-in (options > advanced LARGE) is a
+   value the call site reads, not a global the decoder sniffs. NULL opts
+   = defaults (cap enforced). */
+typedef struct {
+    int allow_large;
+    /* optional abort poll for seeks that emulate a fast-forward (SPC):
+       called between skip chunks; a non-zero return abandons the seek,
+       which returns -1 with the decoder still valid at however far the
+       skip advanced. NULL = run the seek to completion (every other
+       format's seek is already cheap). */
+    int (*seek_abort)(void *ctx);
+    void *seek_abort_ctx;
+} DecOpts;
+
+Decoder *dec_open(const char *path, const DecOpts *opts);
 int      dec_rate(const Decoder *d);
 int      dec_channels(const Decoder *d);
 long long dec_total_frames(const Decoder *d);

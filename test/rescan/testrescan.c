@@ -8,18 +8,10 @@
    (2026-11-07 GH-line): safe file keeps EVERY entry (two directories, one
    rescan, all unrelated rows survive under a stamped header), ambiguous
    file -> rc -3 with the index byte-identical, full scan still rebuilds.
-   Compile (from the repo root, after `cmake --build build`); run with a
-   scratch HOME/XDG_CONFIG_HOME set by the caller. LINK CAVEAT: this test
-   exercises the scan/probe path, so it must NOT pull the stale pre-split
-   decode.c.o leftovers the host build/ dir carries (they predate the
-   ce76e8b division fixes and SIGFPE on a frameless mp3): exclude them and
-   link the dispatch + tier objects instead, as a canonical fresh tree has:
-
-     gcc -std=gnu11 -Isrc -Isrc/library -Isrc/config -Isrc/tag test/rescan/testrescan.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       $(pkg-config --libs sdl2) -lz -lm -lpthread -ldl -lstdc++ -o build/testrescan
+   Build/run: cmake --build build && ctest --test-dir build -R '^testrescan$'
+   (full levari_ui + engine + core link + tier/ffab objects; wrapper scratch
+   env. The old stale-decode.c.o caveat is structurally gone: the core
+   archive carries the CURRENT decode stack, tier or tier-less)
 */
 #include <stdio.h>
 #include <stdlib.h>

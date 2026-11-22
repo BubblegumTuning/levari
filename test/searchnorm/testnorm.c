@@ -1,10 +1,7 @@
 /* search.c norm() case-folding pins.
-   Compile (from the repo root, after `cmake --build build`):
-
-     gcc -std=gnu11 test/searchnorm/testnorm.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o ! -name search.c.o ! -name dispatch.c.o) \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       $(pkg-config --libs sdl2) -lz -lm -lpthread -ldl -lstdc++ -o build/testnorm
+   Build/run: cmake --build build && ctest --test-dir build -R '^testnorm$'
+   (target links filtered levari_ui minus search.c.o + engine + core + tier
+   objects)
 
    Pins per codepoint: input folds to the expected codepoint. Guards the
    0x04C1-0x04CE block where Unicode case pairs are INVERTED (capitals

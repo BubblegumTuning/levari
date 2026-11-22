@@ -11,6 +11,14 @@ typedef struct { float b0, b1, b2, a1, a2; float x1, x2, y1, y2; } Biquad;
 typedef struct {
     int enabled;
     float preamp_db;   /* -20..+12 */
+    /* gain cache, refreshed at the first eq_process after ANY preamp_db
+       write: config load and tests assign preamp_db directly, so only the
+       consumer can be the choke point. preamp_q is the gain in Q14 and
+       gates the integer preamp-only path (q == 16384: unity, skip;
+       q > 65536: past the int32-safe product ceiling, keep the float
+       path — legitimate sliders never reach it, the clamp is +12 dB). */
+    float preamp_cache_db, preamp_gain;
+    int32_t preamp_q;
     float band_db[EQ_BANDS];
     Biquad bq[EQ_BANDS][2];
     unsigned band_mask; /* bits: bands whose coefficients are not identity */

@@ -37,7 +37,7 @@
 #include <time.h>
 
 #ifdef _WIN32
-#include "../compat/win32.h"
+#include "../platform/platform.h"
 #else
 #include <dlfcn.h>
 #endif

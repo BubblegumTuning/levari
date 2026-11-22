@@ -1,26 +1,22 @@
 /* unit test: the ABOUT tab of the options window. Hand-built SDL_Events
-   drive handle_opt_mouse: the ABOUT tab button switches ui.opt_tab, the
+   drive ui_handle_opt_mouse: the ABOUT tab button switches ui.opt_tab, the
    ADV page's controls stay dead on the ABOUT page, and a BASIC-page
    field click cannot take focus there. MOUSEMOTION events pin the
    BASIC-page hover tooltips (LIBRARY DIRS / SCAN / CLEAR / VERIFY arm,
-   ABOUT never arms one). draw_opt() renders every page
+   ABOUT never arms one). ui_draw_opt() renders every page
    (smoke) and the ABOUT page is saved as a BMP when LV_ABOUT_BMP names
    a path (layout eyeball); LV_TIP_BMP=prefix dumps the BASIC page with
-   the SCAN/CLEAR tooltips hovered as prefix-scan/-clear.bmp. Technique (see skill): #include ui.c, link
-   every object EXCEPT main.c.o, ui.c.o, decode.c.o and stb_vorbis.c.o
-   (dispatch.c.o MUST stay: it defines dec_open/dec_ffmpeg_probe_info
-   that ui.c refs; the two excluded TUs are pre-split leftovers that
-   collide with the dec_*.dir tier objects):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/ta \
-       test/about/testabout.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-   Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
+   the SCAN/CLEAR tooltips hovered as prefix-scan/-clear.bmp. Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testabout$'
+   Link = filtered levari_ui archive minus ui_opt.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
-#include "../../src/ui/ui.c"
+#include "../../src/ui/ui_opt.c"
 #include <stdlib.h>
 
 static Player fake_pl;
@@ -37,7 +33,7 @@ static void down(int x, int y) {
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_PRESSED;
     e.motion.x = x; e.motion.y = y;
-    handle_opt_mouse(&e);
+    ui_handle_opt_mouse(&e);
 }
 static void up(int x, int y) {
     SDL_Event e;
@@ -46,7 +42,7 @@ static void up(int x, int y) {
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_RELEASED;
     e.motion.x = x; e.motion.y = y;
-    handle_opt_mouse(&e);
+    ui_handle_opt_mouse(&e);
 }
 static void click(int x, int y) { down(x, y); up(x, y); }
 static void motion(int x, int y) {
@@ -54,7 +50,7 @@ static void motion(int x, int y) {
     memset(&e, 0, sizeof e);
     e.type = SDL_MOUSEMOTION;
     e.motion.x = x; e.motion.y = y;
-    handle_opt_mouse(&e);
+    ui_handle_opt_mouse(&e);
 }
 
 int main(void) {
@@ -71,7 +67,7 @@ int main(void) {
     ui.opt_tab = 0;
 
     /* every page ACTUALLY paints: sentinel-fill the surface first and
-       require draw_opt() to have touched pixels — a bare non-crash smoke
+       require ui_draw_opt() to have touched pixels — a bare non-crash smoke
        cannot catch a page that paints nothing */
     {
         int painted = 1;
@@ -82,7 +78,7 @@ int main(void) {
             for (int y = 0; y < ui.sopt->h; y++)
                 memset(p + (size_t)y * ui.sopt->pitch, 0x5A, (size_t)ui.sopt->w * 3);
             SDL_UnlockSurface(ui.sopt);
-            draw_opt();
+            ui_draw_opt();
             if (SDL_LockSurface(ui.sopt) != 0) { painted = -1; break; }
             p = (Uint8 *)ui.sopt->pixels;
             int touched = 0;
@@ -135,19 +131,19 @@ int main(void) {
     chk("hover CLEAR arms OPTB_CLEAR", ui.opt_hover, OPTB_CLEAR);
     motion(vr.x + vr.w / 2, vr.y + vr.h / 2);
     chk("hover VERIFY arms OPTB_VERIFY", ui.opt_hover, OPTB_VERIFY);
-    draw_opt();                                /* paints the tooltip (smoke) */
+    ui_draw_opt();                                /* paints the tooltip (smoke) */
     motion(2, OPT_H - 2);
     chk("hover off-target clears", ui.opt_hover, -1);
     click(tu.x + tu.w / 2, tu.y + tu.h / 2);   /* ABOUT page */
     motion(sn.x + sn.w / 2, sn.y + sn.h / 2);
     chk("no tooltip armed on ABOUT", ui.opt_hover, -1);
 
-    draw_opt();
+    ui_draw_opt();
     const char *bmp = getenv("LV_ABOUT_BMP");
     if (bmp) {
         ui.opt_tab = 2;
         ui.pressed = B_NONE;
-        draw_opt();
+        ui_draw_opt();
         if (SDL_SaveBMP(ui.sopt, bmp) != 0) { fails++; printf("FAIL save BMP: %s\n", SDL_GetError()); }
         else printf("PASS saved %s\n", bmp);
     }
@@ -159,12 +155,12 @@ int main(void) {
         ui.opt_tab = 0;
         ui.pressed = B_NONE;
         motion(sn.x + sn.w / 2, sn.y + sn.h / 2);
-        draw_opt();
+        ui_draw_opt();
         snprintf(p, sizeof p, "%s-scan.bmp", tip);
         if (SDL_SaveBMP(ui.sopt, p)) { fails++; printf("FAIL save %s: %s\n", p, SDL_GetError()); }
         else printf("PASS saved %s\n", p);
         motion(cr.x + cr.w / 2, cr.y + cr.h / 2);
-        draw_opt();
+        ui_draw_opt();
         snprintf(p, sizeof p, "%s-clear.bmp", tip);
         if (SDL_SaveBMP(ui.sopt, p)) { fails++; printf("FAIL save %s: %s\n", p, SDL_GetError()); }
         else printf("PASS saved %s\n", p);

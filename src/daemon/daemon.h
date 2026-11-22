@@ -2,18 +2,26 @@
 #define LEVARI_DAEMON_H
 
 #include "../player/player.h"
+#include "../platform/sock.h"
 
 /* server side (runs inside the player process) */
 int  srv_start(Player *p);
 void srv_stop(void);
 
-/* default socket path shared by server and client: XDG_RUNTIME_DIR when
-   set, /tmp fallback otherwise; Windows: per-user named pipe */
-void lv_sock_path(char *out, size_t n);
-#ifndef _WIN32
-int  lv_tmp_fallback(void);                 /* 1 = the /tmp fallback is on */
-void lv_sock_ptr_file(char *out, size_t n); /* publish file in config dir */
-int  lv_sock_pointer(char *out, size_t n);  /* published path; 0 = none */
+/* endpoint paths live in platform/sock.h (lv_sock_path, /tmp-fallback
+   pointer helpers) — refactor item 5 moved them out of this header. */
+
+/* era file IPC (batch 29): this box's kernel32 refuses
+   CreateNamedPipeA outright (hardware: gle=120 on the SYNCHRONOUS
+   create too — same dead-kernel-object family as CreateSemaphore).
+   The era conversation therefore runs over two files next to the
+   exe — the one directory hardware PROVED writable (it holds the
+   trace log). Overwrite-only token protocol (no deletes, no locks,
+   no new imports): the client stamps its request "T<tick> ", the
+   server echoes the token as the first field of the answer; stale
+   files die by token mismatch and by the next writer's overwrite. */
+#if defined(LV_WIN9X) && defined(_WIN32)
+int lv_ipc_file(char *out, size_t n, const char *what);
 #endif
 
 /* client side: returns process exit code; prints response */

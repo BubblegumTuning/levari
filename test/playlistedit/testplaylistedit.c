@@ -10,11 +10,9 @@
    hand-built byte-forward fixtures (NumberOfEntries mismatch, relative +
    absolute FileN, Windows backslash paths, CRLF, UTF-8 labels — expected
    UTF-8 literals generated from the codec, garbage keys ignored).
-   Compile playlist.c + tag.c from source directly — no ui.c, no build
-   objects, so a stale build/ tree can never masquerade as the fix:
-     gcc -std=gnu11 -Isrc -o build/testplaylistedit \
-       test/playlistedit/testplaylistedit.c \
-       src/playlist/playlist.c src/tag/tag.c -lpthread -lm
+   build via CMake: cmake --build build && ctest --test-dir build -R
+   '^testplaylistedit$' — the target still compiles playlist.c + tag.c from
+   source DIRECTLY (no build objects), so a stale tree can never masquerade
 */
 #include "playlist/playlist.h"
 #include <stdio.h>
@@ -169,7 +167,7 @@ int main(void) {
         chks("pls rows survive hostile lines", pl.items[1].path, joined);
     }
     /* boundary: PLS_MAX_ENT itself is accepted — real playlists run to
-       30k+ songs (master), so the ceiling is a hazard bound, never a
+       30k+ songs (field report), so the ceiling is a hazard bound, never a
        size cap; the gap stays empty-skipped like any other gap */
     static const unsigned char pls4[] =
         "[playlist]\nFile1=first.mp3\nFile65536=edge.mp3\n";

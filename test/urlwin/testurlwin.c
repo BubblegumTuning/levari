@@ -6,31 +6,21 @@
    the browser — never a persistent row), the B_URL button toggle, and the
    paste-hygiene helper the field's ctrl-V rides.
 
-   Technique (see skill): #include ui.c, link every object EXCEPT
-   main.c.o, ui.c.o and the stale tier-split leftovers (decode.c.o,
-   stb_vorbis.c.o) + the dec_*.dir tier objects. -DLV_URL_ENABLED=1 is
-   REQUIRED: the URL window compiles out without it (that is the
-   LV_STREAMING=OFF shape — this test only exists when the define is on).
-
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL \
-       -o build/testurlwin test/urlwin/testurlwin.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o \
-         ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       $(find build -name 'libmodplug.a' | head -1) \
-       $(find build -name 'libsnes_spc.a' | head -1) \
-       -lz -lm -lpthread -ldl -lstdc++
-
-   Run with a scratch HOME (the urlIndex stub is written at
-   $HOME/.levari/urlIndex) and SDL_VIDEODRIVER=dummy (dummy creates real
-   windows, so urlwin_open's SDL path runs unmodified). NO clipboard pins:
-   the dummy clipboard is flaky on this host — tf_sanitize_paste is pinned
-   as a pure function instead (tf_paste is 3 lines on top of it + SDL glue
+   Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testurlwin$'
+   Link = filtered levari_ui archive minus ui_url.c.o ui_file.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy. NO clipboard pins: the dummy
+   clipboard is flaky on this host — tf_sanitize_paste is pinned as a
+   pure function instead (tf_paste is 3 lines on top of it + SDL glue
    exercised by the file field in the shipped binary).
 */
-#include "../../src/ui/ui.c"
+#include "../../src/ui/ui_url.c"
+#include "../../src/ui/ui_file.c"
 #include <stdlib.h>
 
 static Player fp;
@@ -74,6 +64,9 @@ int main(void) {
     }
     pl_player_init(&fp, &list);
     ui.pl = &fp;
+    /* main() wires the ffmpeg-probe hook in the shipped binary (ui.h);
+       a test harness is the main, so it wires the real dispatcher probe */
+    ui_set_ffprobe(dec_ffmpeg_probe_info);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { printf("FAIL sdl: %s\n", SDL_GetError()); return 2; }
     ui.wmain = SDL_CreateWindow("t", 0, 0, MAIN_W, MAIN_H, SDL_WINDOW_BORDERLESS);
@@ -85,26 +78,26 @@ int main(void) {
         snprintf(p, sizeof p, "%s/.levari/urlIndex", home);
         remove(p);
     }
-    urlwin_open();
+    ui_urlwin_open();
     chk("open: visible", ui.url_visible, 1);
     chk("open: focused", ui.url_focus, 1);
     chk("open: no error", ui.url_err, 0);
     chks("open: no index -> empty field", ui.url_field, "");
 
     /* ---- lazy prefill: the banked row lands in the field, inert ---- */
-    url_close();
+    ui_url_close();
     write_stub("http://host/a.flac\n");
-    urlwin_open();
+    ui_urlwin_open();
     chks("prefill: banked row in field", ui.url_field, "http://host/a.flac");
     chk("prefill: caret at end", ui.url_tf.caret, (int)strlen(ui.url_field));
 
     /* ---- tampered row: prefilled INERT, Enter-gate rejects ---- */
-    url_close();
+    ui_url_close();
     write_stub("file:///x\n");
-    urlwin_open();
+    ui_urlwin_open();
     chks("tampered: prefilled untouched (inert display)", ui.url_field, "file:///x");
     SDL_Event e = keyev(SDLK_RETURN, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("tampered: no play posted", fp.cmd, CMD_NONE);
     chk("tampered: red error raised", ui.url_err, 1);
     chk("tampered: window STAYS open", ui.url_visible, 1);
@@ -112,7 +105,7 @@ int main(void) {
 
     /* ---- Esc closes without posting ---- */
     e = keyev(SDLK_ESCAPE, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("esc: window closed", ui.url_visible, 0);
     chk("esc: focus cleared", ui.url_focus, 0);
     chk("esc: no play posted", fp.cmd, CMD_NONE);
@@ -122,36 +115,36 @@ int main(void) {
         char big[LV_MAX_PATH + 8];
         memset(big, 'A', sizeof big - 1);
         big[sizeof big - 1] = 0;
-        url_close();
+        ui_url_close();
         write_stub(big);
-        urlwin_open();
+        ui_urlwin_open();
         chk("oversize: field stays empty", ui.url_field[0], 0);
         chk("oversize: window still opens", ui.url_visible, 1);
     }
 
     /* ---- empty field Enter: no error, no post, stays open ---- */
     e = keyev(SDLK_RETURN, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("empty Enter: no error", ui.url_err, 0);
     chk("empty Enter: no post", fp.cmd, CMD_NONE);
     chk("empty Enter: stays open", ui.url_visible, 1);
 
     /* ---- typed junk: Enter gate rejects, text survives ---- */
-    url_text("not a url");
+    ui_url_text("not a url");
     e = keyev(SDLK_RETURN, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("junk: no play posted", fp.cmd, CMD_NONE);
     chk("junk: red error raised", ui.url_err, 1);
     chks("junk: text kept", ui.url_field, "not a url");
-    url_close();
+    ui_url_close();
 
     /* ---- valid URL: Enter plays transient, closes window ---- */
-    url_close();
+    ui_url_close();
     write_stub("http://stream.example/live\n");
-    urlwin_open();
+    ui_urlwin_open();
     ui.url_ff_ok = 1; /* play pins host-independent */
     e = keyev(SDLK_RETURN, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("play: CMD_PLAY posted", fp.cmd, CMD_PLAY);
     chk("play: posted at row 0", fp.cmd_arg, 0);
     chk("play: exactly one row", list.count, 1);
@@ -172,28 +165,28 @@ int main(void) {
          "ffmpeg not found - install it or set libav.dir");
     chks("notice(3): mismatch wording", url_ff_notice(3),
          "ffmpeg found but incompatible - see options");
-    url_close();
+    ui_url_close();
     write_stub("http://stream.example/noff.mp3");
-    urlwin_open();
+    ui_urlwin_open();
     fp.cmd = CMD_NONE;  /* previous play pin left CMD_PLAY posted */
     ui.url_ff_ok = 0;
     e = keyev(SDLK_RETURN, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("no-ffmpeg: Enter posts nothing", fp.cmd, CMD_NONE);
     chk("no-ffmpeg: no shape-error flash (notice is the reason)", ui.url_err, 0);
     chk("no-ffmpeg: window stays open", ui.url_visible, 1);
     chks("no-ffmpeg: text kept", ui.url_field, "http://stream.example/noff.mp3");
     ui.url_ff_ok = 1; /* host-independent play pins below */
     e = keyev(SDLK_RETURN, 0);
-    url_key(&e);
+    ui_url_key(&e);
     chk("ffmpeg restored: same field now plays", fp.cmd, CMD_PLAY);
     chk("ffmpeg restored: window closed", ui.url_visible, 0);
     fp.cmd = CMD_NONE;
 
     /* ---- B_URL button toggle ---- */
-    action(B_URL);
+    ui_action(B_URL);
     chk("B_URL: opens window", ui.url_visible, 1);
-    action(B_URL);
+    ui_action(B_URL);
     chk("B_URL: second press closes", ui.url_visible, 0);
 
     /* ---- D3 leak: URL typed into the FILE-browser field -> transient

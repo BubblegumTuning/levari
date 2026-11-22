@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
     printf("probe=%d ver=%s dir=%s\n", rc, ver, dir);
     for (int i = 1; i < argc; i++) {
         int16_t buf[2048 * 2];
-        Decoder *d = dec_open(argv[i]);
+        Decoder *d = dec_open(argv[i], NULL);
         if (!d) { printf("%s: FAIL open\n", argv[i]); continue; }
         int n = dec_read(d, buf, 2048);
         int sk = dec_seek(d, dec_total_frames(d) / 2);

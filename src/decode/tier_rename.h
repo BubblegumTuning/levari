@@ -71,7 +71,10 @@
 #define stb_vorbis_get_frame_short             LEV_TIER(stb_vorbis_get_frame_short)
 #define stb_vorbis_get_frame_short_interleaved LEV_TIER(stb_vorbis_get_frame_short_interleaved)
 #define stb_vorbis_get_info                    LEV_TIER(stb_vorbis_get_info)
+#define stb_vorbis_get_playback_sample_offset  LEV_TIER(stb_vorbis_get_playback_sample_offset)
+#define stb_vorbis_get_playback_sample_offset64 LEV_TIER(stb_vorbis_get_playback_sample_offset64)
 #define stb_vorbis_get_sample_offset           LEV_TIER(stb_vorbis_get_sample_offset)
+#define stb_vorbis_get_sample_offset64         LEV_TIER(stb_vorbis_get_sample_offset64)
 #define stb_vorbis_get_samples_float           LEV_TIER(stb_vorbis_get_samples_float)
 #define stb_vorbis_get_samples_float_interleaved LEV_TIER(stb_vorbis_get_samples_float_interleaved)
 #define stb_vorbis_get_samples_short           LEV_TIER(stb_vorbis_get_samples_short)
@@ -83,9 +86,12 @@
 #define stb_vorbis_open_memory                 LEV_TIER(stb_vorbis_open_memory)
 #define stb_vorbis_open_pushdata               LEV_TIER(stb_vorbis_open_pushdata)
 #define stb_vorbis_seek                        LEV_TIER(stb_vorbis_seek)
+#define stb_vorbis_seek64                      LEV_TIER(stb_vorbis_seek64)
 #define stb_vorbis_seek_frame                  LEV_TIER(stb_vorbis_seek_frame)
+#define stb_vorbis_seek_frame64                LEV_TIER(stb_vorbis_seek_frame64)
 #define stb_vorbis_seek_start                  LEV_TIER(stb_vorbis_seek_start)
 #define stb_vorbis_stream_length_in_samples    LEV_TIER(stb_vorbis_stream_length_in_samples)
+#define stb_vorbis_stream_length_in_samples64  LEV_TIER(stb_vorbis_stream_length_in_samples64)
 #define stb_vorbis_stream_length_in_seconds    LEV_TIER(stb_vorbis_stream_length_in_seconds)
 
 #endif /* LEVAR_DECODE_SUFFIX */

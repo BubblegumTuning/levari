@@ -5,22 +5,18 @@
    dir, mixed batches keep arrival order, and the posted CMD_PLAY names
    the first NEW row. The event-loop windowID routing itself is compile-
    checked only — proving it needs a real drag onto a real window.
-   Technique (see skill): #include ui.c, link every object EXCEPT
-   main.c.o, ui.c.o, decode.c.o AND stb_vorbis.c.o (dispatch.c.o MUST
-   stay — it defines dec_open/dec_ffmpeg_probe_info that ui.c refs; the
-   two excluded TUs are pre-split leftovers that collide with the
-   dec_*.dir tier objects):
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -Isrc -Isrc/ui -Isrc/tag $SDL -o /tmp/td \
-       test/pldrop/testpldrop.c $(find build/CMakeFiles/levari.dir -name '*.o' \
-         ! -name main.c.o ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
-   Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller
-   (lib_index_load resolves the index under the config dir; a missing
-   index is fine: the fill simply matches nothing). argv[1] = the repo's
-   test/ dir (fixtures: a.wav b.wav example.ogg sample.flac sample.mp3
-   tone.wav tone2.wav = exactly 7 audio files, plus pl.m3u/album.cue).
+   Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testpldrop$'
+   Link = filtered levari_ui archive minus ui.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy. argv[1] = the repo test/ dir (fixture
+   counts are pinned); the wrapper passes it via --test-arg.
+   lib_index_load resolves under the scratch config dir; a missing
+   index is fine (fills match 0).
 */
 #include "../../src/ui/ui.c"
 #include <stdlib.h>
@@ -107,7 +103,9 @@ int main(int argc, char **argv) {
     pl_clear(&list);
     drop_add(tdir);
     drop_flush();
-    chk("dir drop finds exactly the 7 fixtures", list.count, 7);
+    /* drop_add RECURSES the test dir: 7 root fixtures + the one audio
+       fixture below it (stbseek/seek-window-est.ogg) = 8 */
+    chk("dir drop finds exactly the 8 fixtures", list.count, 8);
     chk("dir drop kept example.ogg", has_path("/example.ogg"), 1);
     chk("dir drop skipped pl.m3u", has_path("pl.m3u"), 0);
     chk("dir drop skipped album.cue", has_path("album.cue"), 0);

@@ -39,6 +39,14 @@ runs in-process):
      hunk bounds the whole comment section by a 64 MB budget. Pin: hostile
      declares must refuse the open in well under 2 s (pre-fix: 5-8 s of
      allocation/zero-fill on the same machine) and never crash.
+  8. crafted IT stereo-packed sample (fuzz 2026-11-15 night): the
+     ReadSample stereo IT2.14 arm fed the second ITUnpack8Bit call a
+     wrapped (uint32 underflow) length when the first pass overshot its
+     window — the read-guard was void and the release binary read heap
+     past the module image (SIGSEGV once the buffer ends near a page
+     edge). Fix = upstream libmodplug e74d5d7 backport. Pin: the
+     generator's two poison shapes must probe with rc 0, and its benign
+     minimal IT must still probe ok.
 
 Usage: python3 test/probe/probecheck.py [build-dir] [old-build-dir]
        (default build dir: ./build)
@@ -268,6 +276,36 @@ try:
     check("oom-sized comment declare: FAIL open", "FAIL open" in r.stdout, r.stdout)
     check("oom-sized comment declare: refused in <2s (bounded work)", wall < 2.0,
           f"wall={wall:.2f}s — open allocated from the declared length again")
+
+    # 8. crafted IT stereo-packed sample (fuzz 2026-11-15 night): the first
+    # ITUnpack8Bit pass of the RS_*_STEREO ReadSample arm could consume 2
+    # bytes past its window (unchecked `pSrc += 2` block-header skip), and
+    # the second call's length dwMemLength-offset then WRAPPED to ~4 GiB —
+    # the read-guard compared against a pStop past the whole allocation.
+    # ASan aborts at image_end+4; a release build SIGSEGVs when the image
+    # buffer ends near a page edge. Fix = backport of upstream libmodplug
+    # e74d5d7 (four guard lines, load_it.cpp + sndfile.cpp). The ASan-harness
+    # red-on-revert was shown in-session (reverted-tree harness aborts on
+    # it_stereowrap with the original load_it.cpp:1202 signature).
+    gen = os.path.join(repo, "test", "probe", "make_it_stereowrap.py")
+    for args, name in (([], "poison 281B"), (["131072"], "poison 128KiB+")):
+        itf = os.path.join(scratch, "itwrap" + "".join(args) + ".it")
+        subprocess.run([sys.executable, gen, itf] + args, check=True,
+                       capture_output=True)
+        r = run(scratch, ["--probe", itf])
+        check(f"crafted IT stereo-wrap ({name}): exits 0 (no SEGV)",
+              r.returncode == 0, f"rc={r.returncode} out={r.stdout!r}")
+    # must-still-decode half: the benign minimal module from the same
+    # generator opens and seeks (the guards must not reject real IT data;
+    # pre/post PCM bit-identity over real .it + 80 corpus mutants is in
+    # the fix commit's Verified: clause)
+    itv = os.path.join(scratch, "itwrap-valid.it")
+    subprocess.run([sys.executable, gen, itv, "--valid"], check=True,
+                   capture_output=True)
+    r = run(scratch, ["--probe", itv])
+    check("valid minimal IT still probes ok",
+          r.returncode == 0 and "FAIL open" not in r.stdout and "seek=ok" in r.stdout,
+          f"rc={r.returncode} out={r.stdout!r}")
 finally:
     shutil.rmtree(scratch, ignore_errors=True)
 

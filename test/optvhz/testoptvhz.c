@@ -1,20 +1,19 @@
 /* unit test: the ADV-tab VIZ Hz cycle button (OPTB_VHZ) end to end —
-   hand-built SDL_Events drive handle_opt_mouse (down, up), the cycle
+   hand-built SDL_Events drive ui_handle_opt_mouse (down, up), the cycle
    walks 10 -> 24 -> 30 -> 60 -> 10, opt_save persists cfg.vis_hz, the
    config reader clamps anything outside the table back to the default,
-   and vis_frame_ms maps the table (plus a garbage default) to tick
-   periods. Technique (see skill / testoptenc): #include ui.c, link every
-   object EXCEPT main.c.o AND ui.c.o:
-     SDL=$(pkg-config --cflags --libs sdl2)
-     gcc -std=gnu11 -DLV_URL_ENABLED=1 -Isrc -Isrc/ui -Isrc/tag $SDL \
-       -o /tmp/tvhz test/optvhz/testoptvhz.c \
-       $(find build/CMakeFiles/levari.dir -name '*.o' ! -name main.c.o \
-          ! -name ui.c.o ! -name decode.c.o ! -name stb_vorbis.c.o) \
-       $(find build/CMakeFiles -path '*dec_*.dir*' -name '*.o') \
-       build/libmodplug.a build/libsnes_spc.a -lz -lm -lpthread -ldl -lstdc++
-   Run with scratch HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR set by the caller.
+   and ui_vis_frame_ms maps the table (plus a garbage default) to tick
+   periods. Technique: #include %s. Build, link and run are CTest targets now
+   (refactor item 3 — the find-glob recipes died with levari.dir's
+   objects): cmake --build build && ctest --test-dir build -R '^testoptvhz$'
+   Link = filtered levari_ui archive minus ui_opt.c.o + levari_engine
+   (pulls levari_core) + the dec tier/ffab objects + vendored libs.
+   tools/ctest_home.sh runs every case in a fresh scratch dir (the
+   name contains 'scratch'): HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR
+   there, audio.backend=null, /tmp/scratch-p2 present, cwd inside,
+   SDL_VIDEODRIVER=dummy.
 */
-#include "../../src/ui/ui.c"
+#include "../../src/ui/ui_opt.c"
 #include <stdlib.h>
 
 static Player fake_pl;
@@ -31,10 +30,10 @@ static void click(int x, int y) {
     e.button.button = SDL_BUTTON_LEFT;
     e.button.state = SDL_PRESSED;
     e.motion.x = x; e.motion.y = y;
-    handle_opt_mouse(&e);
+    ui_handle_opt_mouse(&e);
     e.type = SDL_MOUSEBUTTONUP;
     e.button.state = SDL_RELEASED;
-    handle_opt_mouse(&e);
+    ui_handle_opt_mouse(&e);
 }
 
 /* rewrite the user config with one ui.vis_hz line and re-read it */
@@ -75,11 +74,11 @@ int main(void) {
     chk("config 60 accepted", cfg.vis_hz, 60);
 
     /* --- the tick table (the scheduler's only hz consumer) ------------- */
-    chk("10 Hz -> 100 ms", vis_frame_ms(10), 100);
-    chk("24 Hz -> 41 ms", vis_frame_ms(24), 41);
-    chk("30 Hz -> 33 ms", vis_frame_ms(30), 33);
-    chk("60 Hz -> 16 ms", vis_frame_ms(60), 16);
-    chk("garbage -> 100 ms (never a busy loop)", vis_frame_ms(7), 100);
+    chk("10 Hz -> 100 ms", ui_vis_frame_ms(10), 100);
+    chk("24 Hz -> 41 ms", ui_vis_frame_ms(24), 41);
+    chk("30 Hz -> 33 ms", ui_vis_frame_ms(30), 33);
+    chk("60 Hz -> 16 ms", ui_vis_frame_ms(60), 16);
+    chk("garbage -> 100 ms (never a busy loop)", ui_vis_frame_ms(7), 100);
 
     /* --- the ADV cycle button via the real mouse chain ----------------- */
     cfg_with_hz("10");
@@ -87,7 +86,7 @@ int main(void) {
     ui.opt_visible = 1;
     ui.opt_tab = 1;
     ui.pressed = B_NONE;
-    ui.opt_vhz = cfg.vis_hz;         /* what opt_open does */
+    ui.opt_vhz = cfg.vis_hz;         /* what ui_opt_open does */
     chk("opens at 10", ui.opt_vhz, 10);
 
     Rect r = opt_vhz_rect();

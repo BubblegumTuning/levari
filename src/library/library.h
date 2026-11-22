@@ -23,6 +23,11 @@ int lib_idx_header(FILE *f);
 /* unescape a v2 index path field in place (only shrinks) */
 void lib_unesc_path(char *p);
 
+/* unescape a v2 index path field of length sn into a bounded dst buffer
+   of dn bytes (only shrinks; dst and src may be the same buffer when dn
+   is the string length + 1). Shared with the library CLI layer. */
+void lib_unesc_field(char *dst, size_t dn, const char *src, size_t sn);
+
 /* fgets + over-long-row guard: a row cut by the line buffer would have
    its tail re-parsed as a garbage row, so the remainder is drained.
    returns 1 for a whole line, 2 for a truncated (skippable) one, 0 at EOF */
@@ -62,7 +67,7 @@ void lib_fill_playlist(Playlist *p);
 int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
                      int *out_notag);
 
-/* VERIFY (master, 2026-11-13): one existence pass over the WHOLE index —
+/* VERIFY (hardware, 2026-11-13): one existence pass over the WHOLE index —
    every row's path field is stat'd. A row that stats as a regular file
    is kept byte-identically; a row the filesystem answered ENOENT or
    ENOTDIR about is DROPPED (its file is gone — the NAS-path-change
@@ -83,7 +88,7 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
 int lib_index_verify(int *out_kept, int *out_purged, int *out_unreach,
                      char *bank_out, size_t bank_n);
 
-/* urlIndex (streaming-plan D5, master ruling): ONE row = the last
+/* urlIndex (streaming-plan D5, design ruling): ONE row = the last
    WORKING url, stored next to the library index (same exposure class —
    the index already carries every path). Written ONLY by the player
    thread when playback demonstrably works (open ok + first decoded

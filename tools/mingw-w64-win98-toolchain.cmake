@@ -23,5 +23,6 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
 # 0x0410 = Windows 98 SE floor. Note SDL_windows.h #undef-s _WIN32_WINNT
 # to its own 0x501 inside SDL TUs; ours (daemon.c etc.) keep 0x0410.
-set(CMAKE_C_FLAGS_INIT "-D_WIN32_WINDOWS=0x0410 -DWINVER=0x0410")
+set(CMAKE_C_FLAGS_INIT "-D_WIN32_WINDOWS=0x0410 -DWINVER=0x0410 -march=pentiumpro -mno-sse -mno-sse2")
+set(CMAKE_CXX_FLAGS_INIT "-D_WIN32_WINDOWS=0x0410 -DWINVER=0x0410 -march=pentiumpro -mno-sse -mno-sse2")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -static-libgcc")
