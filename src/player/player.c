@@ -294,14 +294,22 @@ static void *player_thread(void *arg) {
                 break;
             case CMD_SEEK:
                 if (p->dec) {
-                    /* -1 only for an aborted SPC fast-forward (or a failed
-                       reload): the decoder sits at an unknown mid-skip
-                       position, so leave pos_frames at its last truthful
-                       value — the pending command that aborted the seek
-                       redefines transport state on the next loop pass.
+                    /* -1: an aborted SPC fast-forward (or a failed
+                       reload). The aborted SPC decoder tracks its exact
+                       real position (dec_pos), so re-stamp pos_frames
+                       from it — a pause or speed change that aborted the
+                       skip does NOT redefine transport, and without the
+                       restamp the readout drifts behind the audio until
+                       the next successful seek or track change. A failed
+                       seek on other backends reports unknown (-1):
+                       keep the last truthful value there.
                        The flush still drops the pre-seek stale audio. */
                     if (dec_seek(p->dec, seek_frame) == 0)
                         p->pos_frames = seek_frame;
+                    else {
+                        long long dp = dec_pos(p->dec);
+                        if (dp >= 0) p->pos_frames = dp;
+                    }
                     ao_flush();
                     if (p->state == ST_PAUSE) { p->state = ST_PLAY; ao_resume(); }
                 }

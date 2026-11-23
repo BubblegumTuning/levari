@@ -138,8 +138,13 @@ int main(int argc, char **argv) {
     lv98_tracef("ui_run:rc=%d", ui_rc);
     mpris_stop();
     srv_stop();
-    printf("selftest: cur=%d state=%d pos=%lld/%lld rate=%d\n",
-           player.cur, player.state, player.pos_frames, player.total_frames, player.rate);
+    /* the readout line is the selftest protocol's answer — every gate
+       parses it from a --selftest N run; a normal GUI exit must not
+       print it (stdout is a terminal there, and the "selftest:" label
+       is a lie for a session the user closed by hand) */
+    if (selftest > 0)
+        printf("selftest: cur=%d state=%d pos=%lld/%lld rate=%d\n",
+               player.cur, player.state, player.pos_frames, player.total_frames, player.rate);
     pl_player_stop(&player);
     /* batch 21: the whole "clean exit" proof so far stopped at
        ui_run:rc=0, which prints BEFORE the join in pl_player_stop —

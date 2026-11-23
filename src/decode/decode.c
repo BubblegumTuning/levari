@@ -1113,6 +1113,15 @@ int dec_rate(const Decoder *d) { return d->rate; }
 int dec_channels(const Decoder *d) { return d->ch; }
 long long dec_total_frames(const Decoder *d) { return d->total; }
 
+long long dec_pos(const Decoder *d) {
+    /* SPC is the one backend whose position is exactly tracked (s->played
+       counts every emitted frame: skip chunks AND reads) — and the one
+       seek that can abort, leaving the caller's mirror stale. Any other
+       backend would only guess: report unknown and let the caller keep
+       its last truthful value. */
+    return d && d->fmt == F_SPC ? d->u.sp->played : -1;
+}
+
 /* take the latest ICY StreamTitle (1 = fresh string copied out): the
    player polls this after each chunk; the read loop marks dirty only on
    a CHANGED non-empty StreamTitle, so dirty means NEW. */

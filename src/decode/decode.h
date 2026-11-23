@@ -30,6 +30,11 @@ int      dec_take_title(Decoder *d, char *out, size_t n); /* 1 = fresh ICY Strea
 int      dec_read(Decoder *d, int16_t *out, int frames);
 /* seek to absolute pcm frame; returns 0 on success */
 int      dec_seek(Decoder *d, long long frame);
+/* exact frame position of the decoder (frames emitted since load/seek);
+   -1 when the backend cannot report one truthfully — the caller must then
+   keep its own last truthful value (a failed/aborted seek leaves other
+   backends' position unknown) */
+long long dec_pos(const Decoder *d);
 void     dec_close(Decoder *d);
 
 /* ffmpeg backend availability: 0 = not built, 1 = available,

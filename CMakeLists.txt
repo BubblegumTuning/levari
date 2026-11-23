@@ -430,7 +430,7 @@ endif()
 # CPU tuning for ARM boards: -DLV_TUNE=arm1176jzf-s (Pi Zero 1 / Pi 1),
 # cortex-a7 (Pi 2) or cortex-a72 (Pi 4). On 32-bit armv7 the NEON flags
 # also switch minimp3 to its SIMD mp3 decoder; the armv6 boards (Pi Zero 1,
-# Pi 1: ARM1176, VFPv2, no NEON) get plain VFP instead, so minimp3 keeps
+# Pi 1: ARM1176, VFPv3-D16, no NEON) get plain VFP instead, so minimp3 keeps
 # its scalar path and the binary runs on them (NEON flags would SIGILL).
 set(LV_TUNE "" CACHE STRING "-mcpu target, e.g. arm1176jzf-s (Pi Zero) / cortex-a7 (Pi 2) / cortex-a72 (Pi 4)")
 if(LV_TUNE AND NOT WIN32)
@@ -454,8 +454,12 @@ if(LV_TUNE AND NOT WIN32)
     # -march — the `lto1: warning: switch -mcpu... conflicts with
     # -march=armv6+fp` line: per-object compile flags are replayed but
     # the link driver's defaults WIN for new codegen, so the final
-    # binary gains VFPv3 encodings (vdiv.f64 = undefined instruction on
-    # the ARM1176's VFPv2) even though every .o was compiled -mfpu=vfp.
+    # binary gains encodings touching the d16-d31 register bank (the
+    # VFPv3-D32 half) even though every .o was compiled -mfpu=vfp —
+    # and ARM1176JZF-S is VFPv3-D16: it has no d16-d31 at all, so such
+    # instructions SIGILL on the board (what the D32-discriminating
+    # ISA gate of the Pi release audit scans for). vdiv/vsqrt per se
+    # are fine on this core (they date back to VFPv1).
     # Pin -mcpu (and the FPU/ABI pair) at link time so lto1 generates
     # for the same silicon we ship to.
     target_link_options(levari PRIVATE -mcpu=${LV_TUNE})
@@ -836,7 +840,8 @@ if(LV_TESTS AND NOT CMAKE_CROSSCOMPILING)
     # it needs the macOS dev host, see the ffabi dossier)
     if(LV_PYTHON3)
         foreach(drv probe/probecheck tagwords/tagcheck verify/testverify
-                    deadskip/testdeadskip dribble/daemon_dribble)
+                    deadskip/testdeadskip dribble/daemon_dribble
+                    seekabort/testseekabort)
             string(REGEX REPLACE ".*/" "" _dn ${drv})
             if(_dn STREQUAL "probecheck")
                 # probecheck takes the build dir as argv[1] (cwd is the

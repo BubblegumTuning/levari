@@ -66,13 +66,39 @@ static int abort_never(void *ctx)  { (void)ctx; polls++; return 0; }
 static int abort_first(void *ctx)  { (void)ctx; polls++; return 1; }
 static int abort_after4(void *ctx) { (void)ctx; return ++polls > 4; }
 
+/* minimal 8 kHz mono s16 WAV (LE — the fixture host and every WAV
+   fixture here are little-endian), for the non-SPC dec_pos contract */
+static void mk_wav(const char *path) {
+    unsigned char h[44];
+    unsigned int le;
+    memset(h, 0, sizeof h);
+    memcpy(h, "RIFF", 4);
+    le = 36 + 16; memcpy(h + 4, &le, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    le = 16; memcpy(h + 16, &le, 4);          /* fmt chunk size */
+    h[20] = 1;                                /* PCM */
+    h[22] = 1;                                /* one channel */
+    le = 8000; memcpy(h + 24, &le, 4);        /* rate */
+    le = 16000; memcpy(h + 28, &le, 4);       /* byte rate */
+    h[32] = 2;                                /* block align */
+    h[34] = 16;                               /* bits */
+    memcpy(h + 36, "data", 4);
+    le = 8 * 2; memcpy(h + 40, &le, 4);       /* 8 samples */
+    static const short smp[8] = {0, 1, 2, 3, -1, -2, -3, -4};
+    FILE *o = fopen(path, "wb");
+    fwrite(h, 1, sizeof h, o);
+    fwrite(smp, sizeof smp, 1, o);
+    fclose(o);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <scratch-dir>\n", argv[0]); return 2; }
-    char p3[512], p60[512], pl[512], pdead[512];
+    char p3[512], p60[512], pl[512], pdead[512], pwav[512];
     snprintf(p3, sizeof p3, "%s/spc-3s.spc", argv[1]);
     snprintf(p60, sizeof p60, "%s/spc-60s.spc", argv[1]);
     snprintf(pl, sizeof pl, "%s/spc-3600s.spc", argv[1]);
     snprintf(pdead, sizeof pdead, "%s/spc-floor.spc", argv[1]);
+    snprintf(pwav, sizeof pwav, "%s/pos-check.wav", argv[1]);
     mk_spc(p3, 3, 1); mk_spc(p60, 60, 1); mk_spc(pl, 3600, 1);
     mk_spc(pdead, 3600, 0);
     static int16_t out[4096 * 2];
@@ -83,7 +109,9 @@ int main(int argc, char **argv) {
     if (d) {
         CHECK(dec_total_frames(d) == 160000, "total = (3+2 fade) * 32000");
         CHECK(dec_seek(d, 1000) == 0, "cheap seek succeeds");
+        CHECK(dec_pos(d) == 1000, "dec_pos = target after successful seek");
         CHECK(dec_read(d, out, 512) > 0, "read after seek > 0");
+        CHECK(dec_pos(d) == 1512, "dec_pos tracks emitted frames past the seek");
         dec_close(d);
     }
 
@@ -127,6 +155,10 @@ int main(int argc, char **argv) {
         CHECK(w < 0.5, "abandoned skip bounded (<0.5 s of a ~44 s skip)");
         printf("      (abandoned skip wall %.4fs after %d polls)\n", w, polls);
         CHECK(polls < 60, "skip truly stopped early (far under full chunk count)");
+        /* THE restamp source: the aborted decoder reports exactly where
+           the skip got to (4 chunks of 8192) — the player's CMD_SEEK
+           failure path re-stamps pos_frames from this */
+        CHECK(dec_pos(d) == 4 * 8192, "dec_pos = real position after abort");
         CHECK(dec_read(d, out, 512) > 0, "decoder usable after abort");
         dec_close(d);
     }
@@ -163,6 +195,19 @@ int main(int argc, char **argv) {
         /* the emulated core's error is a latched query consumed by the skip;
            the decoder stays usable after it (same contract as an abort) */
         CHECK(dec_read(d, out, 512) > 0, "decoder usable after halt");
+        dec_close(d);
+    }
+
+    /* pin 7: contract — every non-SPC backend reports its position as
+       unknown (-1), so the player keeps its own mirror instead of
+       trusting a guess after a failed seek */
+    mk_wav(pwav);
+    d = dec_open(pwav, NULL);
+    CHECK(d != NULL, "tiny wav opens");
+    if (d) {
+        CHECK(dec_pos(d) == -1, "dec_pos unknown (-1) on a wav decoder");
+        CHECK(dec_seek(d, 4) == 0, "wav seek succeeds");
+        CHECK(dec_pos(d) == -1, "dec_pos stays unknown after a good wav seek");
         dec_close(d);
     }
 

@@ -25,6 +25,7 @@
     extern int        dec_take_title##SFX(Decoder *d, char *out, size_t n);    \
     extern int        dec_read##SFX(Decoder *d, int16_t *out, int frames);     \
     extern int        dec_seek##SFX(Decoder *d, long long frame);              \
+    extern long long  dec_pos##SFX(const Decoder *d);                          \
     extern void       dec_close##SFX(Decoder *d);                              \
     extern int        dec_ffmpeg_probe##SFX(void);                             \
     extern int        dec_ffmpeg_probe_info##SFX(char *, size_t, char *, size_t);
@@ -45,6 +46,7 @@ typedef struct {
     int       (*take_title)(Decoder *d, char *out, size_t n);
     int       (*read)(Decoder *d, int16_t *out, int frames);
     int       (*seek)(Decoder *d, long long frame);
+    long long (*pos)(const Decoder *d);
     void      (*close)(Decoder *d);
     int       (*ffmpeg_probe)(void);
     int       (*ffmpeg_probe_info)(char *, size_t, char *, size_t);
@@ -53,8 +55,8 @@ typedef struct {
 #define LV_TIER_TABLE(SFX)                                                     \
     { dec_open##SFX, dec_rate##SFX, dec_channels##SFX, dec_total_frames##SFX,  \
       dec_take_title##SFX,                                                       \
-      dec_read##SFX, dec_seek##SFX, dec_close##SFX, dec_ffmpeg_probe##SFX,     \
-      dec_ffmpeg_probe_info##SFX }
+      dec_read##SFX, dec_seek##SFX, dec_pos##SFX, dec_close##SFX,              \
+      dec_ffmpeg_probe##SFX, dec_ffmpeg_probe_info##SFX }
 
 /* ## in LV_TIER_TABLE suppresses argument expansion, so selecting the
    floor programmatically needs one indirection to expand LV_FLOOR to its
@@ -133,6 +135,7 @@ long long dec_total_frames(const Decoder *d) { return tier()->total_frames(d); }
 int dec_take_title(Decoder *d, char *out, size_t n) { return tier()->take_title(d, out, n); }
 int dec_read(Decoder *d, int16_t *out, int frames) { return tier()->read(d, out, frames); }
 int dec_seek(Decoder *d, long long frame) { return tier()->seek(d, frame); }
+long long dec_pos(const Decoder *d) { return tier()->pos(d); }
 void dec_close(Decoder *d) { tier()->close(d); }
 int dec_ffmpeg_probe(void) { return tier()->ffmpeg_probe(); }
 int dec_ffmpeg_probe_info(char *ver_out, size_t ver_n, char *dir_out, size_t dir_n) {

@@ -25,6 +25,7 @@
 #define dec_take_title     LEV_TIER(dec_take_title)
 #define dec_read           LEV_TIER(dec_read)
 #define dec_seek           LEV_TIER(dec_seek)
+#define dec_pos            LEV_TIER(dec_pos)
 #define dec_close          LEV_TIER(dec_close)
 #define dec_ffmpeg_probe      LEV_TIER(dec_ffmpeg_probe)
 #define dec_ffmpeg_probe_info LEV_TIER(dec_ffmpeg_probe_info)
