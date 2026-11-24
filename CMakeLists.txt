@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.8 LANGUAGES C)
+project(levari VERSION 0.3.9 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -269,6 +269,53 @@ function(lv_harden tgt)
     endif()
 endfunction()
 
+# ---- vendored libopus: static decoder core for WIN32/APPLE only ----
+# (design ruling 2026-11-24: the Linux flagship/legacy/Pi/i386 and the
+# Win98 era build keep the dlopen'd system libopus — the link must not
+# reach them; decode.c binds the builtin externs only under
+# LV_OPUS_BUILTIN). Tree is fetched + sha-pinned by tools/fetch_opus.sh,
+# never repo content.
+# The define is DIRECTORY-scoped and sits before the first target on
+# purpose: decode.c is compiled into levari_core, the tier OBJECT libs
+# AND the testopus/testdecode core_x_dec harness shape — a per-target
+# define would miss the harnesses and silently ship a tiered win build
+# on the dlopen path. PUBLIC propagation lands the opus archive AFTER
+# the project objects on every executable and harness that links these
+# libs — never via CMAKE_EXE_LINKER_FLAGS: archive position matters and
+# BEFORE the objects dies with undefined references (dossier trap).
+if(LV_WIN9X)
+    if(LV_OPUS_LINK)
+        message(FATAL_ERROR "LV_OPUS_LINK must never be ON on an era build (Win98 keeps dlopen; era is not a vendored-opus target)")
+    endif()
+elseif(WIN32 OR APPLE)
+    # win/mac flagship ALWAYS link the vendored core (design ruling 2026-11-24) —
+    # a cache -DLV_OPUS_LINK=OFF cannot talk us out of it
+    set(LV_OPUS_LINK ON)
+else()
+    option(LV_OPUS_LINK "statically link the vendored opus core (linux: opt-in DEV GATE ONLY — no shipping linux artifact links opus)" OFF)
+endif()
+if(LV_OPUS_LINK)
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/CMakeLists.txt)
+        message(FATAL_ERROR "third_party/opus missing — run tools/fetch_opus.sh at the repo root before configuring")
+    endif()
+    add_compile_definitions(LV_OPUS_BUILTIN=1)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+    set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/opus EXCLUDE_FROM_ALL)
+    # the gc/dead_strip diet (dossier recipe): the encoder gc's away at the
+    # executable link — there is no --disable-encoders to turn off anyway
+    target_compile_options(opus PRIVATE -ffunction-sections -fdata-sections)
+    if(UNIX AND NOT APPLE)
+        # the modplug lesson, generalized: uninstrumented static archives
+        # with absolute .data refs die on the PIE link (R_X86_64_32S)
+        target_compile_options(opus PRIVATE -fPIE)
+    endif()
+endif()
+
 # ---- static library targets (refactor item 3: one compile, two links) ----
 # levari_core:  the ingest spine — config, tag, playlist, library + CLI,
 #               daemon client, and the decode stack (dispatch.c when tiers
@@ -333,6 +380,9 @@ target_link_libraries(levari_engine PUBLIC levari_core)
 target_link_libraries(levari_ui PUBLIC levari_engine)
 # cjk_font.c inflates its blob through the vendored LZMA decoder
 target_link_libraries(levari_ui PRIVATE lzma)
+if(LV_OPUS_LINK)
+    target_link_libraries(levari_core PUBLIC opus)
+endif()
 
 add_executable(levari src/main.c)
 target_link_libraries(levari levari_ui levari_engine levari_core)
@@ -789,6 +839,54 @@ if(LV_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(testspcseek core_x_dec levari_engine lv_test_deps)
     add_dependencies(testspcseek core_x_dec_make)
     add_test(NAME testspcseek COMMAND sh ${LV_CTHOME} --scratch-arg $<TARGET_FILE:testspcseek>)
+    # testopus: pins the opus open/read/seek path (e59230b: the DEC_FMT
+    # refactor made lv_fmt_opus_open's success tail fall through the
+    # opusfail cleanup, so EVERY .opus "cannot decode" for three releases
+    # with zero ctest coverage — red-pre against that tree). Same
+    # TU-carries-decode.c shape as testspcseek (shares the core_x_dec
+    # filter and stb_vorbis.c; no HAVE_FFMPEG). Committed generated-sine
+    # fixture test/opus/sample.opus (make_fixture.sh regenerates where
+    # ffmpeg carries libopus); negatives are derived from it in the
+    # scratch cwd. libopus itself stays dlopen'd like every shipped
+    # build: a host without it OBSERVE-skips rather than fakes a red.
+    add_executable(testopus test/opus/testopus.c third_party/stb_vorbis.c)
+    target_include_directories(testopus PRIVATE
+        src src/ui src/tag src/library src/config src/decode third_party ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(testopus core_x_dec levari_engine lv_test_deps)
+    add_dependencies(testopus core_x_dec_make)
+    add_test(NAME testopus COMMAND sh ${LV_CTHOME} --test-arg $<TARGET_FILE:testopus>)
+    # testdecode: the WIDTH gate — one open/read/seek row per DEC_FMT
+    # backend on committed generated-sine fixtures (test/decode/ plus the
+    # existing sample.flac and testopus's opus fixture). Born of the opus
+    # fall-through (e59230b): depth gates existed, nothing ever dec_open'd
+    # every format. Same TU-carries-decode.c link shape as testspcseek;
+    # here HAVE_FFMPEG + the dec_ffab objects ARE added where the shipped
+    # build has them, so the ffmpeg row probes the same shape the user's
+    # binary ships (OBSERVE-skips per row when a runtime dep cannot load).
+    add_executable(testdecode test/decode/testdecode.c third_party/stb_vorbis.c)
+    target_include_directories(testdecode PRIVATE
+        src src/ui src/tag src/library src/config src/decode third_party ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(testdecode core_x_dec levari_engine lv_test_deps)
+    add_dependencies(testdecode core_x_dec_make)
+    if(NOT WIN32)
+        target_compile_definitions(testdecode PRIVATE HAVE_FFMPEG)
+        foreach(abi IN LISTS LEVAR_FF_ABIS)
+            target_sources(testdecode PRIVATE $<TARGET_OBJECTS:dec_ffab${abi}>)
+        endforeach()
+    endif()
+    add_test(NAME testdecode COMMAND sh ${LV_CTHOME} --test-arg $<TARGET_FILE:testdecode>)
+    if(LV_OPUS_LINK)
+        # the core_x_dec shape extracts decode.c.o from the levari_core
+        # archive, so the PUBLIC opus dependency does not ride along —
+        # name it for the three harnesses that carry that object
+        foreach(h testspcseek testopus testdecode)
+            if(TARGET ${h})
+                # plain signature: the harness link lines above are plain,
+                # and CMake forbids mixing keyword and plain per target
+                target_link_libraries(${h} opus)
+            endif()
+        endforeach()
+    endif()
 
     lv_test(testrescan    test/rescan/testrescan.c)
     lv_test(testurlidx    test/urlidx/testurlidx.c)

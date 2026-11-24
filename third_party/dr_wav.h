@@ -6540,7 +6540,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                 drwav_int32 nibble0;
                 drwav_int32 nibble1;
 
-                /* LEVARI PATCH (PERFORMANCE hunk 1 of 5, 2026-11-21, master-supplied, NOT
+                /* LEVARI PATCH (PERFORMANCE hunk 1 of 5, 2026-11-21, field-supplied, NOT
                    upstream — RE-APPLY after any vendor refresh): MSADPCM bulk fast path.
                    Bit-exact contract: whole-decode s16 FNV identical to upstream on the
                    MS-ADPCM corpus, mono+stereo, odd trailing frames, block edges. */
@@ -6810,7 +6810,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__ima(drwav* pWav, drwav_uin
             if (pWav->ima.bytesRemainingInBlock == 0) {
                 continue;
             } else {
-                /* LEVARI PATCH (PERFORMANCE hunk 2 of 5, 2026-11-21, master-supplied, NOT
+                /* LEVARI PATCH (PERFORMANCE hunk 2 of 5, 2026-11-21, field-supplied, NOT
                    upstream — RE-APPLY after any vendor refresh): IMA/DVI ADPCM bulk fast
                    path. Bit-exact contract: same corpus rule as hunk 1 (partial groups and
                    odd frame counts included). */

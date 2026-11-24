@@ -56,9 +56,12 @@ void lib_fill_playlist(Playlist *p);
    replace the matching row, append when absent (playlist entries outside the
    library become findable). The path is realpath'd like the scanner's, so a
    symlinked playlist entry updates the scanned row instead of shadowing it.
-   Duration: probe-only — the scanner's dec_open fallback slurps whole files
-   and this runs on the UI thread; a probe that yields 0 KEEPS the stored
-   duration. The header line (creation marker) is preserved byte-identically.
+   Duration: probe-only EXCEPT for module signatures, which the probe is
+   blind on by design and which the module-bounded dec_open answers cheaply
+   (repair path for durations older probes invented from pattern bytes);
+   a probe that yields 0 elsewhere KEEPS the stored duration — the general
+   scanner dec_open fallback slurps whole files and this runs on the UI
+   thread. The header line (creation marker) is preserved byte-identically.
    Returns 0 on success; -1 if the file cannot be opened for probing (index
    untouched); -2 on index read/write failure; -3 if the on-disk index
    predates the v2 header AND cannot be migrated without guessing — the

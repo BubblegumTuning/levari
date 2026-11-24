@@ -52,8 +52,36 @@ static int (*opus_dec)(void *st, const unsigned char *pkt, int len, int16_t *pcm
 static void (*opus_destroy)(void *st);
 static int (*opus_ctl)(void *st, int req, ...);
 
+/* ---- opus: dlopen'd libopus (no dev headers needed) or the static
+   vendored core (LV_OPUS_BUILTIN: win/mac flagship, tools/fetch_opus.sh).
+   The four builtin externs are declared in decode.c's existing shapes —
+   opus_int32/int16 are int/int16_t and the opaque decoder pointer is void*
+   at every call site already; this is the same type view the dlsym casts
+   produce, and the static link pins the exact core we shipped-size-measured
+   (the dossier A/B), which a system DLL never does. */
+#ifdef LV_OPUS_BUILTIN
+extern void *opus_decoder_create(int Fs, int ch, int *err);
+extern int opus_decode(void *st, const unsigned char *pkt, int len,
+                       int16_t *pcm, int frame_sz, int fec);
+extern void opus_decoder_destroy(void *st);
+extern int opus_decoder_ctl(void *st, int req, ...);
+#define LV_OPUS_BUILTIN_BIND()                                    \
+    do {                                                          \
+        opus_create = opus_decoder_create;                        \
+        opus_dec = opus_decode;                                   \
+        opus_destroy = opus_decoder_destroy;                      \
+        opus_ctl = opus_decoder_ctl;                              \
+    } while (0)
+#else
+#define LV_OPUS_BUILTIN_BIND() ((void)0)
+#endif
+
 static int opus_syms(void) {
     if (opus_dec) return 0;
+#ifdef LV_OPUS_BUILTIN
+    LV_OPUS_BUILTIN_BIND();
+    return opus_dec ? 0 : -1;
+#else
     void *h = NULL;
 #ifdef _WIN32
     if (!h) h = dlopen("libopus-0.dll", RTLD_NOW | RTLD_LOCAL);
@@ -77,6 +105,7 @@ static int opus_syms(void) {
     opus_ctl = (int (*)(void *, int, ...))dlsym(h, "opus_decoder_ctl");
     if (!opus_create || !opus_dec || !opus_destroy || !opus_ctl) return -1;
     return 0;
+#endif
 }
 
 typedef struct {
@@ -832,7 +861,13 @@ static int lv_fmt_ogg_open(Decoder *d, const char *path, int url) {
 /* fmt opus open */
 static int lv_fmt_opus_open(Decoder *d, const char *path, int url) {
     (void)url;
-        if (opus_syms() != 0) return -1;
+    if (opus_syms() != 0) {
+        /* one line naming the missing codec core: every opus open failure
+           on a host without libopus was otherwise silent (same mute class
+           as the e59230b fall-through) */
+        fprintf(stderr, "levari: opus playback needs the libopus library\n");
+        return -1;
+    }
     Opus *o = calloc(1, sizeof *o);
     if (!o) return -1;
     o->f = fopen(path, "rb");
@@ -853,12 +888,12 @@ static int lv_fmt_opus_open(Decoder *d, const char *path, int url) {
     long long g = ogg_last_granule(o);
     d->total = g > o->pre_skip ? g - o->pre_skip : 0;
     d->u.op = o;
+    return 0;
 opusfail:
     if (o->dec) opus_destroy(o->dec);
     if (o->f) fclose(o->f);
     free(o);
     return -1;
-    return 0;
 }
 
 /* fmt flac open */

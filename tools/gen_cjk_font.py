@@ -80,7 +80,50 @@ def title_decorations():
         0xFA1F,                          # 﨟 CJK compat kanji (わが﨟たし悪の華)
         0x2F63,                          # ⽣ kangxi radical used decoratively
         0x014D, 0x01DD,                  # ō ǝ romanization flourishes
+        0x00A0,                          # NBSP — blank alias target below;
+                                         # already in the blob via latin-1,
+                                         # named here so the alias cannot
+                                         # outlive its target by accident
     }
+
+def emoji_decorations():
+    # single-color emoji requested 2026-11-24 after the heart-folding
+    # decision: unlike folded hearts/stars, each of these has its own
+    # silhouette in the pinned Unifont (16x16) with no analogue the blob
+    # already ships — verified against the hex bitmaps, not from memory.
+    return {
+        0x1F3B6,                         # 🎶 three detached notes; blob's
+                                         # U+266A (one note) and U+266C
+                                         # (beamed pair) are different shapes
+        0x1F48E,                         # 💎 faceted gem
+        0x1F525,                         # 🔥 flame
+        0x2728,                          # ✨ four-pointed sparkle cluster
+    }
+
+# Single-color folding: shapes whose distinctness dies with color fold into
+# a glyph the blob already ships instead of costing a bitmap each. Emoji/BMP
+# hearts share the silhouette of the suit hearts (U+2665 filled, U+2661
+# outline); U+2B50 ⭐ is the emoji-filled star (Unifont draws it as an
+# outline five-pointer near-identical to the blob's U+2606, and emoji
+# presentation is solid, so it folds to U+2605 like 🖤 folded to the filled
+# heart). U+FE0F/U+FE0E (emoji/text variation selectors, attached to e.g.
+# U+2764 FE0F) fold into the U+00A0 blank: they are never zero-width here
+# because every width loop advances by font_cp_w16 and a 0-width cell would
+# spin it.
+SINGLE_COLOR_ALIASES = {
+    0x2764: 0x2665,                      # ❤ heavy black heart
+    0x1F493: 0x2665, 0x1F494: 0x2665, 0x1F495: 0x2665,  # 💓 💔 💕
+    0x1F496: 0x2665, 0x1F497: 0x2665, 0x1F498: 0x2665,  # 💖 💗 💘
+    0x1F499: 0x2665, 0x1F49A: 0x2665, 0x1F49B: 0x2665,  # 💙 💚 💛
+    0x1F49C: 0x2665, 0x1F49D: 0x2665, 0x1F49E: 0x2665,  # 💜 💝 💞
+    0x1F49F: 0x2665,                      # 💟 heart decoration
+    0x1F5A4: 0x2665,                      # 🖤 black heart
+    0x1F9E1: 0x2665,                      # 🧡 orange heart
+    0x1F90D: 0x2661,                      # 🤍 white heart -> outline heart
+    0x2B50: 0x2605,                       # ⭐ white medium star -> filled star
+    0xFE0E: 0x00A0, 0xFE0F: 0x00A0,       # variation selectors -> blank
+}
+
 
 def load_unifont(path):
     # returns codepoint -> list of 16 uint16 row bitmaps (bit 0x8000 = leftmost)
@@ -115,7 +158,8 @@ def lzma_props():
 def main():
     uni, half = load_unifont(sys.argv[1])
     want = (jis0208_codepoints() | latin1_supplement() | cyrillic() |
-            korean() | common_punctuation() | title_decorations())
+            korean() | common_punctuation() | title_decorations() |
+            emoji_decorations())
     cps = sorted(c for c in want if c in uni)
     missing = len(want) - len(cps)
     sys.stderr.write('font: %d glyphs, %d missing in unifont\n' % (len(cps), missing))
@@ -125,14 +169,28 @@ def main():
                '/* GNU Unifont: GPL-2.0+ with font embedding exception */\n'
                '#include <stdint.h>\n#include <stdlib.h>\n#include "cjk_font.h"\n#include "LzmaDec.h"\n\n')
     out.append('#define CJK_N %d\n' % len(cps))
-    out.append('static const uint16_t cjk_cp[CJK_N] = {\n')
+    # BMP codepoints ride a uint16 table; astral codepoints (emoji) sort
+    # after every BMP entry, so they ride a small uint32 tail table whose
+    # hits index the SAME glyph array past CJK_N_LO. A single uint32 table
+    # would cost ~19 KB .rodata for a handful of emoji, and a uint16-only
+    # table silently truncates astral values (gcc only warns) and breaks
+    # the sortedness binary search depends on.
+    lo = [c for c in cps if c <= 0xFFFF]
+    hi = [c for c in cps if c > 0xFFFF]
+    assert all(c <= 0xFFFF for c in lo)
+    out.append('#define CJK_N_LO %d\n' % len(lo))
+    out.append('static const uint16_t cjk_cp[CJK_N_LO] = {\n')
     row = []
-    for i, c in enumerate(cps):
+    for i, c in enumerate(lo):
         row.append('0x%04X' % c)
         if len(row) == 12:
             out.append(','.join(row) + ',\n'); row = []
     if row:
         out.append(','.join(row) + '\n')
+    out.append('};\n\n')
+    out.append('#define CJK_N_HI %d\n' % len(hi))
+    out.append('static const uint32_t cjk_hi_cp[%d] = {\n' % (len(hi) or 1))
+    out.append((','.join('0x%X' % c for c in hi) if hi else '0') + '\n')
     out.append('};\n\n')
     # half-width (8-wide in unifont) codepoints in the table: latin-1, common
     # punctuation etc. must advance half-width like ascii, not like cjk
@@ -232,14 +290,33 @@ def main():
     out.append('};\n\nconst uint16_t *ascii16_glyph(unsigned cp)\n{\n'
                '    if (cp < 0x20 || cp > 0x7E) return 0;\n'
                '    return ascii16[cp - 0x20];\n}\n\n')
+    out.append('/* Single-color folding: emoji hearts and U+2B50 share the\n'
+               '   silhouette of a shipped glyph once color is gone;\n'
+               '   variation selectors fold into the U+00A0 blank (never\n'
+               '   zero-width: all layout advances by font_cp_w16) */\n'
+               'static unsigned cjk_alias(unsigned cp)\n{\n    switch (cp) {\n')
+    for src, dst in sorted(SINGLE_COLOR_ALIASES.items()):
+        out.append('    case 0x%04X: return 0x%04X;\n' % (src, dst))
+    out.append('    default: return cp;\n    }\n}\n\n')
     out.append('const uint16_t *cjk_glyph(unsigned cp)\n{\n'
                '    if (!cjk_glyphs_ready) cjk_glyphs_init();\n'
                '    if (!cjk_glyphs_ok) return 0;\n'
-               '    int lo = 0, hi = CJK_N - 1;\n'
+               '    cp = cjk_alias(cp);\n'
+               '    int lo = 0, hi = CJK_N_LO - 1;\n'
                '    while (lo <= hi) {\n'
                '        int mid = (lo + hi) / 2;\n'
                '        if (cjk_cp[mid] == cp) return cjk_glyphs[mid];\n'
                '        if (cjk_cp[mid] < cp) lo = mid + 1; else hi = mid - 1;\n'
+               '    }\n'
+               '    if (cp > 0xFFFF) {\n'
+               '        lo = 0; hi = CJK_N_HI - 1;\n'
+               '        while (lo <= hi) {\n'
+               '            int mid = (lo + hi) / 2;\n'
+               '            if (cjk_hi_cp[mid] == cp)\n'
+               '                return cjk_glyphs[CJK_N_LO + mid];\n'
+               '            if (cjk_hi_cp[mid] < cp) lo = mid + 1;\n'
+               '            else hi = mid - 1;\n'
+               '        }\n'
                '    }\n'
                '    return 0;\n}\n\n'
                'int cjk_halfwidth(unsigned cp)\n{\n'

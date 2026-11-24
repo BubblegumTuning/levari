@@ -113,6 +113,13 @@ package linux-legacy x86-64 build-rel-linux-legacy-zig levari README.md assets/l
 
 sdl2=${SDL2_DIR:-$root/../sdl2-mingw/cmake}
 [ -f "$sdl2/sdl2-config.cmake" ] || { echo "SDL2-mingw cmake dir not found: $sdl2 (set SDL2_DIR)" >&2; exit 1; }
+# win flagship links the vendored opus core (LV_OPUS_LINK is forced ON on
+# WIN32/APPLE by CMake) and that tree is NOT repo content — the cut must
+# materialize it. fetch_opus.sh is idempotent (stamp-at-pin no-op) and
+# sha-verifies whatever it writes; without it the win configure hard-fails
+# with a message naming this script. Linux/legacy/pi0/era targets never
+# need the tree (they keep the dlopen path or the LV_WIN9X guard).
+tools/fetch_opus.sh
 build build-rel-win -DCMAKE_TOOLCHAIN_FILE="$root/tools/mingw-w64-toolchain.cmake" -DSDL2_DIR="$sdl2" -DLEVAR_TIERS=avx2
 package win x86-64 build-rel-win levari.exe README.md
 

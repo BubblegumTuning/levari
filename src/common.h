@@ -42,7 +42,7 @@ static inline void lv_fmt_time(char *buf, size_t n, long long sec) {
 }
 
 #ifndef LV_VERSION
-#define LV_VERSION "0.3.8"
+#define LV_VERSION "0.3.9"
 #endif
 
 /* Dev-build identity (see the dev-identity block in CMakeLists.txt): the

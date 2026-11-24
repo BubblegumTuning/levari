@@ -47,6 +47,12 @@ runs in-process):
      edge). Fix = upstream libmodplug e74d5d7 backport. Pin: the
      generator's two poison shapes must probe with rc 0, and its benign
      minimal IT must still probe ok.
+  9. module duration class (field-reported 2026-11-24): the probe's MPEG
+     sync scan on module files (0xFF-riddled pattern data fabricates false
+     frame headers) invented bogus durations that outranked the decoder —
+     a 2.5-minute S3M indexed at 0:04. A module signature now blinds the
+     probe; pin: a hand-built deterministic S3M whose fake-frame tail made
+     the pre-fix probe invent 11 must index the decoder's truthful 8.
 
 Usage: python3 test/probe/probecheck.py [build-dir] [old-build-dir]
        (default build dir: ./build)
@@ -306,6 +312,57 @@ try:
     check("valid minimal IT still probes ok",
           r.returncode == 0 and "FAIL open" not in r.stdout and "seek=ok" in r.stdout,
           f"rc={r.returncode} out={r.stdout!r}")
+    # 9. module family duration (field-reported: END.S3M, a 2.5-minute
+    # S3M, indexed at 0:04): tag_probe ran the MPEG sync scan on module
+    # files, whose pattern data is riddled with 0xFF, and the fabricated
+    # frame walk invented bogus seconds that then outranked the decoder
+    # (every consumer trusts a non-zero probe dur). Fix: a module
+    # signature blinds the probe (0 = unknown) so scan falls through to
+    # libmodplug. Fixture: hand-built minimal S3M in the vendored core's
+    # accepted layout (deterministic 8000 ms) + a tail of fake MPEG frames
+    # OUTSIDE every parsed region — the pre-fix binary probes it at 11 and
+    # indexes 11; the fixed binary must index the truthful 8.
+    def s3m_fixture(path, junk_bytes):
+        h = bytearray(0x75)        # header 0x60 + order/pad/ptr + gap + pattern head
+        h[0:17] = b"LVARI TEST MODULE"
+        h[0x14] = 0x10
+        h[0x20] = 1                                    # ordnum (LE)
+        h[0x24] = 1                                    # patnum (LE)
+        h[0x28:0x2C] = bytes([0x20, 0x13, 0x20, 0x13]) # cwtv, version
+        h[0x2C:0x30] = b"SCRM"
+        h[0x30:0x34] = bytes([64, 6, 125, 15])         # globvol speed tempo mastervol
+        for i in range(32):
+            h[0x40 + i] = i if i < 4 else 0xFF
+        h[0x60] = 0                                    # order 0 -> pattern 0
+        h[0x61] = 0xFF                                 # odd-order pad
+        h[0x62] = 0x07                                 # pattern ptr 0x70 >> 4 (LE)
+        h[0x70] = 66                                   # compressed pattern length
+        h[0x72:0x75] = bytes([0x20, 0x3C, 0x01])       # one note cell
+        h = h.ljust(300, b"\0")                        # ReadS3M min-size gate
+        if junk_bytes:
+            fr = (b"\xFF\xFB\x68\xC4" + b"\0" * 356) * (junk_bytes // 360 + 1)
+            h += fr[:junk_bytes]
+        open(path, "wb").write(h)
+
+    home9 = os.path.join(scratch, "mod-home")
+    mod_dir = os.path.join(scratch, "mod-lib")
+    os.makedirs(home9); os.makedirs(mod_dir)
+    s3m_fixture(os.path.join(mod_dir, "fixture.s3m"), 110000)
+    r = run(home9, ["library", "scan", mod_dir])
+    idx9 = os.path.join(home9, ".levari", "index")
+    if not os.path.exists(idx9):
+        idx9 = os.path.join(home9, ".config", "levari", "index")
+    row9 = ""
+    if os.path.exists(idx9):
+        row9 = next((l for l in open(idx9) if "fixture.s3m" in l), "")
+    parts9 = row9.split("\t")
+    dur9 = parts9[4] if len(parts9) >= 5 else ""
+    check("module scan row carries the decoder duration (never the probe's invention)",
+          dur9 == "8", f"row {row9!r}, scan rc={r.returncode} "
+                       "(pre-fix shape: dur 11)")
+    check("module scan row keeps the module title",
+          len(parts9) >= 3 and parts9[2] == "LVARI TEST MODULE", f"row {row9!r}")
+
 finally:
     shutil.rmtree(scratch, ignore_errors=True)
 

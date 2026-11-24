@@ -89,23 +89,28 @@ int main(int argc, char **argv) {
        whole fixture dir — if a fixture file went missing the honest
        reading is 'fixtures changed', not 'the drop engine regressed' */
     {
-        static const char *fx[7] = { "a.wav", "b.wav", "example.ogg",
-                                     "sample.flac", "sample.mp3", "tone.wav", "tone2.wav" };
+        static const char *fx[13] = { "a.wav", "b.wav", "example.ogg",
+                                     "sample.flac", "sample.mp3", "tone.wav", "tone2.wav",
+                                     "opus/sample.opus",
+                                     "decode/sample.ogg", "decode/sample.oga",
+                                     "decode/sample.wav", "decode/sample.mp3",
+                                     "decode/sample.m4a" };
         int all = 1;
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 13; i++) {
             char p[LV_MAX_PATH];
             snprintf(p, sizeof p, "%s/%s", tdir, fx[i]);
             struct stat st;
             if (stat(p, &st) != 0) { all = 0; printf("MISSING fixture %s\n", fx[i]); }
         }
-        chk("fixture set complete (7 audio files)", all, 1);
+        chk("fixture set complete (13 audio files)", all, 1);
     }
     pl_clear(&list);
     drop_add(tdir);
     drop_flush();
-    /* drop_add RECURSES the test dir: 7 root fixtures + the one audio
-       fixture below it (stbseek/seek-window-est.ogg) = 8 */
-    chk("dir drop finds exactly the 8 fixtures", list.count, 8);
+    /* drop_add RECURSES the test dir: 7 root fixtures + the audio fixtures
+       below it (stbseek/seek-window-est.ogg, opus/sample.opus, the five
+       testdecode fixtures) = 14 */
+    chk("dir drop finds exactly the 14 fixtures", list.count, 14);
     chk("dir drop kept example.ogg", has_path("/example.ogg"), 1);
     chk("dir drop skipped pl.m3u", has_path("pl.m3u"), 0);
     chk("dir drop skipped album.cue", has_path("album.cue"), 0);

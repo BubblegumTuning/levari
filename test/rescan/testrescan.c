@@ -4,7 +4,9 @@
    preservation when the probe goes blind, poisoned stored dur clamped to
    unknown (2b), missing file -> rc -1 with the index file byte-identical
    (decision F: index untouched), escaped-path
-   rows replace-not-shadow (backslash filename), headerless legacy indexes
+   rows replace-not-shadow (backslash filename), a module row poisoned by a
+   pre-fix probe repairs through the module-scoped decoder fallback (6b),
+   headerless legacy indexes
    (2026-11-07 GH-line): safe file keeps EVERY entry (two directories, one
    rescan, all unrelated rows survive under a stamped header), ambiguous
    file -> rc -3 with the index byte-identical, full scan still rebuilds.
@@ -54,6 +56,37 @@ static void write_junk(const char *path) {
     FILE *f = fopen(path, "wb");
     unsigned char z[16] = {0};
     fwrite(z, 1, sizeof z, f);
+    fclose(f);
+}
+
+/* hand-built minimal S3M in libmodplug's accepted layout (title 28,
+   SCRM at 0x2C, orders at 0x60, 2-byte pattern pointer in 16-byte units):
+   1 order, 1 pattern of 64 rows, speed 6 tempo 125 — the vendored core
+   measures it at exactly 8000 ms. Title is set, so the row is tagged;
+   the header carries no length, so the probe must stay blind (0) and
+   only the decoder can answer the duration. */
+static void write_s3m(const char *path) {
+    unsigned char h[300];
+    memset(h, 0, sizeof h);
+    memcpy(h, "LVARI TEST MODULE", 17);
+    h[0x14] = 0x10;
+    h[0x20] = 1;                        /* ordnum (LE) */
+    h[0x24] = 1;                        /* patnum (LE) */
+    h[0x28] = 0x20; h[0x29] = 0x13;     /* cwtv 0x1320 */
+    h[0x2A] = 0x20; h[0x2B] = 0x13;     /* version 0x1320 */
+    memcpy(h + 0x2C, "SCRM", 4);
+    h[0x30] = 64;                       /* globalvol */
+    h[0x31] = 6;                        /* speed */
+    h[0x32] = 125;                      /* tempo */
+    h[0x33] = 15;                       /* mastervol */
+    for (int i = 0; i < 32; i++) h[0x40 + i] = (unsigned char)(i < 4 ? i : 0xFF);
+    h[0x60] = 0;                        /* order 0 -> pattern 0 */
+    h[0x61] = 0xFF;                     /* odd-order pad */
+    h[0x62] = 0x07;                     /* pattern pointer 0x70 >> 4 (LE) */
+    h[0x70] = 66;                       /* compressed pattern length */
+    h[0x72] = 0x20; h[0x73] = 0x3C; h[0x74] = 0x01;  /* one note cell */
+    FILE *f = fopen(path, "wb");
+    fwrite(h, 1, sizeof h, f);
     fclose(f);
 }
 
@@ -197,6 +230,44 @@ int main(void) {
     chk("escaped row replaced not shadowed", row_count(idx), after_first);
     slurp(idx, b, sizeof b);
     chk("escaped row carries B2", strstr(b, "B2") != NULL, 1);
+
+    /* 6b) a module row poisoned by a pre-fix probe REPAIRS on rescan:
+       modules are probe-blind by design, so rescan's module-scoped decoder
+       fallback must replace a stored bogus value (a 2.5-minute S3M kept at
+       0:04 was the field-reported bug) — the stored-dur preservation of
+       case 2 must NOT apply to modules. Fixture measures exactly 8000 ms
+       in the vendored core, so the pins are exact. RED-PRE on the pre-fix
+       binary: the first rescan appends dur 0 (probe blind, no fallback)
+       and the poisoned one re-persists 4. */
+    char mod[LV_MAX_PATH];
+    snprintf(mod, sizeof mod, "%s/mod.s3m", mus);
+    write_s3m(mod);
+    chk("rescan module ok", lib_index_rescan(mod, &t, &dur, &notag), 0);
+    chk("module probe is blind, decoder answered", dur, 8);
+    chk("module rescan not certified notag", notag, 0);
+    slurp(idx, b, sizeof b);
+    chk("module row has decoder duration",
+        strstr(b, "\t\tLVARI TEST MODULE\t\t8\t0\n") != NULL, 1);
+    /* inject a legacy bogus 4 into the row (the pre-fix scan shape), the
+       rescan must repair it, not re-persist it */
+    long mlen = slurp(idx, b, sizeof b);
+    char *mrow = strstr(b, "mod.s3m");
+    char *m5 = mrow ? strstr(mrow, "\t8\t0\n") : NULL;
+    if (!m5) { fails++; printf("FAIL poison inject: no \\t8\\t0 row for mod.s3m\n"); }
+    else {
+        size_t pre = (size_t)(m5 - b);
+        FILE *w = fopen(idx, "w");
+        fwrite(b, 1, pre, w);
+        fputs("\t4\t0\n", w);
+        fwrite(m5 + 5, 1, (size_t)mlen - pre - 5, w);
+        fclose(w);
+    }
+    chk("rescan poisoned module ok", lib_index_rescan(mod, &t, &dur, &notag), 0);
+    chk("module poison repaired to decoder duration", dur, 8);
+    slurp(idx, b, sizeof b);
+    chk("index lost the module poison value",
+        strstr(b, "mod.s3m\t\tLVARI TEST MODULE\t\t4\t0\n") == NULL &&
+        strstr(b, "\t\tLVARI TEST MODULE\t\t8\t0\n") != NULL, 1);
 
     /* header marker must survive every rewrite (b6cb2ea) */
     slurp(idx, b, sizeof b);

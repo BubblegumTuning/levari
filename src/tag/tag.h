@@ -37,8 +37,13 @@ void tag_read(const char *path, Tags *t);
    caller's stat, 0 = stat internally); Ogg streams with no length in their
    headers (Opus, Vorbis, ffmpeg's Ogg FLAC) get it from the end-of-stream
    granulepos (one extra tail seek, only when needed). Returns duration in
-   seconds, 0 = unknown (the rest still needs the decoder). */
+   seconds, 0 = unknown (the rest still needs the decoder). Modules are
+   deliberately always 0 = unknown: the MPEG estimate would run on data
+   riddled with 0xFF and invent a bogus length. */
 int tag_probe(const char *path, long long size_hint, Tags *t);
+/* 1 if the file's head carries a module signature (IT/XM/S3M/MOD — the
+   families read_module and the decoder both recognize); 0 otherwise. */
+int tag_is_module_file(const char *path);
 /* SPC/ID666 length field from a >=0x100-byte header buffer; seconds,
    0 = unknown. decode.c reuses it on its slurped copy. */
 int spc_tag_duration(const unsigned char *head, long n);

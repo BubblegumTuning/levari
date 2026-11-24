@@ -513,6 +513,25 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
     Tags t;
     tag_init(&t);
     int dur = tag_probe(rp, st.st_size, &t);
+    if (!dur && tag_is_module_file(rp)) {
+        /* Module-only decoder fallback (the scanner's, scoped): no module
+           header carries a length, so the probe is blind on every module by
+           design and a stored module duration is only ever a value some
+           probe invented before this class was closed (a 2.5-minute S3M
+           indexed at 0:04). Rescan must be able to repair it, else the row
+           stays poisoned forever: scans are additive and load_track only
+           backfills a stored ZERO. Modules cannot widen the documented UI-
+           thread concern: modplug reads its whole (64 MB-capped) image but
+           a module is megabytes, not the mp3 minimp3 would walk. */
+        DecOpts dopts = { .allow_large = cfg.allow_large };
+        Decoder *dec = dec_open(rp, &dopts);
+        if (dec) {
+            long long tot = dec_total_frames(dec);
+            long long s = tot > 0 ? tot / dec_rate(dec) : 0;
+            dur = lv_clamp_dur(s);
+            dec_close(dec);
+        }
+    }
     /* the scanner's notag certification rule (tag-enabled pass): a full
        probe that finds nothing AT ALL certifies the sparse 7th field */
     int notag = !t.title[0] && !t.artist[0] && !t.album[0] && !t.track;

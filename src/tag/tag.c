@@ -1389,20 +1389,45 @@ static void read_riff(FILE *f, Tags *t) {
     }
 }
 
-static void read_module(const unsigned char *h, size_t n, Tags *t) {
+/* Recognize the module families this parser reads. Returns 1 when the head
+   carries a module signature; copies the title only when t is non-NULL.
+   tag_probe uses the flag to keep the MPEG sync scan away from modules:
+   their pattern data is riddled with 0xFF and fabricates false frame
+   headers, so the size/bitrate estimate invents a bogus duration
+   (a multi-minute S3M indexed at 0:04) that then outranks the decoder's
+   truthful length in every caller that trusts a non-zero probe result. */
+static int read_module(const unsigned char *h, size_t n, Tags *t) {
     static const char *modmag[] = { "M.K.", "M!K!", "M&K!", "N4C4", "FLT4", "FLT8",
                                     "4CHN", "6CHN", "8CHN", "16CH", "24CH", "32CH",
                                     "CD81", "OKTA", "FEST" };
-    if (n < 4) return;
-    if (!memcmp(h, "IMPM", 4) && n >= 0x0C + 26)
-        copy_fixed(t->title, sizeof t->title, h + 0x0C, 26);
-    else if (n >= 17 && !memcmp(h, "Extended Module: ", 17) && n >= 0x35 + 20)
-        copy_fixed(t->title, sizeof t->title, h + 0x35, 20);
-    else if (n >= 0x2C + 4 && !memcmp(h + 0x2C, "SCRM", 4))
-        copy_fixed(t->title, sizeof t->title, h, 20);
+    const unsigned char *ttl = NULL;
+    size_t len = 0;
+    if (n < 4) return 0;
+    if (!memcmp(h, "IMPM", 4) && n >= 0x0C + 26) { ttl = h + 0x0C; len = 26; }
+    else if (n >= 17 && !memcmp(h, "Extended Module: ", 17) && n >= 0x35 + 20) { ttl = h + 0x35; len = 20; }
+    else if (n >= 0x2C + 4 && !memcmp(h + 0x2C, "SCRM", 4)) { ttl = h; len = 20; }
     else if (n >= 1084)
         for (size_t i = 0; i < sizeof modmag / sizeof modmag[0]; i++)
-            if (!memcmp(h + 1080, modmag[i], 4)) { copy_fixed(t->title, sizeof t->title, h, 20); break; }
+            if (!memcmp(h + 1080, modmag[i], 4)) { ttl = h; len = 20; break; }
+    if (!ttl) return 0;
+    if (t) copy_fixed(t->title, sizeof t->title, ttl, len);
+    return 1;
+}
+
+/* Module-family signature check for one file (a head read of the ONE size
+   that covers every family read_module recognizes). lib_index_rescan uses
+   it to scope its decoder fallback to modules only: no module header
+   carries a length, so a stored module duration can only be a value some
+   probe invented, and rescan is the user's repair verb for it — while the
+   fallback must never widen to probe-blind MP3s, where dec_open's
+   whole-file walk would stall the UI thread it runs on. */
+int tag_is_module_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char h[1084];
+    size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    return read_module(h, n, NULL);
 }
 
 /* Duration from the first MPEG frame header inside the head buffer:
@@ -1585,7 +1610,12 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
     } else if (n >= 27 && !memcmp(b, "SNES-SPC700 Sound File Data", 27)) {
         dur = read_spc(b, (long)n, t);
     } else {
-        dur = mp3_head_duration(b, n, 0, 0, size_hint, f);
+        /* A module signature blinds the duration on purpose (0 = unknown):
+           every caller then falls through to the decoder, which is the only
+           truthful length source for a format family whose headers carry
+           none. Feeding the MPEG sync scan here invented bogus seconds. */
+        if (!read_module(b, n, NULL))
+            dur = mp3_head_duration(b, n, 0, 0, size_hint, f);
         if (!tags_complete(t)) read_id3v1(f, t);
         if (!t->title[0]) read_module(b, n, t);
     }

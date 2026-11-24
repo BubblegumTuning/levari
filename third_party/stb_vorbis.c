@@ -3396,7 +3396,7 @@ static int vorbis_decode_packet_rest(vorb *f, int *len, Mode *m, int left_start,
 
 // INVERSE MDCT
    CHECK(f);
-   // LEVARI PATCH (PERFORMANCE hunk 1 of 2, 2026-11-21, master-supplied):
+   // LEVARI PATCH (PERFORMANCE hunk 1 of 2, 2026-11-21, field-supplied):
    // inverse_mdct is linear, so an already-zero channel (really_zero_channel,
    // memset immediately above) stays zero — skipping it is bit-identical
    // (PCM-checksum verified on stereo/mono/5.1/near-silence corpus) and
@@ -5461,7 +5461,7 @@ int stb_vorbis_get_frame_short(stb_vorbis *f, int num_c, short **buffer, int num
 static void convert_channels_short_interleaved(int buf_c, short *buffer, int data_c, float **data, int d_offset, int len)
 {
    int i;
-   // LEVARI PATCH (PERFORMANCE hunk 2 of 2, 2026-11-21, master-supplied):
+   // LEVARI PATCH (PERFORMANCE hunk 2 of 2, 2026-11-21, field-supplied):
    // specialize the common 1- and 2-channel equal-layout cases (this is the
    // levari pull-API path, decode.c stb_vorbis_get_samples_short_interleaved).
    // Same float_to_sample as the general loop, bit-identical (PCM-checksum
