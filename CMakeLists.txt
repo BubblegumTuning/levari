@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.3.9 LANGUAGES C)
+project(levari VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -800,6 +800,7 @@ if(LV_TESTS AND NOT CMAKE_CROSSCOMPILING)
     lv_test(testeq        test/eq/testeq.c                   FILTER ui_x_eq)
     lv_test(testoptenc    test/optenc/testoptenc.c           FILTER ui_x_opt)
     lv_test(testoptvhz    test/optvhz/testoptvhz.c           FILTER ui_x_opt)
+    lv_test(testrg        test/rg/testrg.c)
     lv_test(testpldock    test/pldock/testpldock.c           FILTER ui_x_core)
     lv_test(testpldrop    test/pldrop/testpldrop.c           FILTER ui_x_core NO_TEST)
     # pldrop takes the repo test/ dir (its fixtures) as argv[1]

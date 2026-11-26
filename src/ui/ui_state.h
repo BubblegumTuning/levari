@@ -30,11 +30,12 @@
 
 enum {
     B_PLAY, B_PAUSE, B_STOP, B_PREV, B_NEXT, B_OPEN,
-    B_SHUF, B_REPEAT, B_EQ, B_VIS, B_LIST, B_ABA, B_ABB, B_XMAIN, B_SEARCH, B_URL, B_RPT1,
-    PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_SCAN, PB_X, FB_ADDDIR, FB_X, B_URLX, IB_X,
+    B_SHUF, B_REPEAT, B_EQ, B_VIS, B_LIST, B_ABA, B_ABB, B_XMAIN, B_SEARCH, B_URL, B_RPT1, B_AOT,
+    B_MSTOP, B_MPREV, B_MPLAY, B_MNEXT,
+    PB_SHUF, PB_REPEAT, PB_ADD, PB_REM, PB_CLOSE, PB_LIB, PB_SCAN, PB_X, PB_SSCOPE, FB_ADDDIR, FB_X, B_URLX, IB_X,
     EQB_ON, EQB_FLAT, EQB_ROCK, EQB_POP, EQB_JAZZ, EQB_X, EQB_RESET,
     OPTB_SAVE, OPTB_CLOSE, OPTB_TPL, OPTB_TEQ, OPTB_TVIS, OPTB_TSRCH, OPTB_TSHUF,
-    OPTB_TFADE, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC, OPTB_VHZ,
+    OPTB_TFADE, OPTB_TAOT, OPTB_TMINI, OPTB_TLARGE, OPTB_TFPS, OPTB_TENC, OPTB_VHZ, OPTB_RG,
     OPTB_SCAN, OPTB_CLEAR, OPTB_CHK, OPTB_VERIFY, OPTB_X, OPTB_TABB, OPTB_TABA, OPTB_TABU,
     B_NONE
 };
@@ -47,6 +48,10 @@ enum { OPTF_LIBDIRS, OPTF_LIBIDX, OPTF_LIBAV, OPTF_BACKEND, OPTF_DEVICE, OPTF_SO
    only ever fills while LV_URL_ENABLED compiles the URL window in */
 #define SNAP_NSLOT 5
 #define SNAP_URL 4
+
+/* mini layout geometry (shared: ui.c draws the bar, search.c docks under it) */
+#define MINI_W 320
+#define MINI_H 22
 
 typedef struct {
     Player *pl;
@@ -100,6 +105,7 @@ typedef struct {
     char opt_field[OPTF_N][LV_MAX_PATH];
     int opt_pl, opt_eq, opt_vis, opt_srch, opt_shuf, opt_fade, opt_large, opt_f10;
     int opt_vhz;                /* ADV cycle button copy: 10/24/30/60 (cfg.vis_hz) */
+    int opt_rg;                 /* ADV cycle button copy: 0 off / 1 track / 2 album (cfg.replaygain) */
     int opt_enc;                 /* LEGACY button cycle: 0 auto, 1 latin1, 2 cp1251, 3 utf8, 4 shiftjis (cfg value = opt_enc - 1) */
     int opt_ff;                  /* ADV status line: ffmpeg (libav*) detected
                                     on the system — probed once at ui_opt_open
@@ -156,6 +162,14 @@ typedef struct {
     int pl_w, pl_h;        /* current playlist window size */
     int pl_docked;         /* playlist attached under main window */
     int vis_on;
+    int aot;               /* always-on-top live state: shared truth of the
+                              main-window AoT button and the options
+                              checkbox; startup seeds from cfg.ui_aot,
+                              only SAVE persists an override */
+    int mini;              /* mini layout live state (same persist shape as
+                              aot: menu item + options checkbox toggle it
+                              live, only SAVE persists) */
+    Uint32 mini_dbl;       /* last scroller click tick (double-click -> viz) */
     char title[512];
     int scroll_off;
     int marquee;            /* 1 when draw_main took the scrolling-title path */
@@ -202,6 +216,8 @@ Rect ui_close_rect(int win_w);
 void ui_draw_x(SDL_Surface *s, const Rect *r, int pressed);
 Uint32 ui_col(SDL_Surface *s, int r, int g, int b);
 void ui_action(int id);
+void ui_set_mini(int on);  /* live mini-mode switch (menu item + options
+                              checkbox; only opt_save persists cfg.ui_mini) */
 void ui_msg(const char *text);
 int ui_ffprobe_info(char *ver, size_t vn, char *dir, size_t dn);
 void ui_pl_dock_pos(int *x, int *y);
@@ -221,6 +237,12 @@ int ui_pl_key(SDL_Event *e);
 void ui_pl_sel_reset(void);
 int ui_pl_sel_has(int idx);
 int ui_pl_multi_grow(int need);
+/* merged mini search (ui_pl.c): the playlist band hosts the query field;
+   ui.c routes TEXTINPUT/FOCUS to these while the field holds the caret */
+int ui_pl_search_focused(void);
+void ui_pl_text(const char *text);
+void ui_pl_search_reset(void);   /* mini enter/exit: query always starts clean */
+void ui_pl_search_focus(void);   /* Ctrl+F in mini */
 void ui_draw_eq(void);
 void ui_handle_eq_mouse(SDL_Event *e);
 void ui_file_open(void);

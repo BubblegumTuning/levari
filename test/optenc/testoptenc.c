@@ -93,6 +93,42 @@ int main(void) {
     char buf[8192]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
     chk("config file carries the value", strstr(buf, "tag.legacy_encoding = cp1251") != NULL, 1);
 
+    /* AOT checkbox (BASIC page, under UI PL): the click flips the LIVE
+       ui.aot (wmain is NULL here — SDL_SetWindowAlwaysOnTop rejects a
+       null window by error, never crashes), opt_save persists it, and a
+       reload proves the round-trip. */
+    ui.opt_tab = 0;
+    ui.aot = 0;
+    Rect ra = opt_aot_rect();
+    click(ra.x + ra.w / 2, ra.y + ra.h / 2);
+    chk("AOT click flips live state", ui.aot, 1);
+    opt_save();
+    cfg_load();
+    chk("opt_save persisted AOT", cfg.ui_aot, 1);
+    f = fopen(path, "r");
+    n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+    chk("config file carries ui.always_on_top = on",
+        strstr(buf, "ui.always_on_top = on") != NULL, 1);
+    ui.opt_tab = 1;  /* back to the ADV tab for the close-without-save block */
+
+    /* MINI checkbox (BASIC page, beside AOT): the click flips the live
+       mode via ui_set_mini (wmain NULL: window ops guarded, search opens
+       headless under the dummy driver), opt_save persists the startup
+       default. */
+    ui.opt_tab = 0;
+    ui.mini = 0;
+    Rect rm = opt_mini_rect();
+    click(rm.x + rm.w / 2, rm.y + rm.h / 2);
+    chk("MINI click flips live state", ui.mini, 1);
+    opt_save();
+    cfg_load();
+    chk("opt_save persisted MINI", cfg.ui_mini, 1);
+    f = fopen(path, "r");
+    n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+    chk("config file carries ui.mini = on",
+        strstr(buf, "ui.mini = on") != NULL, 1);
+    ui.opt_tab = 1;
+
     /* close WITHOUT save: cfg is cp1251 (just persisted); cycle live to utf8,
        then ui_opt_close must roll tag.c's live default back to cfg (cp1251) so
        the button re-read on next open and the decoder never disagree. */

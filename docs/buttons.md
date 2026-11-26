@@ -33,6 +33,7 @@ hides that window (its state is kept).
 | `RPT1` | Toggle repeat-one mode (green = on): the current track loops endlessly. `NEXT`/`PREV` still advance to another track (shuffle-aware) and the loop follows it. Mutually exclusive with `REPEAT`. |
 | `A` | Mark **A**: set the A–B repeat start point at the current playback position (green while set). |
 | `B` | Mark **B**: set the repeat end point — only takes effect if `A` is set and playback is already past it. Playback then loops A→B. Clicking `B` a second time clears both points. |
+| `AoT` | Toggle always-on-top for the main window (green = on): the window stays above other applications. The click applies immediately but is never saved; the saved default comes from the options window's `AOT` checkbox (which SAVE persists). |
 
 ### Sliders
 
@@ -177,9 +178,44 @@ overwrites it directly, and the browser closes. Overwriting is silent
 playlist refuses with a red title-strip message. `.pls` is loaded but
 never written — `.m3u` with `#EXTINF` is the save format.
 
+## Mini mode
+
+Entered from the right-click menu (`MINI MODE`) or the options `MINI`
+checkbox; the whole 320x22 bar right-clicks to its menu (`OPTIONS...`,
+`EXIT MINI`, `PLAYLIST`). The bar is one line: name, transport
+symbols, scroller box, time box, close X. Pressing any free spot —
+including the `levari` name — drags the bar, and while the playlist is
+docked the bar carries it along. The bar's controls:
+
+| Control | Action |
+|---|---|
+| `levari` | Static name label. |
+| symbol buttons | BACK, PLAY/PAUSE, STOP, NEXT (left to right). The play button shows the action its click performs (pause bars + green while playing): stopped starts, playing pauses, paused resumes. |
+| scroller box | Title marquee (small font); **double-click** switches it to the spectrum band and back (same state as the full-mode `VIS`). |
+| time box | Green elapsed time, right end, left of the `X`. Fits `99:59+`: minutes run past 59, elapsed at or past 100:00 saturates to `99:59+`. |
+| `X` | Quit (as everywhere). |
+
+In mini the playlist is 320 wide with small-font rows, and its title
+band hosts the **merged search field**: a black edit box (starting at the
+list text's left margin, leaving a grab rail at the band's left), the
+`PL`/`LIB` scope button (same meanings as the search window's), and the
+close `X`. Besides the title band, the window drags from the button row's
+empty right part (past `SCAN`) and the list's left margin; the footer
+strip stays dead. Focus enters the box by click (or `Ctrl+F`); typing
+turns the list into the result list immediately — as many results as fit,
+single click or `Enter` activates (jump, like the search window), `Esc`
+clears and reverts, clearing the text reverts. The footer stays the
+playlist total. The separate search window is full-mode-only: entering
+mini closes it. Seek, volume, EQ, shuffle, repeat, A–B and URL are absent
+in mini; exit restores them.
+
 ## Options window
 
-Opened from the main window title-bar right-click (`OPTIONS...`). The
+Opened from the main window title-bar right-click (`OPTIONS...`). In mini
+mode the right-click menu is on the whole bar and additionally offers
+`EXIT MINI` and a `PLAYLIST` toggle; the full-mode menu gained
+`MINI MODE`. The mini bar's own controls are documented under Mini below.
+The
 `BASIC` / `ADV` / `ABOUT` tab buttons (small tabs in the title bar, right
 of the `OPTIONS` label) switch the page; `SAVE` writes
 all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
@@ -195,6 +231,7 @@ all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
 | `CLEAR` | Delete the library index. `SCAN` rebuilds it (tags re-read). Hovering shows the summary. |
 | `VERIFY` | One existence pass over the whole library index: every row's path is checked on disk; rows whose file is gone (ENOENT/ENOTDIR — e.g. orphans left by a NAS path change) are dropped, rows the filesystem merely cannot answer for right now (offline share, I/O error) stay. Dropped rows are banked verbatim to `<index>.dropped` (overwritten each run) before the index is rewritten, so a recovery is one copy away. Runs in the background (button reads `BUSY`, SCAN/CLEAR refuse meanwhile — one index writer at a time); the result line reports `dropped N (M kept, K unreachable)`. An index that predates the v2 format and cannot be migrated without guessing refuses untouched (`index: run a full scan`). Hovering shows the same summary. |
 | `STARTUP` toggles `UI PL` `UI EQ` `UI VIS` `UI SRCH` `SHUF` `FADE` | Startup window visibility; `SHUF` keeps the shuffle state across sessions; `FADE` fades volume out on stop (on by default). |
+| `AOT` (under `UI PL`) | Always-on-top for the main window. Toggling it applies immediately; `SAVE` persists the current state (the same state the main-window `AoT` button flips without saving). Config key `ui.always_on_top`. |
 
 ### ADV page
 
@@ -204,6 +241,7 @@ all fields and toggles to the config, `CLOSE`/`Esc` hides the window.
 | `10FPS` | Keep repainting the main window at 10 fps whenever the title is long enough to marquee (green = on). Off by default: the marquee only scrolls while playing. On, it also scrolls while paused, stopped, or unfocused — at the cost of a steady 10 fps repaint. Toggling applies immediately (still press `SAVE` to persist). |
 | `LEGACY` | 5-state **cycle button** (not a checkbox): the label shows the current setting — `AUTO`, `LATIN-1`, `CP1251`, `UTF-8` or `SHIFT-JIS`; each click cycles to the next. It forces the codepage for tag fields that carry no declared encoding (id3v2 `enc=0`/invalid marker, ID3v1, RIFF INFO): `AUTO` (default) decides per tag block from byte evidence (see `tag.legacy_encoding` in usage.md), the four forced values decode every such field through that reader. Applying takes effect immediately for future tag reads (no restart); rows already in the library index keep their old values — press `CLEAR` then `SCAN` to re-read. Press `SAVE` to persist. Hovering the button shows the same note. |
 | `10HZ` (VIZ) | 4-state **cycle button** (not a checkbox) beside "VIZ: spectrum bars refresh": the label shows the current rate — `10HZ` (default), `24HZ`, `30HZ` or `60HZ`; each click cycles to the next. Sets the visualizer band's refresh rate in the main window (config `ui.vis_hz`): higher is smoother but costs proportionally more CPU — the floor boxes ship 10. The bar fall-off and the peak decay are time-normalized, so the motion looks identical at every rate. A non-default value colors cyan. Applies on `SAVE` (live thereafter, no restart). |
+| `RG` | 3-state **cycle button** (not a checkbox) beside "RG: replaygain playback": the label shows the current mode — `OFF` (default), `TRACK` or `ALBUM`; each click cycles to the next. Loudness normalization from ReplayGain tags (config `audio.replaygain`): `TRACK` applies the per-file gain, `ALBUM` the per-album gain (falling back to the track gain when a file carries none). Tags are read at each track start from Vorbis comments (FLAC/Ogg), ID3v2 TXXX, ID3v2.4 RVA2 and APEv2 items; files without ReplayGain tags play untouched, and the applied gain is clamped to [-20, +12] dB. A non-default value colors cyan. Applies on `SAVE` (live thereafter, no restart; takes effect from the next track start). |
 | ffmpeg status | Static line at the page bottom: green `ffmpeg: detected`, or red `ffmpeg: not found - streaming unavailable` — whether the libav* shared libraries are loadable at runtime (network streams and aac/m4a/wma need them). Re-probed every time the window opens; installing ffmpeg or pointing `libav.dir` at it applies after a restart. |
 
 ### ABOUT page

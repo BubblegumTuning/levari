@@ -20,6 +20,12 @@ typedef struct {
     int  fade_stop;        /* player.fade_stop: 0 off, 1 on; default on */
     int  allow_large;      /* decode.allow_large: 0 off (default), 1 on =
                               accept files over the 256 MB ingest cap */
+    int  ui_aot;           /* ui.always_on_top: 0 off (default), 1 on =
+                              the main window starts above other windows;
+                              the AoT button overrides live, unpersisted */
+    int  ui_mini;          /* ui.mini: 0 off (default), 1 on = the mini
+                              layout (320x240-screen target: slim main bar,
+                              playlist, 2-result search) */
     int  ui_always10;      /* ui.always_10fps: 0 off (default), 1 on = keep
                               repainting the main window at 10 fps whenever
                               a title is long enough to marquee, so it keeps
@@ -27,6 +33,10 @@ typedef struct {
     int  vis_hz;           /* ui.vis_hz: visualizer band refresh — one of
                               10 (default) / 24 / 30 / 60; anything else in
                               the config file falls back to 10 */
+    int  replaygain;       /* audio.replaygain: 0 off (default), 1 track,
+                              2 album — playback gain from RG tags, read by
+                              the player at each track load and stored live
+                              by the options RG cycle button */
     int  tag_legacy_enc;   /* tag.legacy_encoding: LV_ENC_* from tag.h —
                               -1 auto (default, per-block evidence),
                               0 latin-1, 1 cp1251, 2 utf-8 */

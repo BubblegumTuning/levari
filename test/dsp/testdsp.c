@@ -262,6 +262,41 @@ int main(void) {
         }
         chk("3-channel input clamps to stereo (DC preserved)", dcok && got > 0);
     }
+    /* ---- ReplayGain gain stage (rg_q_for_db / rg_scale) ---- */
+    chk("rg unity q is exactly 16384", rg_q_for_db(0.0f) == 16384);
+    int32_t q835 = rg_q_for_db(-8.35f);
+    chk("rg -8.35 dB q within 1 of 6265", q835 >= 6264 && q835 <= 6266);
+    chk("rg clamp high equals +12 dB", rg_q_for_db(30.0f) == rg_q_for_db(12.0f));
+    chk("rg clamp low equals -20 dB", rg_q_for_db(-30.0f) == rg_q_for_db(-20.0f));
+    {   /* rg_scale vs float reference: the house <=2 LSB convention */
+        int16_t buf[256], ref[256];
+        for (int i = 0; i < 256; i++) buf[i] = ref[i] = (int16_t)(i * 511 - 65000);
+        int32_t q = rg_q_for_db(-6.02f);
+        rg_scale(q, buf, 256);
+        float g = (float)pow(10.0, -6.02 / 20.0);
+        int worst = 0;
+        for (int i = 0; i < 256; i++) {
+            int r = (int)(ref[i] * g);
+            if (r > 32767) r = 32767;
+            if (r < -32768) r = -32768;
+            int d = buf[i] - r;
+            if (d < 0) d = -d;
+            if (d > worst) worst = d;
+        }
+        chk("rg_scale within 2 LSB of the float reference", worst <= 2);
+        /* saturation: full-scale through a boost clamps, never wraps */
+        int16_t hot[4] = { 32767, -32768, 30000, -30000 };
+        rg_scale(rg_q_for_db(12.0f), hot, 4);
+        chk("rg_scale saturates at both ends",
+            hot[0] == 32767 && hot[1] == -32768 && hot[2] == 32767 && hot[3] == -32768);
+        /* unity is a no-op */
+        int16_t same[4] = { 1, -2, 300, -400 };
+        int16_t keep[4] = { 1, -2, 300, -400 };
+        rg_scale(16384, same, 4);
+        chk("rg_scale unity leaves the buffer untouched",
+            !memcmp(same, keep, sizeof same));
+    }
+
     printf("%s: %d failure(s)\n", fails ? "FAILURES" : "ALL PASS", fails);
     return fails != 0;
 }

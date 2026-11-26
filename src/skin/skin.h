@@ -19,7 +19,7 @@ extern const Rect R_INFO;
 /* row 3: volume */
 extern const Rect R_VOL;
 /* row 4: left/right balance + EQ + playlist buttons */
-extern const Rect R_PAN, R_EQ, R_LIST, R_URL;
+extern const Rect R_PAN, R_EQ, R_LIST, R_URL, R_AOT;
 /* row 5: timeline slider, on its own row below the display */
 extern const Rect R_SEEK;
 /* row 6: prev play pause stop next + open file/folder */
@@ -46,9 +46,12 @@ int  font_w(const char *str);
 void font_puts16(SDL_Surface *s, int x, int y, const char *str, Uint32 color);
 void font_putcp16_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, int cx0, int cx1);
 int  font_cp_w16(unsigned cp);
+int  font_cp_w(unsigned cp);
+void font_putcp_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, int cx0, int cx1);
 int  font_w16(const char *str);
 int  font_utf8_next(const char *s, unsigned *cp);
 int  font_fit(const char *s, int maxw);
+int  font_fit_small(const char *s, int maxw);
 /* start of the trailing suffix that fits; == s when all of s fits */
 const char *font_fit_tail(const char *s, int maxw);
 /* double-size (10x14) variant for the play-time box */

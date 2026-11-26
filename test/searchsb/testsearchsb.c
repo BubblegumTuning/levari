@@ -136,16 +136,16 @@ int main(void) {
         int qx = qb.x + qb.w / 2, qy = qb.y + qb.h / 2;
 
         /* invisible control = dead control: PL scope gates the mouse too */
-        scope = 0; pressed = SB_NONE;
+        scope = 0; pressed = SCHB_NONE;
         press(qx, qy);
-        chk("queue dead in PL scope", pressed, SB_NONE);
+        chk("queue dead in PL scope", pressed, SCHB_NONE);
         up(qx, qy);
         chk("PL-scope click queues nothing", fpl.count, 0);
 
         /* LIB scope: down arms, up appends the BEST match */
         scope = 1;
         press(qx, qy);
-        chk("queue arms in LIB scope", pressed, SB_QUEUE);
+        chk("queue arms in LIB scope", pressed, SCHB_QUEUE);
         up(qx, qy);
         chk("up queues best match", fpl.count, 1);
         chk("queued path = res[0]", strcmp(fpl.items[0].path, "/tmp/qq.mp3") == 0, 1);

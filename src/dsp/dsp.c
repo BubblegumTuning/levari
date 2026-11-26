@@ -194,6 +194,26 @@ int eq_enabled(EQ *e) {
     return on;
 }
 
+/* ---------- ReplayGain gain stage ---------- */
+
+int32_t rg_q_for_db(float db) {
+    /* clamp to the preamp range: -20 dB -> q 1638, +12 dB -> q 65251,
+       both inside the int32 product ceiling (see dsp.h) */
+    if (db < -20.0f) db = -20.0f;
+    if (db > 12.0f) db = 12.0f;
+    return (int32_t)(pow(10.0, db / 20.0) * 16384.0 + 0.5);
+}
+
+void rg_scale(int32_t q, int16_t *buf, int n) {
+    if (q == 16384) return;
+    for (int i = 0; i < n; i++) {
+        int32_t v = ((int32_t)buf[i] * q + 8192) >> 14;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        buf[i] = (int16_t)v;
+    }
+}
+
 /* ---------- WSOLA speed control ---------- */
 
 void ws_init(WS *w, double speed) {

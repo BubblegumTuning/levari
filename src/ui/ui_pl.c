@@ -6,6 +6,9 @@ static const Btn PL_BTNS[] = {
     {PB_SHUF, &P_SHUF}, {PB_REPEAT, &P_REPEAT}, {PB_ADD, &P_ADD},
     {PB_REM, &P_REM}, {PB_CLOSE, &P_CLOSE}, {PB_LIB, &P_LIB}, {PB_SCAN, &P_SCAN},
 };
+/* row line pitch: full rides the 16px font (16+1 leading), mini the
+   small 5x7 font like the main window (7+2) */
+static int pl_lh(void) { return ui.mini ? 9 : 17; }
 /* ---- playlist right-click edit menu (D1: menu, not new PL_BTNS — chrome
    space is precious and Winamp-authentic playlists edit through the list
    menu). Two columns of flat items fit the default 116px window; 5x7
@@ -43,6 +46,120 @@ static void pl_layout(Rect *text, Rect *scroll) {
     text->w = ui.pl_w - 24; text->h = ui.pl_h - 40 - 12;
     scroll->x = ui.pl_w - 8; scroll->y = 40;
     scroll->w = 8; scroll->h = text->h;
+}
+
+/* ---- merged mini search (design ruling 2026-11-25): the playlist window hosts
+   a query field in its title band; typing turns the list into the result
+   list, clearing reverts to the playlist. Mini-only — full mode keeps the
+   separate search window. The matcher + result set live in search.c
+   (search_engine_*): only one host is ever live, entering mini closes the
+   window. The '+' queue action is deliberately absent here: typing '+'
+   must reach the query, and the footer stays the playlist total. ---- */
+static char pl_sq[512];
+static TField pl_qtf = { pl_sq, sizeof pl_sq, 0, 0 };
+static int pl_scope;                /* 0 = playlist, 1 = library (band button) */
+static int pl_ssel, pl_sscroll;     /* result view — host state, like the
+                                       search window's own sel/scroll */
+static int pl_sfocus;               /* 1 while the band field holds the caret */
+
+/* band geometry: edit box left (inset 14 to match the list text's left
+   edge, leaving a grab rail at the band's left for the window itself),
+   scope button right of it, X stays ui_close_rect(pl_w); everything sits
+   inside the 22px title band */
+static Rect plm_edit_rect(void)  { Rect r = { 14, 2, ui.pl_w - 88, 18 }; return r; }
+static Rect plm_scope_rect(void) { Rect r = { ui.pl_w - 72, 2, 50, 18 }; return r; }
+
+static int pl_search_active(void) { return ui.mini && pl_sq[0]; }
+
+static void pl_search_run(void) {
+    search_engine_run(pl_sq, pl_scope);
+    pl_ssel = 0; pl_sscroll = 0;
+}
+
+/* keep the selected result in view (the playlist's just-enough rule) */
+static void pl_search_keep(void) {
+    Rect ptext, pscroll;
+    pl_layout(&ptext, &pscroll);
+    int lines = ptext.h / pl_lh();
+    if (pl_ssel < pl_sscroll) pl_sscroll = pl_ssel;
+    if (pl_ssel >= pl_sscroll + lines) pl_sscroll = pl_ssel - lines + 1;
+}
+
+/* keys while the band field holds the caret: the field owns EVERYTHING
+   (the URL window's rule) — printable keys arrive as TEXTINPUT, and a
+   printable KEYDOWN must never fall through to the global hotkeys */
+static int pl_search_key(SDL_Event *e) {
+    int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
+    switch (e->key.keysym.sym) {
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        if (search_engine_count() > 0) search_engine_jump(pl_ssel);
+        return 1;
+    case SDLK_ESCAPE:
+        if (ui.pl_menu) { ui.pl_menu = 0; return 1; }
+        if (pl_sq[0]) {          /* clear + revert, the field keeps focus */
+            pl_sq[0] = 0;
+            pl_qtf.caret = 0; pl_qtf.selall = 0;
+            pl_search_run();
+        } else
+            pl_sfocus = 0;       /* empty: Esc steps the caret out */
+        return 1;
+    case SDLK_UP:
+        if (pl_ssel > 0) { pl_ssel--; pl_search_keep(); }
+        return 1;
+    case SDLK_DOWN:
+        if (pl_ssel < search_engine_count() - 1) { pl_ssel++; pl_search_keep(); }
+        return 1;
+    default: {
+        /* the one shared edit switch (textedit.c): arrows, Home/End,
+           Backspace/Delete, ctrl-a/c/x/v — paste rides tf_paste's
+           sanitizer exactly like the search window's query */
+        int changed = tf_handle_key(&pl_qtf, e->key.keysym.sym, ctrl);
+        if (changed > 0) pl_search_run();
+        return 1;
+    }
+    }
+}
+
+/* results shown, caret elsewhere: the visible list IS the results, so
+   the navigation keys ride them; every other key falls through to the
+   playlist/global shortcuts (design ruling: printable keys stay with pl_key) */
+static int pl_result_key(SDL_Event *e) {
+    int n = search_engine_count();
+    Rect ptext, pscroll;
+    pl_layout(&ptext, &pscroll);
+    int lines = ptext.h / pl_lh();
+    switch (e->key.keysym.sym) {
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        if (n > 0) search_engine_jump(pl_ssel);
+        return 1;
+    case SDLK_UP:
+        if (pl_ssel > 0) { pl_ssel--; pl_search_keep(); }
+        return 1;
+    case SDLK_DOWN:
+        if (pl_ssel < n - 1) { pl_ssel++; pl_search_keep(); }
+        return 1;
+    case SDLK_HOME:
+        if (n > 0) { pl_ssel = 0; pl_sscroll = 0; }
+        return 1;
+    case SDLK_END:
+        if (n > 0) { pl_ssel = n - 1; pl_search_keep(); }
+        return 1;
+    case SDLK_PAGEUP:
+    case SDLK_PAGEDOWN: {
+        int step = lines > 1 ? lines - 1 : 1;
+        if (e->key.keysym.sym == SDLK_PAGEDOWN) pl_sscroll += step;
+        else pl_sscroll -= step;
+        int maxs = n - lines;
+        if (maxs < 0) maxs = 0;
+        if (pl_sscroll < 0) pl_sscroll = 0;
+        if (pl_sscroll > maxs) pl_sscroll = maxs;
+        return 1;
+    }
+    default:
+        return 0;
+    }
 }
 
 /* ---- playlist multi-selection -------------------------------------------
@@ -147,9 +264,66 @@ void ui_draw_pl(void) {
         font_puts(s, b->r->x + (b->r->w - font_w(lbl)) / 2, b->r->y + 3, lbl, c);
     }
 
-    /* track list: as many 17px lines as the window height allows
-       (16px CJK glyphs + 1px leading) */
-    int lines = ptext.h / 17;
+    if (ui.mini) {
+        /* the merged search field + scope button, in the title band
+           (black box + edge like the search window's edit; the border
+           lights up while the field holds the caret) */
+        Rect ed = plm_edit_rect(), sc = plm_scope_rect();
+        int win_focused = ui.app_focused && ui.wpl &&
+                          ui.focus_wid == SDL_GetWindowID(ui.wpl);
+        SDL_Rect b = { ed.x, ed.y, ed.w, ed.h };
+        SDL_FillRect(s, &b, ui_col(s, 0, 0, 0));
+        SDL_Rect t1 = {ed.x, ed.y, ed.w, 1}, t2 = {ed.x, ed.y + ed.h - 1, ed.w, 1};
+        SDL_Rect t3 = {ed.x, ed.y, 1, ed.h}, t4 = {ed.x + ed.w - 1, ed.y, 1, ed.h};
+        Uint32 edge = (pl_sfocus && win_focused) ? ui_col(s, 0, 224, 255)
+                                                 : ui_col(s, 90, 90, 90);
+        SDL_FillRect(s, &t1, edge); SDL_FillRect(s, &t2, edge);
+        SDL_FillRect(s, &t3, edge); SDL_FillRect(s, &t4, edge);
+        ui_draw_field_text(s, ed, pl_sq, &pl_qtf, pl_sfocus && win_focused,
+                           (SDL_GetTicks() / 500) % 2 == 0);
+        skin_button(s, &sc, ui.pressed == PB_SSCOPE, 0);
+        const char *slbl = pl_scope ? "LIB" : "PL";
+        font_puts(s, sc.x + (sc.w - font_w(slbl)) / 2, sc.y + 3, slbl,
+                  pl_scope ? ui_col(s, 0, 255, 0) : ui_col(s, 220, 220, 220));
+    }
+
+    if (pl_search_active()) {
+        /* the list IS the results: as many small-font rows as fit (no
+           cap), colors mirror the search window (library-only rows ride
+           the bluish tint, the selected result is green) */
+        int n = search_engine_count();
+        int lh = pl_lh();
+        int lines = ptext.h / lh;
+        if (pl_sscroll > n - lines && n >= lines) pl_sscroll = n - lines;
+        if (pl_sscroll < 0) pl_sscroll = 0;
+        for (int i = 0; i < lines; i++) {
+            int idx = pl_sscroll + i;
+            if (idx >= n) break;
+            char line[512];
+            lv_strlcpy(line, search_engine_disp(idx), sizeof line);
+            int fit = font_fit_small(line, ptext.w - 4);
+            if ((int)strlen(line) > fit) line[fit] = 0;
+            Uint32 c = search_engine_pl_idx(idx) >= 0
+                           ? ui_col(s, 170, 170, 170)
+                           : ui_col(s, 130, 130, 170);
+            if (idx == pl_ssel) c = ui_col(s, 0, 255, 0);
+            font_puts(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
+        }
+        if (n > lines) {
+            int th = pscroll.h * lines / n;
+            if (th < 8) th = 8;
+            int ty = pscroll.y + (pscroll.h - th) * pl_sscroll / (n - lines);
+            SDL_Rect r = {pscroll.x + 1, ty, pscroll.w - 2, th};
+            SDL_FillRect(s, &r, ui_col(s, 110, 110, 110));
+        }
+        if (!n)
+            font_puts(s, ptext.x + 2, ptext.y + 1, "(no matches)",
+                      ui_col(s, 150, 150, 150));
+    } else {
+    /* track list: as many lines as the window height allows (full: 17px
+       lines of the 16px font; mini: 9px lines of the small font) */
+    int lh = pl_lh();
+    int lines = ptext.h / lh;
     /* keep the playing track in view: when cur moves (next/prev, shuffle,
        search activation) scroll just enough to show it */
     if (p->cur != ui.pl_cur) {
@@ -174,12 +348,14 @@ void ui_draw_pl(void) {
         if (t->duration) snprintf(line, sizeof line, "%02d. %s [%d:%02d]", idx + 1, name, t->duration / 60, t->duration % 60);
         else snprintf(line, sizeof line, "%02d. %s", idx + 1, name);
         /* truncate to fit, without splitting UTF-8 sequences */
-        int fit = font_fit(line, ptext.w - 4);
+        int fit = ui.mini ? font_fit_small(line, ptext.w - 4)
+                          : font_fit(line, ptext.w - 4);
         if ((int)strlen(line) > fit) line[fit] = 0;
         Uint32 c = ui_col(s, 170, 170, 170);
         if (idx == p->cur) c = ui_col(s, 0, 255, 0);
         else if (ui.pl_selall || ui_pl_sel_has(idx)) c = ui_col(s, 255, 255, 255);
-        font_puts16(s, ptext.x + 2, ptext.y + 1 + i * 17, line, c);
+        if (ui.mini) font_puts(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
+        else font_puts16(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
     }
 
     /* scrollbar thumb */
@@ -194,11 +370,12 @@ void ui_draw_pl(void) {
     /* row-drag (12): drop-index highlight — a green hairline at the gap
        the block will land at, clamped to the visible rows */
     if (ui.drag == 12 && ui.pl_drop >= 0) {
-        int dy = ptext.y + (ui.pl_drop - ui.pl_scroll) * 17;
+        int dy = ptext.y + (ui.pl_drop - ui.pl_scroll) * lh;
         if (dy < ptext.y) dy = ptext.y;
-        if (dy > ptext.y + lines * 17 - 1) dy = ptext.y + lines * 17 - 1;
+        if (dy > ptext.y + lines * lh - 1) dy = ptext.y + lines * lh - 1;
         SDL_Rect r = {ptext.x, dy, ptext.w, 1};
         SDL_FillRect(s, &r, ui_col(s, 0, 255, 0));
+    }
     }
 
     /* totals, pinned to the bottom edge (fmt_pl_total saturates at
@@ -439,7 +616,7 @@ void ui_handle_pl_mouse(SDL_Event *e) {
     int x = e->motion.x, y = e->motion.y;
     Rect ptext, pscroll;
     pl_layout(&ptext, &pscroll);
-    int lines = ptext.h / 17;
+    int lines = ptext.h / pl_lh();
     if (e->type == SDL_MOUSEBUTTONDOWN) {
         /* any press ends the previous press cycle: a lost release (the
            event loop clears a latched drag on a button-less motion) must
@@ -461,6 +638,8 @@ void ui_handle_pl_mouse(SDL_Event *e) {
         return;
     }
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
+        if (ui.mini) pl_sfocus = 0;   /* a click outside the box unfocuses
+                                         it (the query text persists) */
         Rect xc = ui_close_rect(ui.pl_w);
         if (ui_in_rect(&xc, x, y)) { ui.pressed = PB_X; return; }
         if (x >= ui.pl_w - 12 && y >= ui.pl_h - 12) {
@@ -469,10 +648,70 @@ void ui_handle_pl_mouse(SDL_Event *e) {
             ui.drag_wx = ui.pl_w; ui.drag_wy = ui.pl_h;
             return;
         }
+        if (ui.mini) {
+            Rect scb = plm_scope_rect();
+            if (ui_in_rect(&scb, x, y)) { ui.pressed = PB_SSCOPE; return; }
+            Rect ed = plm_edit_rect();
+            if (ui_in_rect(&ed, x, y)) {
+                pl_sfocus = 1;
+                pl_qtf.selall = 0;
+                /* place the caret at the codepoint boundary nearest the
+                   click, hit-testing the visible caret-anchored slice
+                   (the search window's shape, on the 16px grid) */
+                int av = ed.w - 12;
+                int qlen = (int)strlen(pl_sq);
+                if (pl_qtf.caret < 0 || pl_qtf.caret > qlen) pl_qtf.caret = qlen;
+                char pre[512];
+                memcpy(pre, pl_sq, (size_t)pl_qtf.caret);
+                pre[pl_qtf.caret] = 0;
+                const char *st = font_fit_tail(pre, av);
+                int off = (int)(st - pre);
+                int room = av - font_w16(st);
+                int extra = room > 0 ? font_fit(pl_sq + pl_qtf.caret, room) : 0;
+                const char *end = pl_sq + off + (pl_qtf.caret - off) + extra;
+                const char *p = pl_sq + off;
+                int px = ed.x + 3;
+                while (p < end) {
+                    unsigned cp;
+                    int n = font_utf8_next(p, &cp);
+                    if (x < px + font_cp_w16(cp) / 2) break;
+                    px += font_cp_w16(cp);
+                    p += n;
+                }
+                pl_qtf.caret = (int)(p - pl_sq);
+                SDL_SetWindowInputFocus(ui.wpl);
+                SDL_StartTextInput();
+                return;
+            }
+        }
         for (size_t i = 0; i < sizeof PL_BTNS / sizeof PL_BTNS[0]; i++)
             if (ui_in_rect(PL_BTNS[i].r, x, y)) { ui.pressed = PL_BTNS[i].id; return; }
+        if (ui.mini) {
+            /* mini grab rails (design ruling 2026-11-25): the button row's empty
+               right part (past SCAN) and the 14px margin left of the list
+               are the spaces a user reaches for — both drag the window
+               like the title band. The footer strip stays dead. */
+            if (y >= 22 && y < 40) { ui.drag = 4; ui_drag_begin(ui.wpl); return; }
+            if (x < ptext.x && y >= 40 && y < ui.pl_h - 12) { ui.drag = 4; ui_drag_begin(ui.wpl); return; }
+        }
+        if (pl_search_active()) {
+            /* the list IS the results: a plain click selects AND activates
+               (the search window's contract — single click = do_jump); no
+               multi-select, no row drag, no double-click deferral */
+            if (ui_in_rect(&ptext, x, y)) {
+                int idx = pl_sscroll + (y - ptext.y) / pl_lh();
+                if (idx < search_engine_count()) {
+                    pl_ssel = idx;
+                    search_engine_jump(idx);
+                }
+                return;
+            }
+            if (ui_in_rect(&pscroll, x, y)) { ui.drag = 5; return; }
+            if (y < 22) { ui.drag = 4; ui_drag_begin(ui.wpl); }
+            return;
+        }
         if (ui_in_rect(&ptext, x, y)) {
-            int idx = ui.pl_scroll + (y - ptext.y) / 17;
+            int idx = ui.pl_scroll + (y - ptext.y) / pl_lh();
             if (idx < pl->count) {
                 /* SDL2 mouse-button events carry no modifier mask — the
                    physical keyboard state is the only truth at click time */
@@ -562,6 +801,12 @@ void ui_handle_pl_mouse(SDL_Event *e) {
         if (ui.pressed != B_NONE) {
             Rect xc = ui_close_rect(ui.pl_w);
             if (ui.pressed == PB_X && ui_in_rect(&xc, x, y)) ui_action(PB_CLOSE);
+            if (ui.pressed == PB_SSCOPE) {
+                /* no mode gate on UP: pressed can only arm while the
+                   button is drawn (mini), and mode cannot toggle mid-press */
+                Rect scb = plm_scope_rect();
+                if (ui_in_rect(&scb, x, y)) { pl_scope = !pl_scope; pl_search_run(); }
+            }
             for (size_t i = 0; i < sizeof PL_BTNS / sizeof PL_BTNS[0]; i++)
                 if (PL_BTNS[i].id == ui.pressed && ui_in_rect(PL_BTNS[i].r, x, y))
                     ui_action(ui.pressed);
@@ -588,26 +833,39 @@ void ui_handle_pl_mouse(SDL_Event *e) {
             if (ui.pl_drop >= 0 || abs(y - ui.pl_press_y) >= 4) {
                 /* edge auto-scroll: riding the list bounds keeps long
                    drags reachable from one press (motion-event driven) */
-                if (y < ptext.y + 8 && ui.pl_scroll > 0)
+                int lh = pl_lh(), half = lh / 2;   /* full: 17/2=8 — the
+                    standing constants; mini: 9/2=4 */
+                if (y < ptext.y + half && ui.pl_scroll > 0)
                     ui.pl_scroll--;
-                else if (pl->count > lines && y >= ptext.y + lines * 17 - 8 &&
+                else if (pl->count > lines && y >= ptext.y + lines * lh - half &&
                          ui.pl_scroll < pl->count - lines)
                     ui.pl_scroll++;
-                int gap = ui.pl_scroll + (y - ptext.y + 8) / 17;
+                int gap = ui.pl_scroll + (y - ptext.y + half) / lh;
                 if (gap < 0) gap = 0;
                 if (gap > pl->count) gap = pl->count;
                 ui.pl_drop = gap;
             }
-        } else if (ui.drag == 5 && pl->count > lines) {
-            ui.pl_scroll = (y - pscroll.y) * (pl->count - lines) / pscroll.h;
-            if (ui.pl_scroll < 0) ui.pl_scroll = 0;
+        } else if (ui.drag == 5) {
+            if (pl_search_active()) {
+                int n = search_engine_count();
+                if (n > lines) {
+                    pl_sscroll = (y - pscroll.y) * (n - lines) / pscroll.h;
+                    if (pl_sscroll < 0) pl_sscroll = 0;
+                    if (pl_sscroll > n - lines) pl_sscroll = n - lines;
+                }
+            } else if (pl->count > lines) {
+                ui.pl_scroll = (y - pscroll.y) * (pl->count - lines) / pscroll.h;
+                if (ui.pl_scroll < 0) ui.pl_scroll = 0;
+            }
         } else if (ui.drag == 8) {
             int gx, gy;
             SDL_GetGlobalMouseState(&gx, &gy);
             int w = ui.drag_wx + gx - ui.drag_gx, h = ui.drag_wy + gy - ui.drag_gy;
             if (w < PL_MIN_W) w = PL_MIN_W;
-            /* horizontal size snaps to the main window's width within DOCK_SNAP px */
-            if (abs(w - MAIN_W) <= DOCK_SNAP && w != MAIN_W) w = MAIN_W;
+            /* horizontal size snaps to the main window's width within
+               DOCK_SNAP px (mini: the 320 bar) */
+            int snapw = ui.mini ? MINI_W : MAIN_W;
+            if (abs(w - snapw) <= DOCK_SNAP && w != snapw) w = snapw;
             if (h < PL_MIN_H) h = PL_MIN_H;
             if (w != ui.pl_w || h != ui.pl_h) {
                 ui.pl_w = w; ui.pl_h = h;
@@ -616,10 +874,18 @@ void ui_handle_pl_mouse(SDL_Event *e) {
             }
         }
     } else if (e->type == SDL_MOUSEWHEEL) {
+        if (pl_search_active()) {
+            int n = search_engine_count();
+            pl_sscroll -= e->wheel.y;
+            if (pl_sscroll < 0) pl_sscroll = 0;
+            if (pl_sscroll > n - lines)
+                pl_sscroll = n > lines ? n - lines : 0;
+        } else {
         ui.pl_scroll -= e->wheel.y;
         if (ui.pl_scroll < 0) ui.pl_scroll = 0;
         if (ui.pl_scroll > pl->count - lines)
             ui.pl_scroll = pl->count > lines ? pl->count - lines : 0;
+        }
     }
 }
 
@@ -644,7 +910,7 @@ void ui_pl_cursor(int dir) {
     pl_sel_add(idx);
     Rect ptext, pscroll;
     pl_layout(&ptext, &pscroll);
-    int lines = ptext.h / 17;
+    int lines = ptext.h / pl_lh();
     if (idx < ui.pl_scroll) ui.pl_scroll = idx;
     else if (idx >= ui.pl_scroll + lines) ui.pl_scroll = idx - lines + 1;
 }
@@ -653,6 +919,10 @@ void ui_pl_cursor(int dir) {
    shortcuts in handle_key don't also fire. pgup/pgdn scroll by one page
    minus one line, so the bottom visible line becomes the new top */
 int ui_pl_key(SDL_Event *e) {
+    /* merged mini search: the focused field owns every key; with results
+       showing (caret elsewhere) the navigation keys ride the result list */
+    if (ui.mini && pl_sfocus) return pl_search_key(e);
+    if (pl_search_active()) return pl_result_key(e);
     Player *p = ui.pl;
     int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
     switch (e->key.keysym.sym) {
@@ -705,7 +975,7 @@ int ui_pl_key(SDL_Event *e) {
         if (p->pl->count == 0) return 0;
         Rect ptext, pscroll;
         pl_layout(&ptext, &pscroll);
-        int lines = ptext.h / 17;
+        int lines = ptext.h / pl_lh();
         int last = p->pl->count - 1;
         int at_end = e->key.keysym.sym == SDLK_END;
         int idx = at_end ? last : 0;
@@ -720,7 +990,7 @@ int ui_pl_key(SDL_Event *e) {
     case SDLK_PAGEDOWN: {
         Rect ptext, pscroll;
         pl_layout(&ptext, &pscroll);
-        int lines = ptext.h / 17;
+        int lines = ptext.h / pl_lh();
         int step = lines > 1 ? lines - 1 : 1;
         if (e->key.keysym.sym == SDLK_PAGEDOWN) ui.pl_scroll += step;
         else ui.pl_scroll -= step;
@@ -733,4 +1003,42 @@ int ui_pl_key(SDL_Event *e) {
     default:
         return 0;
     }
+}
+
+/* ---- merged mini search: exported entry points (ui.c routing) ---- */
+
+int ui_pl_search_focused(void) { return pl_sfocus; }
+
+/* TEXTINPUT for the band field (ui.c routes it here only while the
+   playlist window holds focus AND the field holds the caret) */
+void ui_pl_text(const char *text) {
+    char clean[512];
+    if (!search_filter_query(text, clean, sizeof clean)) return;
+    tf_insert(&pl_qtf, clean);
+    pl_search_run();
+}
+
+/* mini enter/exit: the merged field always starts and ends empty, so the
+   full-mode search window never inherits a mini query and vice versa */
+void ui_pl_search_reset(void) {
+    pl_sq[0] = 0;
+    pl_qtf.caret = 0; pl_qtf.selall = 0;
+    pl_sfocus = 0;
+    pl_ssel = 0; pl_sscroll = 0;
+    search_engine_run("", 0);
+}
+
+/* Ctrl+F in mini: focus the band field (showing the playlist if the
+   menu toggled it off) — the search window itself is full-mode-only */
+void ui_pl_search_focus(void) {
+    if (!ui.mini || !ui.wpl) return;
+    if (!ui.pl_visible) {
+        ui.pl_visible = 1;
+        SDL_ShowWindow(ui.wpl);
+    }
+    pl_sfocus = 1;
+    pl_qtf.selall = 0;
+    SDL_SetWindowInputFocus(ui.wpl);
+    SDL_StartTextInput();
+    ui_dirty |= D_PL;
 }

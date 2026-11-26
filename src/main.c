@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
     ui_set_raise_hook(mpris_take_raise);
     if (cfg.shuffle_remember > 0 && cfg.shuffle > 0) player.shuffle = 1;
     player.fade_stop = cfg.fade_stop > 0;
+    player.rg_mode = cfg.replaygain;   /* audio.replaygain: off/track/album */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--nopl")) show_pl = 0;

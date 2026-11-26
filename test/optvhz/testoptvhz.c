@@ -50,6 +50,18 @@ static void cfg_with_hz(const char *hzval) {
     cfg_load();
 }
 
+/* rewrite the user config with one audio.replaygain line and re-read it */
+static void cfg_with_rg(const char *val) {
+    const char *home = getenv("XDG_CONFIG_HOME");
+    char path[LV_MAX_PATH];
+    snprintf(path, sizeof path, "%s/levari/config", home);
+    FILE *f = fopen(path, "w");
+    if (!f) { printf("FAIL cfg_with_rg: cannot write %s\n", path); fails++; return; }
+    fprintf(f, "audio.replaygain = %s\n", val);
+    fclose(f);
+    cfg_load();
+}
+
 int main(void) {
     const char *home = getenv("HOME");
     if (!home) { printf("caller must set scratch HOME/XDG_CONFIG_HOME\n"); return 1; }
@@ -111,6 +123,39 @@ int main(void) {
     ui.opt_vhz = 777;
     click(r.x + r.w / 2, r.y + r.h / 2);
     chk("garbage copy restarts at 10", ui.opt_vhz, 10);
+
+    /* --- ReplayGain: config default/clamp + ADV cycle + SAVE store ---- */
+    {
+        char p[LV_MAX_PATH];
+        snprintf(p, sizeof p, "%s/levari/config", getenv("XDG_CONFIG_HOME"));
+        unlink(p);
+    }
+    cfg_load();
+    chk("default replaygain is off", cfg.replaygain, 0);
+    cfg_with_rg("track");
+    chk("config track accepted", cfg.replaygain, 1);
+    cfg_with_rg("ALBUM");
+    chk("config ALBUM accepted (case-insensitive)", cfg.replaygain, 2);
+    cfg_with_rg("loud");
+    chk("config garbage stays off", cfg.replaygain, 0);
+
+    cfg_with_rg("off");
+    ui.opt_rg = cfg.replaygain;        /* what ui_opt_open does */
+    chk("RG opens at off", ui.opt_rg, 0);
+    Rect rr = opt_rg_rect();
+    click(rr.x + rr.w / 2, rr.y + rr.h / 2);
+    chk("RG cycle 1 -> track", ui.opt_rg, 1);
+    click(rr.x + rr.w / 2, rr.y + rr.h / 2);
+    chk("RG cycle 2 -> album", ui.opt_rg, 2);
+    click(rr.x + rr.w / 2, rr.y + rr.h / 2);
+    chk("RG cycle wraps to off", ui.opt_rg, 0);
+    /* land on track, SAVE: cfg persists AND the player store lands live */
+    click(rr.x + rr.w / 2, rr.y + rr.h / 2);
+    opt_save();
+    cfg_load();
+    chk("opt_save persisted track", cfg.replaygain, 1);
+    chk("opt_save stored rg_mode live on the player",
+        atomic_load_explicit(&fake_pl.rg_mode, memory_order_relaxed), 1);
 
     printf(fails ? "FAILED (%d)\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;

@@ -100,6 +100,19 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
     decode.allow_large = off      accept files over 256 MB; off = the decoder
                                   refuses them (options window ADV page,
                                   `LARGE` toggle)
+    ui.mini = off                 start in the mini layout: a 320x56 main
+                                  bar (name, title scroller — double-click
+                                  switches it to the spectrum — time
+                                  readout, STOP/BACK/PLAY/NEXT), the
+                                  playlist, and a 2-result search window,
+                                  all sized for a 320x240 screen. Live
+                                  toggle: right-click menu `MINI MODE` /
+                                  `EXIT MINI`, or the options BASIC `MINI`
+                                  checkbox (options `SAVE` persists)
+    ui.always_on_top = off        the main window starts above other
+                                  windows; the main-window `AoT` button
+                                  overrides live without saving (options
+                                  BASIC `AOT` checkbox; `SAVE` persists)
     ui.always_10fps = off         keep repainting the main window at 10 fps
                                   whenever a title is long enough to marquee,
                                   so it scrolls while paused/stopped/unfocused
@@ -109,6 +122,18 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
                                   Higher is smoother, costs proportionally
                                   more CPU (options window ADV page, `VIZ`
                                   cycle button, cyan label when non-default)
+    audio.replaygain = off        loudness normalization from ReplayGain
+                                  tags: off | track | album. `track` uses
+                                  the per-file gain, `album` the per-album
+                                  gain (falling back to track when a file
+                                  has none). Read at each track start from
+                                  Vorbis comments (FLAC/Ogg), ID3v2 TXXX,
+                                  ID3v2.4 RVA2 and APEv2 items; files
+                                  without tags play untouched. Applied
+                                  gain is clamped
+                                  to [-20, +12] dB (options window ADV
+                                  page, `RG` cycle button, cyan label when
+                                  non-default)
     tag.legacy_encoding = auto    codepage for tag fields with no declared
                                   encoding: auto | latin1 | cp1251 | utf8 |
                                   shiftjis.

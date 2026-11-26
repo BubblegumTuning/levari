@@ -376,6 +376,40 @@ int main(void) {
     chk("file-carry: pinned file stays at its clamp", fw_file.x, WALL_X);
     ui.snap[1].w = NULL;
 
+    /* K: mini mode — the bar's motion path must carry the docked playlist
+       exactly like full mode (the mini handler once called drag_step
+       alone: the playlist stayed put while the bar travelled and
+       dock_restore snapped the bar back flush on release — hardware
+       report). The press lands ON the name rect: the band drags
+       through the name too (the old R_MNAME exclusion was a dead zone). */
+    refused_calls = 0;
+    ui.mini = 1;
+    ui.pl_w = MINI_W;
+    fw_main = (FakeWin){ 100, 100, MINI_W, MINI_H };
+    fw_pl = (FakeWin){ 100, 100 + MINI_H, MINI_W, PL_H };
+    ui.pl_docked = 1; ui.drag = 0; ui.pressed = B_NONE;
+    gmx = 110; gmy = 110;
+    mkdown(&e2, 10, 10);             /* inside R_MNAME {4,5,36,12} */
+    loop_guard(&e2);
+    handle_main_mouse(&e2);          /* routes to the mini handler */
+    chk("mini: press on the name latches the band drag", ui.drag, 3);
+    for (int i = 0; i < 6; i++) {
+        gmy += 10;
+        mkmotion(&e2, gmx - fw_main.x, gmy - fw_main.y);
+        loop_guard(&e2);
+        handle_main_mouse(&e2);
+    }
+    chk("mini: bar drag carries the docked playlist (follow)", fw_pl.y, 100 + MINI_H + 60);
+    chk("mini: follow did not undock", ui.pl_docked, 1);
+    mkup(&e2, gmx - fw_main.x, gmy - fw_main.y);
+    loop_guard(&e2);
+    handle_main_mouse(&e2);
+    chk("mini: release keeps the bar where it was dropped (no snap-back)",
+        fw_main.y, 100 + 60);
+    chk("mini: playlist stays flush under the bar", fw_pl.y, 100 + MINI_H + 60);
+    ui.mini = 0;
+    ui.pl_w = PL_W;
+
     printf(fails ? "%d FAILURES\n" : "all pass\n", fails ? fails : 0);
     return fails != 0;
 }

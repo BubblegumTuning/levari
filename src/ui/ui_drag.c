@@ -4,7 +4,7 @@
 
 void ui_pl_dock_pos(int *x, int *y) {
     SDL_GetWindowPosition(ui.wmain, x, y);
-    *y += MAIN_H;
+    *y += (ui.mini ? MINI_H : MAIN_H);
 }
 void ui_drag_begin(SDL_Window *w) {
     SDL_GetGlobalMouseState(&ui.drag_gx, &ui.drag_gy);
@@ -136,8 +136,22 @@ static void drag_step(SDL_Window *w, int snap, int *ax, int *ay) {
     *ax += x - ox; *ay += y - oy;
 }
 
-/* main window drag: no snap */
-void ui_drag_move(SDL_Window *w) { drag_step(w, 0, &ui.drag_gx, &ui.drag_gy); }
+/* main window drag: no snap, but the drag CARRIES the docked playlist and
+   every snapped window. Both the full-mode and the mini motion paths call
+   this: mini once called drag_step alone, so the docked playlist stayed
+   put while the bar travelled and ui_drag_dock_restore pulled the bar back
+   flush on release — the bar then read as "cannot be moved" while the
+   playlist was docked (hardware report, mini round 2). */
+void ui_drag_move(SDL_Window *w) {
+    drag_step(w, 0, &ui.drag_gx, &ui.drag_gy);
+    int wx, wy;
+    SDL_GetWindowPosition(w, &wx, &wy);
+    if (ui.pl_docked && ui.pl_visible)
+        ui_follow_move(ui.wpl, &ui.follow_pl, wx, wy + (ui.mini ? MINI_H : MAIN_H));
+    for (int i = 0; i < SNAP_NSLOT; i++)
+        if (ui.snap[i].w)
+            ui_follow_move(ui.snap[i].w, &ui.follow_snap[i], wx + ui.snap[i].dx, wy + ui.snap[i].dy);
+}
 
 /* file/eq/options drag: live-snap beside main, follows main until
    dragged away */
@@ -244,7 +258,7 @@ int ui_drag_dock_restore(void) {
     struct { SDL_Window *w; int dx, dy; } c[SNAP_NSLOT + 1];
     int n = 0;
     if (ui.pl_docked && ui.pl_visible) {
-        c[n].w = ui.wpl; c[n].dx = 0; c[n].dy = MAIN_H; n++;
+        c[n].w = ui.wpl; c[n].dx = 0; c[n].dy = ui.mini ? MINI_H : MAIN_H; n++;
     }
     for (int i = 0; i < SNAP_NSLOT; i++)
         if (ui.snap[i].w) { c[n].w = ui.snap[i].w; c[n].dx = ui.snap[i].dx; c[n].dy = ui.snap[i].dy; n++; }

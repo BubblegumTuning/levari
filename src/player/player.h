@@ -33,6 +33,7 @@ typedef pthread_cond_t lv_wake_t;
 
 enum { ST_STOP, ST_PLAY, ST_PAUSE };
 enum { CMD_NONE, CMD_PLAY, CMD_TOGGLE_PAUSE, CMD_STOP, CMD_SEEK, CMD_NEXT, CMD_PREV, CMD_SPEED };
+enum { RG_OFF, RG_TRACK, RG_ALBUM };   /* audio.replaygain = off|track|album */
 
 /* the cross-thread scalars are _Atomic, not volatile: the UI, daemon and
    MPRIS threads read them lock-free while the player thread writes them,
@@ -64,6 +65,15 @@ typedef struct {
     _Atomic int rate, ch;
     EQ eq;
     WS ws;
+    /* ReplayGain: rg_mode is seeded from cfg at startup and stored live
+       by options SAVE; rg_trk/rg_alb are the CURRENT track's centi-dB
+       (LV_RG_NONE = absent), probed off-lock at load and written under
+       p->mtx; the cache is player-thread only, shaped exactly like the
+       preamp cache in EQ (the comparison is the one choke point). */
+    _Atomic int rg_mode;
+    _Atomic int rg_trk, rg_alb;
+    float rg_cache_db;
+    int32_t rg_q;
     _Atomic int speed; /* percent, 100 = normal */
     _Atomic long long ab_a, ab_b; /* -1 = unset */
     int16_t viz_buf[4096];

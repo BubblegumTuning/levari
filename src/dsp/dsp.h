@@ -44,6 +44,15 @@ void eq_toggle(EQ *e);
 int  eq_enabled(EQ *e);
 void eq_process(EQ *e, int16_t *buf, int frames, int ch);
 
+/* ---- ReplayGain gain stage (player loop, applied before eq_process)
+   Q14 multiplier for a dB value, clamped to the preamp slider's
+   [-20, +12] dB range: the same product ceiling the preamp integer
+   path proves (q <= 65536 keeps |int16 * q| inside int32). */
+int32_t rg_q_for_db(float db);
+/* in-place Q14 scale with saturation, same rounding as the preamp
+   integer path; q == 16384 (unity) is a no-op */
+void rg_scale(int32_t q, int16_t *buf, int n);
+
 /* ---- WSOLA time-scale (speed) control ---- */
 #define WS_FRAME 1024
 #define WS_SEARCH 192

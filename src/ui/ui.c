@@ -48,7 +48,236 @@ static const Btn MAIN_BTNS[] = {
     {B_PREV, &R_PREV}, {B_PLAY, &R_PLAY}, {B_PAUSE, &R_PAUSE},
     {B_STOP, &R_STOP}, {B_NEXT, &R_NEXT}, {B_OPEN, &R_OPEN},
     {B_ABA, &R_ABA}, {B_ABB, &R_ABB}, {B_SEARCH, &R_SEARCH}, {B_RPT1, &R_RPT1},
+    {B_AOT, &R_AOT},
 };
+
+/* ---------- mini layout (320x240-screen target, Adafruit 2.8\" class) ----------
+   One-band bar (the whole window IS the title band, y<22): name, the
+   transport as SYMBOLS (BACK PLAY/PAUSE STOP NEXT, design ruling), the
+   title scroller (double-click -> spectrum) and the time readout
+   (current position, right end, left of the close X) — scroller and time
+   small font (same as the readout), each on its own black box.
+   No seek/volume/EQ/shuffle/repeat/A-B/URL.
+   The window is the same window, resized; draw and hit-test branch on
+   ui.mini. Mini bypasses the draw-region optimization: any dirty bit draws
+   the full bar (7k px, cheap) and presents the full rect.
+   (MINI_W/MINI_H live in ui_state.h — search.c docks under the bar.) */
+static const Rect R_MNAME    = {4, 5, 36, 12};   /* draw-only; the band drags through the name too */
+static const Rect R_MPREV    = {44, 5, 18, 12};
+static const Rect R_MPLAY    = {64, 5, 18, 12};
+static const Rect R_MSTOP    = {84, 5, 18, 12};
+static const Rect R_MNEXT    = {104, 5, 18, 12};
+static const Rect R_MSCROLL  = {126, 6, 130, 9};
+static const Rect R_MTIME    = {260, 6, 40, 9};  /* fits "99:59+" exactly; text right-aligned */
+static const Btn MINI_BTNS[] = {
+    {B_MPREV, &R_MPREV}, {B_MPLAY, &R_MPLAY}, {B_MSTOP, &R_MSTOP}, {B_MNEXT, &R_MNEXT},
+};
+
+/* right-click menu: one table per mode (full: options + enter mini;
+   mini: options + exit + the one window the bar has no buttons for —
+   SEARCH is gone, the playlist band hosts the merged search field) */
+static const char *const MENU_FULL[] = {"OPTIONS...", "MINI MODE"};
+static const char *const MENU_MINI[] = {"OPTIONS...", "EXIT MINI", "PLAYLIST"};
+static int menu_count(void) { return ui.mini ? 3 : 2; }
+static Rect menu_item_rect(int i) { Rect r = {2, 22 + i * 20, 110, 20}; return r; }
+static const char *menu_label(int i) { return ui.mini ? MENU_MINI[i] : MENU_FULL[i]; }
+
+/* the mini menu outgrows the 56px bar: the window grows while it is open */
+static void menu_grow(int open) {
+    if (!ui.mini || !ui.wmain) return;
+    int h = open ? 22 + menu_count() * 20 + 2 : MINI_H;
+    SDL_SetWindowSize(ui.wmain, MINI_W, h);
+    ui.smain = lv_win_surface(ui.wmain);
+}
+static void menu_close(void) { ui.menu = 0; menu_grow(0); }
+static void menu_action(int i) {
+    switch (i) {
+    case 0: ui_opt_open(); break;
+    case 1: ui_set_mini(!ui.mini); break;
+    case 2:
+        ui.pl_visible = !ui.pl_visible;
+        if (ui.pl_visible) SDL_ShowWindow(ui.wpl); else SDL_HideWindow(ui.wpl);
+        ui_dirty |= D_PL;
+        break;
+    }
+}
+
+void ui_set_mini(int on) {
+    int want = on ? 1 : 0;
+    if (ui.mini == want) return;
+    ui.mini = want;
+    ui.menu = 0;
+    ui.mini_dbl = 0;
+    if (ui.wmain) {
+        SDL_SetWindowSize(ui.wmain, ui.mini ? MINI_W : MAIN_W, ui.mini ? MINI_H : MAIN_H);
+        ui.smain = lv_win_surface(ui.wmain);
+    }
+    if (ui.mini) {
+        /* entering mini opens the playlist docked flush under the bar and
+           CLOSES the search window: in mini the playlist band hosts the
+           merged search field, the separate window is full-mode-only.
+           The merged query starts clean in both directions. */
+        int wx = 0, wy = 0;
+        if (ui.wmain) SDL_GetWindowPosition(ui.wmain, &wx, &wy);
+        ui.pl_visible = 1;
+        if (ui.wpl) {
+            if (ui.pl_w != MINI_W) {
+                SDL_SetWindowSize(ui.wpl, MINI_W, ui.pl_h);
+                ui.spl = lv_win_surface(ui.wpl);
+                ui.pl_w = MINI_W;
+            }
+            SDL_SetWindowPosition(ui.wpl, wx, wy + MINI_H);
+            SDL_ShowWindow(ui.wpl);
+        }
+        search_close();
+        ui_pl_search_reset();
+    } else {
+        if (ui.wpl && ui.pl_w != PL_W) {
+            SDL_SetWindowSize(ui.wpl, PL_W, ui.pl_h);
+            ui.spl = lv_win_surface(ui.wpl);
+            ui.pl_w = PL_W;
+        }
+        ui_pl_search_reset();
+    }
+    ui_dirty |= D_MAIN | D_PL | D_SRCH;
+}
+
+/* spectrum band over a strip rect: shared by the full-mode title strip and
+   the mini scroller. The feed gate (fresh engine chunk only) and the
+   time-normalized 0.85-per-100ms fall-off are the locked invariants
+   (draw-regions dossier) — one copy, both callers. */
+static void draw_viz_band(SDL_Surface *s, int tx, int ty, int tw, int th) {
+    Player *p = ui.pl;
+    static float bars[VIZ_BARS], smooth[VIZ_BARS];
+    static Uint32 viz_last;
+    static Uint32 viz_t;
+    int16_t snap[4096];
+    int n;
+    unsigned seq;
+    int playing = p->state == ST_PLAY;
+    pthread_mutex_lock(&p->viz_mtx);
+    n = p->viz_n;
+    if (n > 4096) n = 4096;
+    if (n < 0) n = 0;
+    seq = p->viz_seq;
+    if (n > 0) memcpy(snap, p->viz_buf, (size_t)n * sizeof snap[0]);
+    pthread_mutex_unlock(&p->viz_mtx);
+    /* A FRESH engine chunk since the last frame? The player feeds one
+       chunk per decode pass (~21 Hz: CHUNK 2048 at real-time pace), so
+       above that UI rate a frame sees the same seq. Re-FFTing it would
+       redraw identical bars; feeding silence (the old behavior) made them
+       sawtooth. No fresh chunk -> zero bars through the same fall-off:
+       pure decay until the next chunk (paused and stopped ride this same
+       branch, as before). */
+    if (playing && seq != viz_last) {
+        viz_last = seq;
+        viz_spectrum(snap, n, p->rate, bars);
+    } else {
+        memset(bars, 0, sizeof bars);
+    }
+    /* the 0.85 fall-off is PER 100 ms (the historical frame rate); at
+       24/30/60 Hz a bare 0.85 decays 2.4x..6x too fast. Normalize by real
+       elapsed time: factor = 0.85^(dt/100), exactly 0.85 at the default. */
+    Uint32 tnow = SDL_GetTicks();
+    float dt = viz_t ? (float)(tnow - viz_t) : 100.f;
+    viz_t = tnow;
+    if (dt > 500.f) dt = 500.f;   /* post-pause frame = decayed out */
+    float k = powf(0.85f, dt / 100.f);
+    for (int b = 0; b < VIZ_BARS; b++) {
+        smooth[b] = bars[b] > smooth[b] ? bars[b] : smooth[b] * k;
+        int h = (int)(smooth[b] * 16.0f);
+        if (h > th) h = th;
+        if (h > 0) {
+            int x0 = b * tw / VIZ_BARS, x1 = (b + 1) * tw / VIZ_BARS;
+            SDL_Rect r = {tx + x0, ty + th - 1 - h, x1 - x0 - 1, h};
+            SDL_FillRect(s, &r, ui_col(s, 0, 200, 60));
+        }
+    }
+}
+
+static void draw_mini_menu(SDL_Surface *s) {
+    int n = menu_count();
+    SDL_Rect mb = {2, 22, 110, n * 20};
+    SDL_FillRect(s, &mb, ui_col(s, 40, 40, 40));
+    SDL_Rect t = {mb.x, mb.y, mb.w, 1}, bo = {mb.x, mb.y + mb.h - 1, mb.w, 1};
+    SDL_Rect l = {mb.x, mb.y, 1, mb.h}, r = {mb.x + mb.w - 1, mb.y, 1, mb.h};
+    Uint32 bc = ui_col(s, 140, 140, 140);
+    SDL_FillRect(s, &t, bc); SDL_FillRect(s, &bo, bc);
+    SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
+    for (int i = 0; i < n; i++)
+        font_puts(s, 10, 22 + i * 20 + 6, menu_label(i), ui_col(s, 220, 220, 220));
+}
+
+static void draw_icon(SDL_Surface *s, int id, const Rect *r, Uint32 c);
+
+static void draw_mini_main(void) {
+    SDL_Surface *s = ui.smain;
+    Player *p = ui.pl;
+    if (!s) return;
+    skin_window_bg(s, MINI_W, s->h);
+    Rect xc = ui_close_rect(MINI_W);
+    ui_draw_x(s, &xc, ui.pressed == B_XMAIN);
+    font_puts(s, R_MNAME.x, 7, "levari", ui_col(s, 0, 224, 255));
+    for (size_t i = 0; i < sizeof MINI_BTNS / sizeof MINI_BTNS[0]; i++) {
+        const Btn *b = &MINI_BTNS[i];
+        int active = b->id == B_MPLAY && p->state == ST_PLAY;
+        skin_button(s, b->r, ui.pressed == b->id, active);
+        /* draw_icon switches on the full-mode ids; the play button shows
+           the action its click performs */
+        int icon = b->id == B_MPREV ? B_PREV
+                 : b->id == B_MSTOP ? B_STOP
+                 : b->id == B_MNEXT ? B_NEXT
+                 : active ? B_PAUSE : B_PLAY;
+        draw_icon(s, icon, b->r,
+                  active ? ui_col(s, 0, 255, 0) : ui_col(s, 220, 220, 220));
+    }
+    /* time box: current position only, right-aligned at the band's right
+       end, left of the close X */
+    SDL_Rect tbox = {R_MTIME.x, R_MTIME.y, R_MTIME.w, R_MTIME.h};
+    SDL_FillRect(s, &tbox, ui_col(s, 0, 0, 0));
+    char tb[16];
+    int pos = p->rate ? (int)(p->pos_frames / p->rate) : 0;
+    if (p->state == ST_STOP) pos = 0;
+    /* mini box budget (design ruling): the readout fits at most "99:59+";
+       longer elapsed saturates there. Deliberately NOT lv_fmt_time — that
+       switches to H:MM:SS at an hour and would not fit the box (same
+       exception class as the playlist row's compact [m:ss] column). */
+    if (pos >= 6000) snprintf(tb, sizeof tb, "99:59+");
+    else snprintf(tb, sizeof tb, "%d:%02d", pos / 60, pos % 60);
+    font_puts(s, R_MTIME.x + R_MTIME.w - 2 - font_w(tb), 7, tb, ui_col(s, 0, 255, 0));
+    /* scroller box: black ground, title or spectrum, small font */
+    SDL_Rect sbox = {R_MSCROLL.x, R_MSCROLL.y, R_MSCROLL.w, R_MSCROLL.h};
+    SDL_FillRect(s, &sbox, ui_col(s, 0, 0, 0));
+    int tx = R_MSCROLL.x, tw = R_MSCROLL.w;
+    if (ui.vis_on) {
+        draw_viz_band(s, tx, R_MSCROLL.y, tw, R_MSCROLL.h);
+    } else if (font_w(ui.title) <= tw) {
+        ui.marquee = 0;
+        font_puts(s, tx, 7, ui.title, ui_col(s, 0, 224, 255));
+    } else {
+        /* marquee: same padded-cycle machinery as the full strip, small
+           font with the explicit horizontal clip (putpx ignores clip_rect) */
+        ui.marquee = 1;
+        char padded[600];
+        snprintf(padded, sizeof padded, "%s   ", ui.title);
+        int len = font_w(padded);
+        int off = ui.scroll_off % (len + 20);
+        int x = tx - off;
+        const char *q = padded;
+        while (*q) {
+            if (x >= tx + tw) break;
+            unsigned cp;
+            int n = font_utf8_next(q, &cp);
+            int cw = font_cp_w(cp);
+            if (x + cw > tx)
+                font_putcp_clip(s, x, 7, cp, ui_col(s, 0, 224, 255), tx, tx + tw);
+            x += cw;
+            q += n;
+        }
+        if (p->state == ST_PLAY || cfg.ui_always10 > 0) ui.scroll_off += 2;
+    }
+    if (ui.menu) draw_mini_menu(s);
+}
 
 
 
@@ -210,6 +439,13 @@ static void lvprof_tick(unsigned regs) {
 #endif
 
 static void draw_main(unsigned regs) {
+    if (ui.mini) {
+        /* mini draws the full bar; reset the region list so the present
+           path (rgn_n==0) uploads the whole window, not a stale rect set */
+        rgn_n = 0;
+        draw_mini_main();
+        return;
+    }
     SDL_Surface *s = ui.smain;
     Player *p = ui.pl;
 
@@ -269,52 +505,7 @@ static void draw_main(unsigned regs) {
                    strip carries the message, plain red, for its 10 s */
                 font_puts16(s, tx, R_TSCROLL.y + 1, ui.msg, ui_col(s, 255, 60, 60));
             } else if (ui.vis_on) {
-                static float bars[VIZ_BARS], smooth[VIZ_BARS];
-                static Uint32 viz_last;
-                int16_t snap[4096];
-                int n;
-                unsigned seq;
-                int playing = p->state == ST_PLAY;
-                pthread_mutex_lock(&p->viz_mtx);
-                n = p->viz_n;
-                if (n > 4096) n = 4096;
-                if (n < 0) n = 0;
-                seq = p->viz_seq;
-                if (n > 0) memcpy(snap, p->viz_buf, (size_t)n * sizeof snap[0]);
-                pthread_mutex_unlock(&p->viz_mtx);
-                /* A FRESH engine chunk since the last frame? The player
-                   feeds one chunk per decode pass (~21 Hz: CHUNK 2048 at
-                   real-time pace), so above that UI rate a frame sees the
-                   same seq. Re-FFTing it would redraw identical bars;
-                   feeding silence (the old behavior) made them sawtooth.
-                   No fresh chunk -> zero bars through the same 0.85
-                   fall-off: pure decay until the next chunk (paused and
-                   stopped ride this same branch, as before). */
-                if (playing && seq != viz_last) {
-                    viz_last = seq;
-                    viz_spectrum(snap, n, p->rate, bars);
-                } else {
-                    memset(bars, 0, sizeof bars);
-                }
-                /* the 0.85 fall-off is PER 100 ms (the historical frame
-                   rate); at 24/30/60 Hz a bare 0.85 decays 2.4x..6x too
-                   fast. Normalize by real elapsed time: factor =
-                   0.85^(dt/100), exactly 0.85 at the 10 Hz default. */
-                static Uint32 viz_t;
-                Uint32 tnow = SDL_GetTicks();
-                float dt = viz_t ? (float)(tnow - viz_t) : 100.f;
-                viz_t = tnow;
-                if (dt > 500.f) dt = 500.f;   /* post-pause frame = decayed out */
-                float k = powf(0.85f, dt / 100.f);
-                for (int b = 0; b < VIZ_BARS; b++) {
-                    smooth[b] = bars[b] > smooth[b] ? bars[b] : smooth[b] * k;
-                    int h = (int)(smooth[b] * 16.0f);
-                    if (h > 0) {
-                        int x0 = b * tw / VIZ_BARS, x1 = (b + 1) * tw / VIZ_BARS;
-                        SDL_Rect r = {tx + x0, R_TSCROLL.y + R_TSCROLL.h - 1 - h, x1 - x0 - 1, h};
-                        SDL_FillRect(s, &r, ui_col(s, 0, 200, 60));
-                    }
-                }
+                draw_viz_band(s, tx, R_TSCROLL.y, tw, R_TSCROLL.h);
             } else if (font_w16(ui.title) <= tw) {
                 font_puts16(s, tx, R_TSCROLL.y + 1, ui.title, ui_col(s, 0, 224, 255));
             } else {
@@ -407,6 +598,7 @@ static void draw_main(unsigned regs) {
         if (b->id == B_RPT1) active = p->repeat == 2;
         if (b->id == B_EQ) active = eq_enabled(&p->eq);
         if (b->id == B_VIS) active = ui.vis_on;
+        if (b->id == B_AOT) active = ui.aot;
         skin_button(s, b->r, ui.pressed == b->id, active);
         Uint32 c = ui_col(s, 220, 220, 220);
         if (b->id == B_SHUF) font_puts(s, b->r->x + (b->r->w - font_w("SHUFFLE")) / 2, b->r->y + 3, "SHUFFLE", active ? ui_col(s, 0, 255, 0) : c);
@@ -422,6 +614,8 @@ static void draw_main(unsigned regs) {
                                          "SRCH", search_is_open() ? ui_col(s, 0, 255, 0) : c);
         if (b->id == B_RPT1) font_puts(s, b->r->x + (b->r->w - font_w("RPT1")) / 2, b->r->y + 3,
                                       "RPT1", active ? ui_col(s, 0, 255, 0) : c);
+        if (b->id == B_AOT) font_puts(s, b->r->x + (b->r->w - font_w("AoT")) / 2, b->r->y + 3,
+                                      "AoT", active ? ui_col(s, 0, 255, 0) : c);
         if (b->id == B_ABA) font_puts(s, b->r->x + 3, b->r->y + 3, "A",
                                       p->ab_a >= 0 ? ui_col(s, 0, 255, 0) : c);
         if (b->id == B_ABB) font_puts(s, b->r->x + 3, b->r->y + 3, "B",
@@ -450,7 +644,8 @@ static void draw_main(unsigned regs) {
     }
 
     if (ui.menu) {
-        Rect mi = { 2, 22, 110, 20 };
+        int n = menu_count();
+        Rect mi = { 2, 22, 110, n * 20 };
         if (rgn_hit(&mi)) {
             SDL_Rect mb = { mi.x, mi.y, mi.w, mi.h };
             SDL_FillRect(s, &mb, ui_col(s, 40, 40, 40));
@@ -459,7 +654,8 @@ static void draw_main(unsigned regs) {
             Uint32 bc = ui_col(s, 140, 140, 140);
             SDL_FillRect(s, &t, bc); SDL_FillRect(s, &b, bc);
             SDL_FillRect(s, &l, bc); SDL_FillRect(s, &r, bc);
-            font_puts(s, mi.x + 8, mi.y + 6, "OPTIONS...", ui_col(s, 220, 220, 220));
+            for (int i = 0; i < n; i++)
+                font_puts(s, mi.x + 8, mi.y + 6 + i * 20, menu_label(i), ui_col(s, 220, 220, 220));
         }
     }
         LV_ACC(wid_us);
@@ -550,6 +746,19 @@ void ui_action(int id) {
         else SDL_HideWindow(ui.weq);
         break;
     case B_VIS: ui.vis_on = !ui.vis_on; p->viz_feed = ui.vis_on; break;
+    case B_AOT:
+        /* live override only: config keeps the saved default until SAVE
+           in options writes the current state */
+        ui.aot = !ui.aot;
+        SDL_SetWindowAlwaysOnTop(ui.wmain, ui.aot ? SDL_TRUE : SDL_FALSE);
+        break;
+    case B_MSTOP: pl_post(p, CMD_STOP, 0); break;
+    case B_MPREV: pl_post(p, CMD_PREV, 0); break;
+    case B_MPLAY:
+        if (p->state == ST_STOP) pl_post(p, CMD_PLAY, p->cur >= 0 ? p->cur : 0);
+        else pl_post(p, CMD_TOGGLE_PAUSE, 0);
+        break;
+    case B_MNEXT: pl_post(p, CMD_NEXT, 0); break;
     case B_LIST:
         ui.pl_visible = !ui.pl_visible;
         if (ui.pl_visible) {
@@ -688,19 +897,72 @@ void ui_action(int id) {
     }
 }
 
+/* mini hit-test: close X, the four transport buttons, scroller
+   double-click (-> spectrum), band drag. No seek/volume/pan paths. */
+static void handle_mini_mouse(SDL_Event *e, int x, int y) {
+    Player *p = ui.pl;
+    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
+        Rect xc = ui_close_rect(MINI_W);
+        if (ui_in_rect(&xc, x, y)) { ui.pressed = B_XMAIN; return; }
+        for (size_t i = 0; i < sizeof MINI_BTNS / sizeof MINI_BTNS[0]; i++)
+            if (ui_in_rect(MINI_BTNS[i].r, x, y)) { ui.pressed = MINI_BTNS[i].id; ui.drag = 0; return; }
+        if (ui_in_rect(&R_MSCROLL, x, y)) {
+            Uint32 now = SDL_GetTicks();
+            if (ui.mini_dbl && now - ui.mini_dbl < 400) {
+                ui.vis_on = !ui.vis_on;
+                p->viz_feed = ui.vis_on;
+                ui.mini_dbl = 0;
+            } else ui.mini_dbl = now;
+            return;
+        }
+        if (y < 22) { ui.drag = 3; ui_drag_begin(ui.wmain); }
+        return;
+    }
+    if (e->type == SDL_MOUSEBUTTONUP) {
+        if (ui.drag == 3) {
+            if (!ui_drag_dock_restore())
+                ui_drag_bounce(ui.wmain, ui.drag_wxlo, ui.drag_wxhi, ui.drag_wylo, ui.drag_wyhi);
+            ui.drag = 0;
+            return;
+        }
+        if (ui.drag == 0 && ui.pressed != B_NONE) {
+            Rect xc = ui_close_rect(MINI_W);
+            if (ui.pressed == B_XMAIN && ui_in_rect(&xc, x, y)) {
+                SDL_Event q; q.type = SDL_QUIT; SDL_PushEvent(&q);
+            }
+            for (size_t i = 0; i < sizeof MINI_BTNS / sizeof MINI_BTNS[0]; i++)
+                if (MINI_BTNS[i].id == ui.pressed && ui_in_rect(MINI_BTNS[i].r, x, y))
+                    ui_action(MINI_BTNS[i].id);
+            ui.pressed = B_NONE;
+        }
+        return;
+    }
+    if (e->type == SDL_MOUSEMOTION && ui.drag == 3) ui_drag_move(ui.wmain);
+}
+
 static void handle_main_mouse(SDL_Event *e) {
     Player *p = ui.pl;
     int x = e->motion.x, y = e->motion.y;
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_RIGHT) {
-        ui.menu = y < 22 ? 1 : 0;
+        /* full mode: title band only (as always); mini: the whole bar is
+           the menu zone — it has no band-sized dead space to spare */
+        if (!ui.mini && y >= 22) return;
+        ui.menu = 1;
+        menu_grow(1);
+        ui_dirty |= D_MAIN;
         return;
     }
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT && ui.menu) {
-        Rect mi = { 2, 22, 110, 20 };
-        ui.menu = 0;
-        if (ui_in_rect(&mi, x, y)) ui_opt_open();
+        int n = menu_count();
+        menu_close();
+        for (int i = 0; i < n; i++) {
+            Rect mi = menu_item_rect(i);
+            if (ui_in_rect(&mi, x, y)) { menu_action(i); break; }
+        }
+        ui_dirty |= D_MAIN;
         return;
     }
+    if (ui.mini) { handle_mini_mouse(e, x, y); return; }
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
         /* a button press cancels any latched drag (ui_focus_click_drag can
            latch one before the click-through press arrives): without this
@@ -754,14 +1016,7 @@ static void handle_main_mouse(SDL_Event *e) {
             if (p->pan < -32) p->pan = -32;
             if (p->pan > 32) p->pan = 32;
         } else if (ui.drag == 3) {
-            ui_drag_move(ui.wmain);
-            int wx, wy;
-            SDL_GetWindowPosition(ui.wmain, &wx, &wy);
-            if (ui.pl_docked && ui.pl_visible)
-                ui_follow_move(ui.wpl, &ui.follow_pl, wx, wy + MAIN_H);
-            for (int i = 0; i < SNAP_NSLOT; i++)
-                if (ui.snap[i].w)
-                    ui_follow_move(ui.snap[i].w, &ui.follow_snap[i], wx + ui.snap[i].dx, wy + ui.snap[i].dy);
+            ui_drag_move(ui.wmain); /* carries docked playlist + snapped windows */
         }
     }
     if (e->type == SDL_MOUSEBUTTONUP) {
@@ -859,13 +1114,21 @@ static void handle_key(SDL_Event *e) {
     case SDLK_KP_MINUS:
         p->vol -= 8; if (p->vol < 0) p->vol = 0; break;
     case SDLK_l: if (ctrl) { pl_scan_tags(p->pl, &p->mtx); } break;
-    case SDLK_f:
+    case SDLK_f: {
+        int want = 0;
 #ifdef __APPLE__
-        if (ctrl || (e->key.keysym.mod & KMOD_GUI)) search_open(ui.wmain);
+        want = ctrl || (e->key.keysym.mod & KMOD_GUI);
 #else
-        if (ctrl) search_open(ui.wmain);
+        want = ctrl;
 #endif
+        /* mini has no search window: Ctrl+F focuses the merged band
+           field in the playlist instead */
+        if (want) {
+            if (ui.mini) ui_pl_search_focus();
+            else search_open(ui.wmain);
+        }
         break;
+    }
     case SDLK_e:
         ui.eq_visible = !ui.eq_visible;
         if (ui.eq_visible) SDL_ShowWindow(ui.weq);
@@ -873,7 +1136,7 @@ static void handle_key(SDL_Event *e) {
         break;
     case SDLK_o: ui_file_open(); break;
     case SDLK_ESCAPE:
-        if (ui.menu) { ui.menu = 0; break; }
+        if (ui.menu) { menu_close(); break; }
         { SDL_Event q; q.type = SDL_QUIT; SDL_PushEvent(&q); } break;
     }
 }
@@ -1022,6 +1285,9 @@ int ui_run(Player *p, int show_pl) {
         return -1;
     }
     if (!show_pl) SDL_HideWindow(ui.wpl);
+    ui.aot = cfg.ui_aot > 0;
+    if (ui.aot) SDL_SetWindowAlwaysOnTop(ui.wmain, SDL_TRUE);
+    if (cfg.ui_mini > 0) ui_set_mini(1);  /* seeds the mini layout + opens all three */
     ui.weq = SDL_CreateWindow("levari - equalizer", ex, ey,
                               EQ_W, EQ_H, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
     if (ui.weq && !ui_show_eq) SDL_HideWindow(ui.weq);
@@ -1039,7 +1305,7 @@ int ui_run(Player *p, int show_pl) {
     int ax, ay;
     SDL_GetWindowPosition(ui.wmain, &ax, &ay);
     if (ax != mx || ay != my) {
-        int py = ay + MAIN_H;
+        int py = ay + (ui.mini ? MINI_H : MAIN_H);
         if (py + PL_H > disp.y + disp.h) py = disp.y + disp.h - PL_H;
         if (py < disp.y) py = disp.y;
         SDL_SetWindowPosition(ui.wpl, ax, py);
@@ -1084,7 +1350,7 @@ int ui_run(Player *p, int show_pl) {
                 ui.seq ? (unsigned)ui.seq->format->BitsPerPixel : 0u,
                 ui.smain->w, ui.smain->h);
 #endif
-    if (ui_show_search) search_open(ui.wmain);
+    if (ui_show_search && !ui.mini) search_open(ui.wmain);
 
     Uint32 next = SDL_GetTicks();
     ui_dirty = D_ALL;
@@ -1184,6 +1450,9 @@ int ui_run(Player *p, int show_pl) {
 #ifdef LV_URL_ENABLED
                 else if (ui.url_visible && ui.wurl && e.window.windowID == SDL_GetWindowID(ui.wurl)) SDL_StartTextInput();
 #endif
+                else if (ui.mini && ui.pl_visible && ui.wpl &&
+                         e.window.windowID == SDL_GetWindowID(ui.wpl) &&
+                         ui_pl_search_focused()) SDL_StartTextInput();
                 else SDL_StopTextInput();
                 /* the set surfaces as a unit: when focus arrives from another
                    app, raise every visible window, not just the one the WM
@@ -1252,6 +1521,15 @@ int ui_run(Player *p, int show_pl) {
             break;
         case SDL_TEXTINPUT:
             if (search_is_open() && ui.focus_wid == search_window_id()) search_text(e.text.text);
+            else if (ui.mini && ui.pl_visible && ui.wpl &&
+                     ui.focus_wid == SDL_GetWindowID(ui.wpl) &&
+                     ui_pl_search_focused()) {
+                /* the merged band field: only while the field holds the
+                   caret — printable keys elsewhere stay with the shortcuts */
+                ui_pl_text(e.text.text);
+                ui_dirty |= D_PL;
+                next = SDL_GetTicks(); /* paint the edit now */
+            }
             else if (ui.opt_visible && ui.wopt && ui.focus_wid == SDL_GetWindowID(ui.wopt)) ui_opt_text(e.text.text);
 #ifdef LV_URL_ENABLED
             else if (ui.url_visible && ui.wurl && ui.focus_wid == SDL_GetWindowID(ui.wurl) &&
@@ -1424,6 +1702,11 @@ int ui_run(Player *p, int show_pl) {
             int srch_focused = so && ui.app_focused &&
                                ui.focus_wid == search_window_id();
             search_set_focus(srch_focused);
+            /* the merged band field's caret blinks on the same cadence
+               while the playlist window holds focus and the field the caret */
+            int pl_srch_focused = ui.mini && ui.pl_visible && ui.app_focused &&
+                                  ui_pl_search_focused() && ui.wpl &&
+                                  ui.focus_wid == SDL_GetWindowID(ui.wpl);
 
             /* the file path field blinks on the same cadence when its
                window holds the caret */
@@ -1514,7 +1797,7 @@ int ui_run(Player *p, int show_pl) {
                     win_present_main(ui.wmain);
                     LV_ACC(blit_us);
                 }
-                if ((ui_dirty & D_PL) && ui.pl_visible) { ui_draw_pl(); win_present(ui.wpl); }
+                if (((ui_dirty & D_PL) || pl_srch_focused) && ui.pl_visible) { ui_draw_pl(); win_present(ui.wpl); }
                 if ((ui_dirty & D_EQ) && ui.eq_visible && ui.weq) { ui_draw_eq(); win_present(ui.weq); }
                 if ((ui_dirty & D_FILE) && ui.file_visible && ui.sfile) { ui_draw_file(); win_present(ui.wfile); }
                 if ((ui_dirty & D_OPT) && ui.opt_visible && ui.sopt) { ui_draw_opt(); win_present(ui.wopt); }
@@ -1538,7 +1821,7 @@ int ui_run(Player *p, int show_pl) {
                position slider keep pace instead of jumping on refocus;
                unfocused idle sleeps on events. */
             if (anim) next = now + (vis_live ? ui_vis_frame_ms(cfg.vis_hz) : 100);
-            else if (srch_focused || file_focused || url_focused) next = now + (unsigned)(500 - (int)(now % 500));
+            else if (srch_focused || file_focused || url_focused || pl_srch_focused) next = now + (unsigned)(500 - (int)(now % 500));
             else if (ui.app_focused) next = now + 1000;
             else if (playing) next = now + 1000;
             else next = 0;   /* unfocused, nothing playing: sleep on events */

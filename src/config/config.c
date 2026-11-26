@@ -76,6 +76,10 @@ static void set_key(const char *k, char *v) {
         int o = onoff(v); if (o >= 0) cfg.fade_stop = o;
     } else if (!strcmp(k, "decode.allow_large")) {
         int o = onoff(v); if (o >= 0) cfg.allow_large = o;
+    } else if (!strcmp(k, "ui.mini")) {
+        int o = onoff(v); if (o >= 0) cfg.ui_mini = o;
+    } else if (!strcmp(k, "ui.always_on_top")) {
+        int o = onoff(v); if (o >= 0) cfg.ui_aot = o;
     } else if (!strcmp(k, "ui.always_10fps")) {
         int o = onoff(v); if (o >= 0) cfg.ui_always10 = o;
     } else if (!strcmp(k, "ui.vis_hz")) {
@@ -83,6 +87,10 @@ static void set_key(const char *k, char *v) {
         if (hz == 24 || hz == 30 || hz == 60) cfg.vis_hz = hz;
         /* anything else (incl. garbage) stays the memset default... which
            is 0, NOT 10: the default is set explicitly in cfg_load below */
+    } else if (!strcmp(k, "audio.replaygain")) {
+        /* memset default 0 = RG_OFF; garbage stays off */
+        if      (!lv_strcasecmp(v, "track")) cfg.replaygain = 1;
+        else if (!lv_strcasecmp(v, "album")) cfg.replaygain = 2;
     } else if (!strcmp(k, "tag.legacy_encoding")) {
         if      (!lv_strcasecmp(v, "auto"))   cfg.tag_legacy_enc = LV_ENC_AUTO;
         else if (!lv_strcasecmp(v, "latin1")) cfg.tag_legacy_enc = LV_ENC_LATIN1;
@@ -160,8 +168,12 @@ static int cfg_save_locked(void) {
     if (cfg.shuffle >= 0) fprintf(f, "player.shuffle = %s\n", onoff_s(cfg.shuffle));
     fprintf(f, "player.fade_stop = %s\n", onoff_s(cfg.fade_stop));
     fprintf(f, "decode.allow_large = %s\n", onoff_s(cfg.allow_large));
+    fprintf(f, "ui.mini = %s\n", onoff_s(cfg.ui_mini));
+    fprintf(f, "ui.always_on_top = %s\n", onoff_s(cfg.ui_aot));
     fprintf(f, "ui.always_10fps = %s\n", onoff_s(cfg.ui_always10));
     fprintf(f, "ui.vis_hz = %d\n", cfg.vis_hz);
+    fprintf(f, "audio.replaygain = %s\n",
+            cfg.replaygain == 1 ? "track" : cfg.replaygain == 2 ? "album" : "off");
     fprintf(f, "tag.legacy_encoding = %s\n", legacy_enc_s(cfg.tag_legacy_enc));
     fclose(f);
     /* mingw's rename refuses to replace an existing file: retry once

@@ -11,7 +11,8 @@
    row + VERIFY beside CLEAR) with the same trailing margin the old
    CHK-column formula left (was MAIN_W + SCAN_W + 2*GAP + CHK_W = 422) */
 #define OPT_W (MAIN_W + 2 * (OPT_SCAN_W + OPT_SCAN_GAP))
-#define OPT_H (MAIN_H + PL_H)
+/* +28: the ADV page's RG row (replaygain cycle) sits below SAVE/CLOSE */
+#define OPT_H (MAIN_H + PL_H + 28)
 #define OPT_FLD_X 100
 #define OPT_FLD_W 207
 #define OPT_FLD_H 18
@@ -34,6 +35,13 @@ static Rect opt_clear_rect(void) { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_G
    the index, visually with CLEAR. The column widened the window (OPT_W). */
 static Rect opt_verify_rect(void) { Rect r = { OPT_FLD_X + OPT_FLD_W + OPT_SCAN_GAP + OPT_SCAN_W + OPT_SCAN_GAP, OPT_ROWS[OPTF_LIBIDX].y, OPT_SCAN_W, OPT_FLD_H }; return r; }
 static Rect opt_tog_rect(int i)  { Rect r = { OPT_FLD_X + i * 52, 190, 48, 14 }; return r; }
+/* always-on-top checkbox: second row under the STARTUP toggles, flush
+   under UI PL. It applies live (shares ui.aot with the main-window AoT
+   button); SAVE only persists it */
+static Rect opt_aot_rect(void)   { Rect r = { OPT_FLD_X, 208, 48, 14 }; return r; }
+/* mini-mode checkbox beside AOT: applies live via ui_set_mini (opens all
+   three windows), SAVE only persists the startup default */
+static Rect opt_mini_rect(void)  { Rect r = { OPT_FLD_X + 52, 208, 48, 14 }; return r; }
 /* BASIC/ADVANCED/ABOUT tab buttons: small tabs in the title bar, right of
    the "OPTIONS" label (ends at x=52); visible on all three pages */
 static Rect opt_tab_basic_rect(void) { Rect r = { 60, 4, 38, 14 }; return r; }
@@ -48,6 +56,7 @@ static Rect opt_fps_rect(void)       { Rect r = { 186, 114, 48, 14 }; return r; 
 static Rect opt_enc_rect(void)       { Rect r = { 186, 150, 72, 14 }; return r; }
 /* VIZ Hz cycle button (ADV page): visualizer band refresh rate */
 static Rect opt_vhz_rect(void)       { Rect r = { 186, 214, 48, 14 }; return r; }
+static Rect opt_rg_rect(void)        { Rect r = { 186, 248, 48, 14 }; return r; }
 /* ui.vis_hz -> the viz tick period; only the four table values ever
    reach here (config clamps, the cycle button walks the same table),
    and the switch default makes a torn value 10 Hz, never a busy loop */
@@ -92,7 +101,7 @@ static const char *opt_ff_label(int ok, const char *ver, int *red) {
     return "ffmpeg: not found - streaming unavailable";
 }
 /* Prefill a BLANK libav.dir field with the directory the probe resolved
-   the libraries from (field report 2026-11-07: detected -> show where). Field
+   the libraries from (design ruling 2026-11-07: detected -> show where). Field
    only — cfg keeps its value until the usual save — and a filled field
    is the user's decision, never overwritten. A pinned dir can make
    loading no worse than an empty one: ff_dlopen falls back to the keg
@@ -108,7 +117,7 @@ void ui_opt_open(void) {
     if (!ui.wopt) {
         int mx, my;
         SDL_GetWindowPosition(ui.wmain, &mx, &my);
-        int ox = mx + MAIN_W;
+        int ox = mx + (ui.mini ? MINI_W : MAIN_W);
         SDL_Rect d;
         if (SDL_GetDisplayBounds(0, &d) == 0 && ox + OPT_W > d.x + d.w) ox = mx - OPT_W;
         ui.wopt = SDL_CreateWindow("levari - options", ox, my,
@@ -145,6 +154,7 @@ void ui_opt_open(void) {
     ui.opt_f10 = cfg.ui_always10 > 0;
     ui.opt_vhz = (cfg.vis_hz == 24 || cfg.vis_hz == 30 || cfg.vis_hz == 60)
                  ? cfg.vis_hz : 10;
+    ui.opt_rg = cfg.replaygain == 1 || cfg.replaygain == 2 ? cfg.replaygain : 0;
     ui.opt_enc = cfg.tag_legacy_enc + 1;   /* LV_ENC_AUTO(-1) -> cycle 0 */
     if (ui.opt_enc < 0 || ui.opt_enc > 4) ui.opt_enc = 0;
     ui.opt_ff = ui_ffprobe_info(ui.opt_ff_ver, sizeof ui.opt_ff_ver,
@@ -206,9 +216,16 @@ static void opt_save(void) {
     if (ui.opt_shuf) cfg.shuffle = ui.pl->shuffle; /* capture the live state now */
     cfg.fade_stop = ui.opt_fade;
     ui.pl->fade_stop = ui.opt_fade; /* apply without waiting for a restart */
+    cfg.ui_aot = ui.aot;            /* persists the live state (button or checkbox) */
+    cfg.ui_mini = ui.mini;          /* ditto: the mini layout startup default */
     cfg.allow_large = ui.opt_large; /* player reads cfg at each load: no restart */
     cfg.ui_always10 = ui.opt_f10;   /* scheduler reads cfg live: no restart */
     cfg.vis_hz = ui.opt_vhz;        /* ditto: the vis tick period is live */
+    cfg.replaygain = ui.opt_rg;     /* ditto: the store lands on the player
+                                       immediately (atomic), the cache
+                                       comparison applies it on the next
+                                       chunk — no restart, no reload */
+    atomic_store_explicit(&ui.pl->rg_mode, ui.opt_rg, memory_order_relaxed);
     cfg.tag_legacy_enc = ui.opt_enc - 1;  /* tag.c reads it live: decoding applies now,
                                              already-indexed rows keep old readings until re-scan */
     cfg_unlock();
@@ -437,6 +454,17 @@ void ui_draw_opt(void) {
         font_puts(s, r.x + (r.w - font_w(TOG[i].l)) / 2, r.y + 3, TOG[i].l,
                   on ? ui_col(s, 0, 255, 0) : ui_col(s, 220, 220, 220));
     }
+    {   /* AOT: reads the LIVE state, not a staged copy — the main-window
+           button can flip it while this window sits open */
+        Rect ra = opt_aot_rect();
+        skin_button(s, &ra, ui.pressed == OPTB_TAOT, ui.aot);
+        font_puts(s, ra.x + (ra.w - font_w("AOT")) / 2, ra.y + 3, "AOT",
+                  ui.aot ? ui_col(s, 0, 255, 0) : ui_col(s, 220, 220, 220));
+        Rect rm = opt_mini_rect();
+        skin_button(s, &rm, ui.pressed == OPTB_TMINI, ui.mini);
+        font_puts(s, rm.x + (rm.w - font_w("MINI")) / 2, rm.y + 3, "MINI",
+                  ui.mini ? ui_col(s, 0, 255, 0) : ui_col(s, 220, 220, 220));
+    }
     } else if (ui.opt_tab == 1) {
         /* ADVANCED page: LARGE = allow ingest of files over the 256 MB
            decode cap (OOM guard for the slurp-based decoders) */
@@ -481,6 +509,17 @@ void ui_draw_opt(void) {
         snprintf(vhzl, sizeof vhzl, "%dHZ", ui.opt_vhz);
         font_puts(s, r4.x + (r4.w - font_w(vhzl)) / 2, r4.y + 3, vhzl,
                   ui.opt_vhz != 10 ? ui_col(s, 0, 224, 255) : ui_col(s, 220, 220, 220));
+        /* 3-state cycle button (NOT a checkbox): ReplayGain playback mode;
+           off is the default, so only track/album color as an override.
+           The row sits below SAVE/CLOSE (OPT_H carries the +28). */
+        font_puts(s, 10, 248, "RG: replaygain playback", ui_col(s, 220, 220, 220));
+        font_puts(s, 10, 262, "cycle: off / track / album", ui_col(s, 120, 120, 120));
+        Rect r5 = opt_rg_rect();
+        skin_button(s, &r5, ui.pressed == OPTB_RG, 0);
+        static const char *RGL[3] = { "OFF", "TRACK", "ALBUM" };
+        const char *rl = RGL[ui.opt_rg % 3];
+        font_puts(s, r5.x + (r5.w - font_w(rl)) / 2, r5.y + 3, rl,
+                  ui.opt_rg ? ui_col(s, 0, 224, 255) : ui_col(s, 220, 220, 220));
     } else {
         /* ABOUT page: static credits, no controls — centered title/icon/
            creator block over a left-aligned thanks list */
@@ -611,7 +650,8 @@ void ui_draw_opt(void) {
     }
     if (ui.opt_hover == OPTB_VHZ) {
         Rect rv = opt_vhz_rect();
-        SDL_Rect tb = { rv.x, rv.y + rv.h + 4, 214, 30 };
+        /* above the button: below sits the RG row (the +28 ADV row) */
+        SDL_Rect tb = { rv.x, rv.y - 34, 214, 30 };
         if (tb.x + tb.w > OPT_W) tb.x = OPT_W - tb.w;
         SDL_FillRect(s, &tb, ui_col(s, 40, 40, 40));
         SDL_Rect t = { tb.x, tb.y, tb.w, 1 }, b = { tb.x, tb.y + tb.h - 1, tb.w, 1 };
@@ -646,6 +686,8 @@ void ui_handle_opt_mouse(SDL_Event *e) {
                 if (ui_in_rect(&te, x, y)) { ui.pressed = OPTB_TENC; return; }
                 Rect tv = opt_vhz_rect();
                 if (ui_in_rect(&tv, x, y)) { ui.pressed = OPTB_VHZ; return; }
+                Rect tr = opt_rg_rect();
+                if (ui_in_rect(&tr, x, y)) { ui.pressed = OPTB_RG; return; }
             }
             if (y < 22) { ui.drag = 11; ui_drag_begin(ui.wopt); ui.opt_focus = -1; }
             return;
@@ -662,6 +704,10 @@ void ui_handle_opt_mouse(SDL_Event *e) {
             Rect tg = opt_tog_rect(i);
             if (ui_in_rect(&tg, x, y)) { ui.pressed = OPTB_TPL + i; return; }
         }
+        Rect ra = opt_aot_rect();
+        if (ui_in_rect(&ra, x, y)) { ui.pressed = OPTB_TAOT; return; }
+        Rect rm = opt_mini_rect();
+        if (ui_in_rect(&rm, x, y)) { ui.pressed = OPTB_TMINI; return; }
         for (int i = 0; i < OPTF_N; i++) {
             Rect f = opt_field_rect(i);
             if (ui_in_rect(&f, x, y)) {
@@ -702,8 +748,26 @@ void ui_handle_opt_mouse(SDL_Event *e) {
                 /* the scheduler reads cfg at tick time; effect lands on
                    SAVE with the rest (no hidden half-applied state) */
             }
+            else if (ui.pressed == OPTB_RG) {
+                Rect trg = opt_rg_rect();
+                if (ui_in_rect(&trg, x, y)) ui.opt_rg = (ui.opt_rg + 1) % 3;  /* off -> track -> album */
+            }
             else if (ui.pressed == OPTB_SAVE && ui_in_rect(&sv, x, y)) opt_save();
             else if (ui.pressed == OPTB_CLOSE && ui_in_rect(&cl, x, y)) ui_opt_close();
+            else if (ui.pressed == OPTB_TMINI) {
+                Rect rm = opt_mini_rect();
+                if (ui_in_rect(&rm, x, y)) ui_set_mini(!ui.mini);
+            }
+            else if (ui.pressed == OPTB_TAOT) {
+                /* own case, NOT folded into the OPTB_TPL.. range check
+                   (that index maps to opt_tog_rect); applies immediately,
+                   persists only through SAVE */
+                Rect ra = opt_aot_rect();
+                if (ui_in_rect(&ra, x, y)) {
+                    ui.aot = !ui.aot;
+                    SDL_SetWindowAlwaysOnTop(ui.wmain, ui.aot ? SDL_TRUE : SDL_FALSE);
+                }
+            }
             else if (ui.pressed >= OPTB_TPL && ui.pressed <= OPTB_TFADE) {
                 int i = ui.pressed - OPTB_TPL;
                 Rect tg = opt_tog_rect(i);

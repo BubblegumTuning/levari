@@ -984,9 +984,186 @@ static unsigned be32(const unsigned char *p) {
            ((unsigned)p[2] << 8) | p[3];
 }
 
+/* ---- ReplayGain extraction (public entry tag_rg_read, near tag_read)
+   Centi-dB values, LV_RG_NONE = absent. The Rg pointer rides the
+   existing tag-block walkers; every other caller passes NULL. ---- */
+typedef struct { int trk, alb; } Rg;
+
+/* "[-]N[.N][ dB]" -> centi-dB. Accepts the U+2212 minus, the unit is
+   case-insensitive with optional spaces; a third decimal digit is
+   truncated. Anything else ("n/a", empty, trailing garbage) fails. */
+static int rg_parse_db(const char *s, int *out) {
+    const char *p = s;
+    int neg = 0;
+    if (!memcmp(p, "\xe2\x88\x82", 3)) { neg = 1; p += 3; }
+    else if (*p == '-') { neg = 1; p++; }
+    else if (*p == '+') p++;
+    int whole = 0, any = 0;
+    while (*p >= '0' && *p <= '9') {
+        whole = whole * 10 + (*p - '0');
+        if (whole > 1000) return 0;
+        p++; any = 1;
+    }
+    if (!any) return 0;
+    int frac = 0;
+    if (*p == '.') {
+        p++;
+        int d1 = -1, d2 = 0;
+        if (*p >= '0' && *p <= '9') { d1 = *p - '0'; p++; }
+        if (*p >= '0' && *p <= '9') { d2 = *p - '0'; p++; }
+        if (d1 < 0) return 0;
+        frac = d1 * 10 + d2;
+    }
+    while (*p == ' ') p++;
+    if (*p) {
+        if (!(toupper((unsigned char)p[0]) == 'D' &&
+              toupper((unsigned char)p[1]) == 'B')) return 0;
+        p += 2;
+        while (*p == ' ') p++;
+        if (*p) return 0;
+    }
+    *out = neg ? -(whole * 100 + frac) : whole * 100 + frac;
+    return 1;
+}
+
+/* TXXX description: uppercased, '_' treated as ' ' (taggers write both
+   spellings). ASCII match: RG taggers use enc 0/3, both ASCII-safe for
+   these keys. */
+static void rg_norm_desc(char *d) {
+    for (char *q = d; *q; q++)
+        *q = *q == '_' ? ' ' : (char)toupper((unsigned char)*q);
+}
+
+/* TXXX frame (id3v2.3/4): enc byte, NUL-terminated description, value */
+static void rg_txxx(Rg *rg, const unsigned char *p, size_t n) {
+    if (n < 3) return;
+    const unsigned char *d = p + 1;
+    size_t dl = 0;
+    while (dl + 1 < n && d[dl]) dl++;
+    if (dl + 1 >= n || dl > 31) return;
+    char desc[32];
+    memcpy(desc, d, dl);
+    desc[dl] = 0;
+    rg_norm_desc(desc);
+    int *slot = !strcmp(desc, "REPLAYGAIN TRACK GAIN") ? &rg->trk :
+                !strcmp(desc, "REPLAYGAIN ALBUM GAIN") ? &rg->alb : NULL;
+    if (!slot) return;
+    const unsigned char *v = d + dl + 1;
+    size_t vl = n - (size_t)(v - p);
+    if (vl > 31) vl = 31;
+    char vb[32];
+    memcpy(vb, v, vl);
+    vb[vl] = 0;
+    int c;
+    if (rg_parse_db(vb, &c)) *slot = c;
+}
+
+/* RVA2 frame (id3v2.4, spec 4.11): identification text + NUL, then per
+   channel: type $xx, adjustment $xx xx = 16-bit signed (adjustment*512),
+   i.e. 1/512 dB, then peak bits $xx + peak bytes. The first channel's
+   adjustment is the one that matters for ReplayGain. */
+static void rg_rva2(Rg *rg, const unsigned char *p, size_t n) {
+    size_t i = 0;
+    while (i < n && p[i]) i++;
+    if (i >= n || i > 31) return;
+    char id[32];
+    memcpy(id, p, i);
+    id[i] = 0;
+    for (char *q = id; *q; q++) *q = (char)toupper((unsigned char)*q);
+    int *slot = !strncmp(id, "TRACK", 5) ? &rg->trk :
+                !strncmp(id, "ALBUM", 5) ? &rg->alb : NULL;
+    if (!slot) return;
+    i++;
+    if (i + 3 > n) return;
+    int adj = (int)(short)((p[i + 1] << 8) | p[i + 2]);
+    *slot = (int)(((long long)adj * 100 + (adj >= 0 ? 256 : -256)) / 512);
+}
+
+/* APEv2 tail reader, RG keys only (WP2). Spec verified 2026-11-25 via
+   hydrogenaud APE_Tags_Header / APE_Tag_Item / Ape_Tags_Flags:
+   footer "APETAGEX" + version LE32 (2000) + tag size LE32 (footer and
+   all items, header EXCLUDED) + item count LE32 + flags LE32 (bit 31 =
+   tag contains a header) + 8 reserved bytes; each item = value size
+   LE32 + item flags LE32 (bits 2..1: 0 = UTF-8 text) + key (ASCII
+   0x20..0x7E) + NUL + value. The tag sits at EOF, or immediately
+   before a trailing ID3v1. Keys are case sensitive per spec but
+   readers are recommended case-insensitive; we normalize like TXXX
+   (uppercase, '_' ~ ' '). Only text items are parsed; a malformed
+   item stops the walk (fail-closed). */
+static void ape_rg_read(FILE *f, Rg *rg) {
+    if (fseek(f, 0, SEEK_END) != 0) return;
+    long fsz = ftell(f);
+    if (fsz < 32) return;
+    long cand[2];
+    int nc = 0;
+    cand[nc++] = fsz - 32;
+    if (fsz >= 160) {
+        unsigned char v1[3];
+        if (fseek(f, fsz - 128, SEEK_SET) == 0 && fread(v1, 1, 3, f) == 3 &&
+            v1[0] == 'T' && v1[1] == 'A' && v1[2] == 'G')
+            cand[nc++] = fsz - 128 - 32;
+    }
+    for (int c = 0; c < nc; c++) {
+        unsigned char fo[32];
+        if (fseek(f, cand[c], SEEK_SET) != 0 || fread(fo, 1, 32, f) != 32)
+            continue;
+        if (memcmp(fo, "APETAGEX", 8) != 0) continue;
+        unsigned ver = fo[8] | (fo[9] << 8) | (fo[10] << 16) | ((unsigned)fo[11] << 24);
+        unsigned size = fo[12] | (fo[13] << 8) | (fo[14] << 16) | ((unsigned)fo[15] << 24);
+        unsigned cnt = fo[16] | (fo[17] << 8) | (fo[18] << 16) | ((unsigned)fo[19] << 24);
+        if (ver < 2000) continue;                    /* v1 has no footer */
+        if (size < 32 || size > (1u << 24)) continue; /* sanity cap, as ID3 */
+        /* size excludes the header (footer flags bit 31), so the items
+           begin exactly size-32 bytes before the footer whether or not
+           a header sits in front of them */
+        long istart = cand[c] - (long)size + 32;
+        if (istart < 0) continue;
+        size_t ilen = (size_t)(cand[c] - istart);
+        unsigned char *ib = malloc(ilen);
+        if (!ib) return;
+        if (fseek(f, istart, SEEK_SET) != 0 || fread(ib, 1, ilen, f) != ilen) {
+            free(ib);
+            continue;
+        }
+        size_t p = 0;
+        for (unsigned i = 0; i < cnt && p + 8 <= ilen; i++) {
+            unsigned vs = ib[p] | (ib[p + 1] << 8) | (ib[p + 2] << 16) | ((unsigned)ib[p + 3] << 24);
+            unsigned ifl = ib[p + 4] | (ib[p + 5] << 8) | (ib[p + 6] << 16) | ((unsigned)ib[p + 7] << 24);
+            p += 8;
+            size_t k0 = p;
+            while (p < ilen && ib[p] >= 0x20 && ib[p] <= 0x7E) p++;
+            if (p == k0 || p - k0 > 255 || p >= ilen || ib[p] != 0) break; /* malformed */
+            p++;
+            if (vs > ilen - p) break;
+            char key[256];
+            memcpy(key, ib + k0, p - k0);
+            key[p - k0] = 0;
+            rg_norm_desc(key);
+            if (((ifl >> 1) & 3) == 0 &&                 /* UTF-8 text item */
+                (!strcmp(key, "REPLAYGAIN TRACK GAIN") ||
+                 !strcmp(key, "REPLAYGAIN ALBUM GAIN"))) {
+                char val[32];
+                size_t vl = vs < 31 ? vs : 31;
+                memcpy(val, ib + p, vl);
+                val[vl] = 0;
+                int db;
+                if (rg_parse_db(val, &db)) {
+                    if (!strcmp(key, "REPLAYGAIN TRACK GAIN")) {
+                        if (rg->trk == LV_RG_NONE) rg->trk = db;
+                    } else if (rg->alb == LV_RG_NONE) rg->alb = db;
+                }
+            }
+            p += vs;
+        }
+        free(ib);
+        break;  /* first well-formed footer wins */
+    }
+}
+
 /* walk ID3v2 frames (ver 2/3/4) from a memory buffer; legacy text frames
-   are stashed into lb, decoded as one block by the caller */
-static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t, LegacyBlock *lb, TagFull *full) {
+   are stashed into lb, decoded as one block by the caller; rg (nullable)
+   collects ReplayGain frames on the way past */
+static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags, Tags *t, LegacyBlock *lb, TagFull *full, Rg *rg) {
     size_t i = 0;
     /* extended header (flag 0x40): without skipping it the frame walk
        starts inside the ext header and loses every frame. v3: 4 plain
@@ -1021,6 +1198,10 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags
             i += 10;
         }
         if (fsz == 0 || i + fsz > sz) break;
+        if (rg && ver >= 3) {
+            if (!memcmp(id, "TXXX", 4)) rg_txxx(rg, buf + i, fsz);
+            else if (!memcmp(id, "RVA2", 4)) rg_rva2(rg, buf + i, fsz);
+        }
         /* id3v2.2 comment frames are 3-char "COM": the 4-byte "COMM"
            compare cannot see them and id[0]=='T' never matches, so the
            v2.2 gate must name them explicitly (their payload shape —
@@ -1051,9 +1232,9 @@ static void id3v2_frames(const unsigned char *buf, size_t sz, int ver, int flags
    which the real duration must subtract. */
 typedef struct { int rate; int preskip; int is_opus; } OggClock;
 static int read_ogg(const unsigned char *buf, size_t n, Tags *t, TagFull *full,
-                    OggClock *clk);
+                    OggClock *clk, Rg *rg);
 static int flac_blocks(const unsigned char *b, size_t n, Tags *t,
-                       TagFull *full, int *rate_out);
+                       TagFull *full, int *rate_out, Rg *rg);
 /* did any dump field arrive? decides the tag_probe-basics fallback */
 static int full_any(const TagFull *f) {
     return f->title[0] || f->artist[0] || f->album[0] || f->album_artist[0] ||
@@ -1075,7 +1256,7 @@ void tag_read_full(const char *path, TagFull *f) {
                 if (b && fread(b, 1, sz, fp) == sz) {
                     Tags basic = {{0}, {0}, {0}, 0};
                     LegacyBlock lb = {0};
-                    id3v2_frames(b, sz, h[3], h[5], &basic, &lb, f);
+                    id3v2_frames(b, sz, h[3], h[5], &basic, &lb, f, NULL);
                     parsed = 1;          /* lb_finish intentionally NOT run */
                 }
                 free(b);
@@ -1089,7 +1270,7 @@ void tag_read_full(const char *path, TagFull *f) {
             if (b) {
                 size_t n = fread(b, 1, TAG_HEAD, fp);
                 Tags basic = {{0}, {0}, {0}, 0};
-                read_ogg(b, n, &basic, f, NULL);
+                read_ogg(b, n, &basic, f, NULL, NULL);
                 if (full_any(f)) parsed = 1;
                 free(b);
             }
@@ -1103,7 +1284,7 @@ void tag_read_full(const char *path, TagFull *f) {
             if (b && fseek(fp, 0, SEEK_SET) == 0) {
                 size_t n = fread(b, 1, TAG_HEAD, fp);
                 Tags basic = {{0}, {0}, {0}, 0};
-                flac_blocks(b + 4, n > 4 ? n - 4 : 0, &basic, f, NULL);
+                flac_blocks(b + 4, n > 4 ? n - 4 : 0, &basic, f, NULL, NULL);
                 if (full_any(f)) parsed = 1;
             }
             free(b);
@@ -1150,7 +1331,7 @@ static int tags_complete(const Tags *t) {
     return t->title[0] && t->artist[0];
 }
 
-static void vorbis_comment(Tags *t, TagFull *full, const unsigned char *p, size_t n) {
+static void vorbis_comment(Tags *t, TagFull *full, const unsigned char *p, size_t n, Rg *rg) {
     /* p points after 0x03 "vorbis" */
     if (n < 8) return;
     unsigned rd = p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24);
@@ -1182,6 +1363,16 @@ static void vorbis_comment(Tags *t, TagFull *full, const unsigned char *p, size_
             memcpy(b, val, k);
             t->track = atoi(b);
         }
+        else if (rg && (!strcmp(key, "REPLAYGAIN_TRACK_GAIN") ||
+                        !strcmp(key, "REPLAYGAIN_ALBUM_GAIN"))) {
+            char vb[32];
+            size_t k = vl < 31 ? vl : 31;
+            memcpy(vb, val, k);
+            vb[k] = 0;
+            int c;
+            if (rg_parse_db(vb, &c))
+                *(!strcmp(key, "REPLAYGAIN_TRACK_GAIN") ? &rg->trk : &rg->alb) = c;
+        }
         if (full) full_fill_vorbis(full, key, val, vl);
         p += cl; n -= cl;
     }
@@ -1211,7 +1402,7 @@ static int flac_streaminfo_dur(const unsigned char *p, size_t n, int *rate_out) 
    whenever STREAMINFO carries one (the Ogg-granule duration fallback needs
    it even when total_samples is zero, as ffmpeg writes it). */
 static int flac_blocks(const unsigned char *b, size_t n, Tags *t,
-                       TagFull *full, int *rate_out) {
+                       TagFull *full, int *rate_out, Rg *rg) {
     size_t i = 0;
     int dur = 0;
     for (;;) {
@@ -1222,7 +1413,7 @@ static int flac_blocks(const unsigned char *b, size_t n, Tags *t,
         i += 4;
         if (blen > n - i) break;
         if (type == 0) dur = flac_streaminfo_dur(b + i, blen, rate_out);
-        else if (type == 4) vorbis_comment(t, full, b + i, blen);
+        else if (type == 4) vorbis_comment(t, full, b + i, blen, rg);
         i += blen;
         if (last || (dur && tags_complete(t))) break;
     }
@@ -1241,7 +1432,7 @@ static int flac_blocks(const unsigned char *b, size_t n, Tags *t,
    granulepos when the headers carry none.
    Returns duration seconds (only FLAC STREAMINFO provides it here), 0 = unknown. */
 static int read_ogg(const unsigned char *buf, size_t n, Tags *t, TagFull *full,
-                    OggClock *clk) {
+                    OggClock *clk, Rg *rg) {
     size_t i = 0;
     unsigned char pkt[65536];
     size_t pn = 0;
@@ -1273,23 +1464,23 @@ static int read_ogg(const unsigned char *buf, size_t n, Tags *t, TagFull *full,
                     if (clk)                          /* ident: ver u32, ch u8, rate u32 */
                         clk->rate = pkt[12] | (pkt[13] << 8) | (pkt[14] << 16) | ((unsigned)pkt[15] << 24);
                 } else if (pn > 7 && pkt[0] == 0x03 && memcmp(pkt + 1, "vorbis", 6) == 0) {
-                    vorbis_comment(t, full, pkt + 7, pn - 7);
+                    vorbis_comment(t, full, pkt + 7, pn - 7, rg);
                     return dur;
                 } else if (pn >= 8 && memcmp(pkt, "OpusTags", 8) == 0) {
-                    vorbis_comment(t, full, pkt + 8, pn - 8);
+                    vorbis_comment(t, full, pkt + 8, pn - 8, rg);
                     return dur;
                 } else if (pn >= 5 && pkt[0] == 0x7F && memcmp(pkt + 1, "FLAC", 4) == 0) {
                     flac = 1;
                     /* marker = 0x7F "FLAC" + major + minor + 2B header-packet
                        count; ffmpeg embeds the fLaC magic + first blocks here */
                     if (pn >= 13 && memcmp(pkt + 9, "fLaC", 4) == 0)
-                        dur = flac_blocks(pkt + 13, pn - 13, t, full, clk ? &clk->rate : NULL);
+                        dur = flac_blocks(pkt + 13, pn - 13, t, full, clk ? &clk->rate : NULL, rg);
                 } else if (flac && pn >= 4) {
                     unsigned type = pkt[0] & 0x7F;
                     if (type == 0)
                         dur = flac_streaminfo_dur(pkt + 4, pn - 4, clk ? &clk->rate : NULL);
                     else if (type == 4) {
-                        vorbis_comment(t, full, pkt + 4, pn - 4);
+                        vorbis_comment(t, full, pkt + 4, pn - 4, rg);
                         return dur;
                     }
                 }
@@ -1566,13 +1757,13 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
             if (sz <= (1u << 24)) {
                 LegacyBlock lb = {0};
                 if (10 + sz <= n) {
-                    id3v2_frames(b + 10, sz, b[3], b[5], t, &lb, NULL);
+                    id3v2_frames(b + 10, sz, b[3], b[5], t, &lb, NULL, NULL);
                 } else {
                     /* tag larger than the head buffer: one follow-up read */
                     unsigned char *tb = malloc(sz);
                     if (tb && fseek(f, 10, SEEK_SET) == 0 &&
                         fread(tb, 1, sz, f) == sz)
-                        id3v2_frames(tb, sz, b[3], b[5], t, &lb, NULL);
+                        id3v2_frames(tb, sz, b[3], b[5], t, &lb, NULL, NULL);
                     free(tb);
                 }
                 lb_finish(&lb, t, 0);   /* one verdict for the whole v2 block */
@@ -1596,14 +1787,14 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
         if (!tags_complete(t)) read_id3v1(f, t);
     } else if (n >= 4 && b[0]=='O' && b[1]=='g' && b[2]=='g' && b[3]=='S') {
         OggClock clk = {0, 0, 0};
-        dur = read_ogg(b, n, t, NULL, &clk);
+        dur = read_ogg(b, n, t, NULL, &clk, NULL);
         /* Opus and Vorbis carry no length in their headers (and ffmpeg
            zeroes STREAMINFO's total_samples in Ogg FLAC): the end-of-stream
            granulepos holds it. Only pays the tail seek when the walk found
            a usable clock but no duration. */
         if (!dur && clk.rate) dur = ogg_tail_duration(f, b, size_hint, &clk);
     } else if (n >= 4 && b[0]=='f' && b[1]=='L' && b[2]=='a' && b[3]=='C') {
-        dur = flac_blocks(b + 4, n - 4, t, NULL, NULL);
+        dur = flac_blocks(b + 4, n - 4, t, NULL, NULL, NULL);
     } else if (n >= 4 && b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F') {
         fseek(f, 0, SEEK_SET);
         read_riff(f, t);
@@ -1626,4 +1817,54 @@ int tag_probe(const char *path, long long size_hint, Tags *t) {
 
 void tag_read(const char *path, Tags *t) {
     tag_probe(path, 0, t);
+}
+
+/* ReplayGain: one open, one walk of the tag block. The display walkers
+   are reused with throwaway Tags/LegacyBlock so their behaviour is
+   byte-identical for every other caller (they pass rg = NULL). */
+void tag_rg_read(const char *path, int *trk, int *alb) {
+    Rg rg = { LV_RG_NONE, LV_RG_NONE };
+    FILE *f = fopen(path, "rb");
+    if (!f) { *trk = *alb = LV_RG_NONE; return; }
+    unsigned char *b = malloc(TAG_HEAD);
+    if (!b) { fclose(f); *trk = *alb = LV_RG_NONE; return; }
+    size_t n = fread(b, 1, TAG_HEAD, f);
+    if (n >= 3 && b[0] == 'I' && b[1] == 'D' && b[2] == '3') {
+        if (n >= 10 && b[3] >= 2 && b[3] <= 4) {
+            size_t sz = ((size_t)b[6] << 21) | ((size_t)b[7] << 14) |
+                        ((size_t)b[8] << 7) | b[9];
+            if (sz <= (1u << 24)) {
+                Tags dummy;
+                tag_init(&dummy);
+                LegacyBlock lb = { 0 };
+                if (10 + sz <= n)
+                    id3v2_frames(b + 10, sz, b[3], b[5], &dummy, &lb, NULL, &rg);
+                else {
+                    unsigned char *tb = malloc(sz);
+                    if (tb && fseek(f, 10, SEEK_SET) == 0 &&
+                        fread(tb, 1, sz, f) == sz)
+                        id3v2_frames(tb, sz, b[3], b[5], &dummy, &lb, NULL, &rg);
+                    free(tb);
+                }
+            }
+        }
+    } else if (n >= 4 && b[0] == 'f' && b[1] == 'L' && b[2] == 'a' && b[3] == 'C') {
+        Tags dummy;
+        tag_init(&dummy);
+        flac_blocks(b + 4, n - 4, &dummy, NULL, NULL, &rg);
+    } else if (n >= 4 && b[0] == 'O' && b[1] == 'g' && b[2] == 'g' && b[3] == 'S') {
+        Tags dummy;
+        tag_init(&dummy);
+        OggClock clk = { 0, 0, 0 };
+        read_ogg(b, n, &dummy, NULL, &clk, &rg);
+    }
+    /* APEv2 coexists with any container (MP3 with APEv2, FLAC with
+       APEv2, ...) and lives at the tail — probe only what the head
+       formats left unfilled */
+    if (rg.trk == LV_RG_NONE || rg.alb == LV_RG_NONE)
+        ape_rg_read(f, &rg);
+    free(b);
+    fclose(f);
+    *trk = rg.trk;
+    *alb = rg.alb;
 }

@@ -35,6 +35,21 @@ For a per-button reference of every control in each window, see
   window is open; `Esc`/`X` closes, the title strip drags. Compiled
   only with `-DLV_STREAMING=ON` (the default); details in
   [usage.md](usage.md#streaming).
+- **Mini mode** (right-click → `MINI MODE`; in mini, right-click anywhere
+  on the bar → `EXIT MINI`) — a 320x22 one-line main bar sized with the
+  playlist for a 320x240 screen: static `levari` name,
+  BACK/PLAY/STOP/NEXT symbol buttons, title scroller box in the small
+  font (double-click it to switch to the spectrum band and back), and an
+  elapsed-time box at the right end (fits `99:59+`, saturating there;
+  PLAY is a play/pause toggle, green while playing). Entering mini opens
+  the playlist (320 wide, small-font rows) and closes the search window:
+  in mini the playlist's title band hosts the search field — typing turns
+  the list into the result list, clearing reverts (see buttons.md). The
+  mini menu toggles `PLAYLIST` off/on. Dragging the bar carries the
+  docked playlist; in mini the playlist also drags from the button row's
+  empty right part and the list's left margin. No seek/volume/EQ/shuffle/
+  repeat/A–B/URL in mini — exit to restore them. Startup default:
+  `ui.mini` (options `MINI` checkbox + `SAVE`).
 - **Options** (right-click the main window's title bar → `OPTIONS...`) —
   opens docked flush to the main window's right edge, top-aligned, as wide
   as the main+playlist stack plus a margin for the `SCAN` button.
@@ -92,7 +107,8 @@ snapped window then moves together with the main window until dragged away.
 Dragging the playlist gets the same live snap on the bottom side: within
 12 px of the main window's bottom edge it snaps flush under it (x
 aligning when close), and while docked it follows the main window;
-dragging away undocks it.
+dragging away undocks it. In mini the window additionally drags from the
+button row's empty right part and the list's left margin (see buttons.md).
 
 The search window opens docked flush to the main window's left edge,
 top-aligned, and is exactly as tall as the main+playlist stack, so the
@@ -103,7 +119,8 @@ there is no room on the left).
 
     x play   c pause   Space play/pause   v stop   b prev   n next
     s shuffle   r repeat   Ctrl+L rescan tags
-    Ctrl+F (Cmd+F on Mac) open + focus the search window
+    Ctrl+F (Cmd+F on Mac) open + focus the search window (in mini: focus
+    the playlist's merged search field)
     e equalizer   o open browser
     Left/Right seek ±5s   Up/Down step the playlist selection by one
     row (the view follows)   +/= louder, - quieter (numpad too)

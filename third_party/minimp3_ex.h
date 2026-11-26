@@ -229,7 +229,12 @@ static int mp3dec_check_vbrtag(const uint8_t *frame, int frame_size, uint32_t *f
     if (frame_size_u - tag_off < 4)
         return 0;
     tag = frame + tag_off;
-    *frames = (uint32_t)(tag[0] << 24) | (tag[1] << 16) | (tag[2] << 8) | tag[3];
+    /* LEVARI PATCH: tag[0] << 24 with tag[0]>=128 overflows signed int (UBSan,
+       night 2026-11-24, 2 hits) — the second APE-tag read the 3a17cc8 fix
+       missed (the tag_size site above casts before the shift; this one cast
+       after it, which does not help). Upstream lieff/minimp3 master identical
+       and unfixed. Cast before the shift; value unchanged. */
+    *frames = ((uint32_t)tag[0] << 24) | (tag[1] << 16) | (tag[2] << 8) | tag[3];
     tag_off += 4;
     if (flags & BYTES_FLAG)
     {

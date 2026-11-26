@@ -14,6 +14,9 @@ const Rect R_EQ      = {8, 78, 26, 12};
 const Rect R_LIST    = {38, 78, 26, 12};
 /* URL button beside LST (row 4, the free slot right after it) */
 const Rect R_URL     = {68, 78, 26, 12};
+/* always-on-top toggle: right end of the LST/URL row, its right edge
+   flush with the timeline's (R_SEEK ends at MAIN_W-8) */
+const Rect R_AOT     = {MAIN_W - 34, 78, 26, 12};
 /* row 5: timeline slider, full width (8px margins like R_INFO) */
 const Rect R_SEEK    = {8, 94, MAIN_W - 16, 12};
 const Rect R_PREV    = {8, 110, 45, 18};
@@ -301,7 +304,7 @@ int font_utf8_next(const char *s, unsigned *cp) {
 /* unifont 8-wide codepoints (latin-1, curly quotes, dashes...) advance
    half-width like ascii; only fullwidth cjk takes the wide cell */
 static int half16(unsigned cp) { return cp < 0x80 || cjk_halfwidth(cp); }
-static int font_cp_w(unsigned cp) { return half16(cp) ? 6 : CJK_GLYPH_W + 1; }
+int font_cp_w(unsigned cp) { return half16(cp) ? 6 : CJK_GLYPH_W + 1; }
 /* widths on the 16px grid: half-width is 8+1, CJK is 16+1 */
 int font_cp_w16(unsigned cp) { return half16(cp) ? 9 : CJK_GLYPH_W + 1; }
 
@@ -343,6 +346,29 @@ void font_puts(SDL_Surface *s, int x, int y, const char *str, Uint32 color) {
     }
 }
 
+/* one codepoint on the small-font baseline y, pixels clipped to [cx0, cx1)
+   (putpx ignores clip_rect, so the marquee needs an explicit horizontal
+   clip; CJK rides the 16px cell bottom-aligned, same as font_puts) */
+void font_putcp_clip(SDL_Surface *s, int x, int y, unsigned cp, Uint32 color, int cx0, int cx1) {
+    if (cp < 0x80) {
+        if (cp < 32 || cp > 126) cp = '?';
+        const unsigned char *g = FONT[cp - 32];
+        for (int col = 0; col < 5; col++) {
+            int px = x + col;
+            if (px < cx0 || px >= cx1) continue;
+            unsigned char bits = g[col];
+            for (int row = 0; row < 7; row++) {
+                if (!(bits & (1 << row))) continue;
+                int py = y + row;
+                if (py < 0 || py >= s->h) continue;
+                putpx(s, px, py, color);
+            }
+        }
+    } else {
+        font_putcp16_clip(s, x, y - 9, cp, color, cx0, cx1);
+    }
+}
+
 /* text inside a 16px line box whose top is y */
 void font_puts16(SDL_Surface *s, int x, int y, const char *str, Uint32 color) {
     while (*str) {
@@ -373,6 +399,23 @@ int font_fit(const char *s, int maxw) {
         unsigned cp;
         int n = font_utf8_next(q, &cp);
         int w = font_cp_w16(cp);
+        if (used + w > maxw + 1) break;
+        used += w;
+        bytes += n;
+        q += n;
+    }
+    return bytes;
+}
+
+/* the small-font twin of font_fit (5x7 grid advances) — for rows drawn
+   with font_puts (mini playlist) */
+int font_fit_small(const char *s, int maxw) {
+    int used = 0, bytes = 0;
+    const char *q = s;
+    while (*q) {
+        unsigned cp;
+        int n = font_utf8_next(q, &cp);
+        int w = font_cp_w(cp);
         if (used + w > maxw + 1) break;
         used += w;
         bytes += n;

@@ -159,27 +159,36 @@ static void load_track(Player *p, int idx, int report) {
     /* tag_read is file I/O (128 KB head read, slow on network shares) and
        the UI draw path blocks on p->mtx every frame: probe the tags BEFORE
        taking the lock, then write them back under it only if the row is
-       still the same file (the daemon may have swapped the playlist). */
+       still the same file (the daemon may have swapped the playlist).
+       The ReplayGain probe rides the same off-lock window. */
     char path[LV_MAX_PATH] = "";
-    int need_tags = 0;
+    int need_tags = 0, want_rg = 0;
     pthread_mutex_lock(&p->mtx);
     if (idx >= 0 && idx < p->pl->count) {
         Track *t = &p->pl->items[idx];
-        if (!t->tags.title[0] && !t->notag) {
-            lv_strlcpy(path, t->path, sizeof path);
-            need_tags = 1;
-        }
+        lv_strlcpy(path, t->path, sizeof path);
+        if (!t->tags.title[0] && !t->notag) need_tags = 1;
+        want_rg = p->rg_mode != RG_OFF;
     }
     pthread_mutex_unlock(&p->mtx);
     Tags tags;
     tag_init(&tags);
     if (need_tags) tag_read(path, &tags);
+    int rg_trk = LV_RG_NONE, rg_alb = LV_RG_NONE;
+    if (want_rg && path[0]) tag_rg_read(path, &rg_trk, &rg_alb);
     pthread_mutex_lock(&p->mtx);
     if (need_tags && idx >= 0 && idx < p->pl->count &&
         !strcmp(p->pl->items[idx].path, path) &&
         !p->pl->items[idx].tags.title[0]) {
         p->pl->items[idx].tags = tags;
         pl_touch(p->pl);   /* the search cache must see tags that arrive this late */
+    }
+    if (idx >= 0 && idx < p->pl->count && !strcmp(p->pl->items[idx].path, path)) {
+        p->rg_trk = rg_trk;
+        p->rg_alb = rg_alb;
+    } else {
+        p->rg_trk = p->rg_alb = LV_RG_NONE;  /* row swapped mid-probe: no gain
+                                                until the swap's own load runs */
     }
     load_track_locked(p, idx, report);
     pthread_mutex_unlock(&p->mtx);
@@ -247,6 +256,31 @@ static void apply_pan(int16_t *buf, int frames, int ch, int pan) {
         buf[i * 2]     = (int16_t)((int32_t)buf[i * 2] * lg / 128);
         buf[i * 2 + 1] = (int16_t)((int32_t)buf[i * 2 + 1] * rg / 128);
     }
+}
+
+/* ReplayGain: consumer-side cache shaped exactly like eq_process's
+   preamp cache — every writer (the mode store, the per-track values)
+   is caught by the comparison, one pow per change not per chunk.
+   Applied BEFORE eq_process so the EQ and its preamp ride on top of
+   the RG gain; album mode falls back to track gain when the album
+   value is absent. Mode OFF leaves the unity q in place. */
+static void rg_apply(Player *p, int16_t *buf, int frames, int ch) {
+    int mode = atomic_load_explicit(&p->rg_mode, memory_order_relaxed);
+    int cdb = LV_RG_NONE;
+    if (mode == RG_TRACK)
+        cdb = atomic_load_explicit(&p->rg_trk, memory_order_relaxed);
+    else if (mode == RG_ALBUM) {
+        cdb = atomic_load_explicit(&p->rg_alb, memory_order_relaxed);
+        if (cdb == LV_RG_NONE)
+            cdb = atomic_load_explicit(&p->rg_trk, memory_order_relaxed);
+    }
+    if (cdb == LV_RG_NONE) cdb = 0;
+    float db = (float)cdb / 100.0f;
+    if (db != p->rg_cache_db) {
+        p->rg_cache_db = db;
+        p->rg_q = rg_q_for_db(db);
+    }
+    rg_scale(p->rg_q, buf, frames * ch);
 }
 
 static void *player_thread(void *arg) {
@@ -352,6 +386,7 @@ static void *player_thread(void *arg) {
             }
             int got = dec_read(p->dec, buf, CHUNK);
             if (got > 0) {
+                rg_apply(p, buf, got, p->ch);
                 eq_process(&p->eq, buf, got, p->ch);
                 /* the mono downmix + copy exists ONLY for the viz band:
                    with the band off (viz_feed=0, set by the UI at toggle
@@ -459,6 +494,8 @@ void pl_player_init(Player *p, Playlist *pl) {
     p->speed = 100;
     p->ab_a = p->ab_b = -1;
     p->track_start = p->track_end = 0;
+    p->rg_trk = p->rg_alb = LV_RG_NONE;   /* memset zero is 0.00 dB, not absent */
+    p->rg_q = 16384;                      /* unity: the cache starts applied */
     pthread_mutex_init(&p->mtx, NULL);
     pthread_mutex_init(&p->viz_mtx, NULL);
     LV_WAKE_INIT(&p->wake);

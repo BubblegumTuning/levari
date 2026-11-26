@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { SB_NONE, SB_X, SB_SCOPE, SB_QUEUE };
+enum { SCHB_NONE, SCHB_X, SCHB_SCOPE, SCHB_QUEUE };
 
 #define SRCH_W 340
 #define SRCH_H (MAIN_H + PL_H) /* left column as tall as main+playlist: the trio forms a rectangle */
@@ -334,15 +334,21 @@ static void res_push(const char *path, const char *title, const char *artist, in
     r->pl_idx = pl_idx;
 }
 
-static void run_search(void) {
-    nres = 0; sel = 0; scroll = 0;
+/* the shared matcher: fills res[]/nres for the query q in scope sc
+   (0 = playlist, 1 = library). Two hosts ride this one copy: the search
+   window (run_search below) and the merged mini field in the playlist
+   window (search_engine_run) — only one host is ever live, entering mini
+   closes the window. sel/scroll are HOST state: the engine never touches
+   them, each caller owns its view. */
+static void run_search_q(const char *q, int sc) {
+    nres = 0;
     char nq[512];
-    norm(query, nq, sizeof nq);
+    norm(q, nq, sizeof nq);
     const char *toks[8];
     int ntok = tokenize(nq, toks);
     if (!ntok) return;
 
-    if (scope == 0) {
+    if (sc == 0) {
         pthread_mutex_lock(&sp->mtx);
         pc_sync(sp->pl);
         int cached = pcache_key == sp->pl && pcache_gen == sp->pl->gen;
@@ -404,6 +410,13 @@ static void run_search(void) {
         }
         free(c);
     }
+}
+
+/* the search window's own pass: its statics, plus the view reset the
+   engine deliberately leaves to hosts (testsearchsb pins this shape) */
+static void run_search(void) {
+    sel = 0; scroll = 0;
+    run_search_q(query, scope);
 }
 
 static void do_jump(Result *r) {
@@ -584,7 +597,7 @@ static void draw_edit(void) {
         SDL_Rect c = { cx, edit.y + 2, 1, 14 };
         SDL_FillRect(sf, &c, col(0, 255, 0));
     }
-    skin_button(sf, &scopeb, pressed == SB_SCOPE, 0);
+    skin_button(sf, &scopeb, pressed == SCHB_SCOPE, 0);
     const char *lbl = scope ? "LIB" : "PL";
     font_puts(sf, scopeb.x + (scopeb.w - font_w(lbl)) / 2, scopeb.y + 3, lbl,
               scope ? col(0, 255, 0) : col(220, 220, 220));
@@ -595,7 +608,7 @@ void search_draw(void) {
     skin_window_bg(sf, SRCH_W, SRCH_H);
     font_puts(sf, 10, 6, "SEARCH", col(0, 224, 255));
     Rect xc = srch_close_rect();
-    draw_x(sf, &xc, pressed == SB_X);
+    draw_x(sf, &xc, pressed == SCHB_X);
     draw_edit();
 
     SRCH_LIST_RECT;
@@ -630,7 +643,7 @@ void search_draw(void) {
        together, so an invisible control can never be clicked) */
     if (scope) {
         Rect qb = srch_queue_rect();
-        skin_button(sf, &qb, pressed == SB_QUEUE, 0);
+        skin_button(sf, &qb, pressed == SCHB_QUEUE, 0);
         font_puts(sf, qb.x + (qb.w - font_w("ADD")) / 2, qb.y + 3, "ADD",
                   col(220, 220, 220));
     }
@@ -655,11 +668,11 @@ void search_mouse(SDL_Event *e) {
     int lines = list.h / SRCH_LINEH;
     if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
         Rect xc = srch_close_rect();
-        if (in_rect(&xc, x, y)) { pressed = SB_X; return; }
-        if (in_rect(&scopeb, x, y)) { pressed = SB_SCOPE; return; }
+        if (in_rect(&xc, x, y)) { pressed = SCHB_X; return; }
+        if (in_rect(&scopeb, x, y)) { pressed = SCHB_SCOPE; return; }
         if (scope) {
             Rect qb = srch_queue_rect();
-            if (in_rect(&qb, x, y)) { pressed = SB_QUEUE; return; }
+            if (in_rect(&qb, x, y)) { pressed = SCHB_QUEUE; return; }
         }
         if (in_rect(&edit, x, y)) {
             qtf.selall = 0;
@@ -714,18 +727,18 @@ void search_mouse(SDL_Event *e) {
         }
     } else if (e->type == SDL_MOUSEBUTTONUP) {
         Rect xc = srch_close_rect();
-        if (pressed == SB_X && in_rect(&xc, x, y)) search_close();
-        else if (pressed == SB_SCOPE && in_rect(&scopeb, x, y)) {
+        if (pressed == SCHB_X && in_rect(&xc, x, y)) search_close();
+        else if (pressed == SCHB_SCOPE && in_rect(&scopeb, x, y)) {
             scope = !scope;
             run_search();
         }
-        else if (pressed == SB_QUEUE) {
+        else if (pressed == SCHB_QUEUE) {
             /* no scope gate needed on UP: pressed can only arm while the
                button is drawn, and scope cannot toggle mid-press */
             Rect qb = srch_queue_rect();
             if (in_rect(&qb, x, y)) do_queue();
         }
-        pressed = SB_NONE;
+        pressed = SCHB_NONE;
         if (drag == 1) {
             ui_drag_bounce(w, sxlo, sxhi, sylo, syhi);
             drag = 0;
@@ -820,29 +833,33 @@ void search_key(SDL_Event *e) {
     }
 }
 
+/* the ONE typed-query codepoint filter: tab is accepted (tokenize splits
+   on it), DEL, the C1 range and surrogates smuggled in as 3-byte CESU-8
+   must not reach the matcher or the render loop. Returns the bytes
+   written (0 = nothing survived); out is always NUL-terminated. Shared
+   by search_text and the merged mini field (ui_pl.c). */
+int search_filter_query(const char *text, char *out, size_t n) {
+    size_t o = 0;
+    const char *q = text;
+    while (*q && o + 4 < n) {
+        unsigned cp;
+        int nl = font_utf8_next(q, &cp);
+        int keep = cp == 0x09 || (cp >= 0x20 && cp < 0x7F) ||
+                   (cp >= 0xA0 && !(cp >= 0xD800 && cp <= 0xDFFF));
+        if (keep) o += (size_t)utf8_enc(cp, out + o);
+        q += nl;
+    }
+    out[o] = 0;
+    return (int)o;
+}
+
 void search_text(const char *text) {
     if (eat_plus) {
         eat_plus = 0;
         if (!strcmp(text, "+")) return; /* the + KEYDOWN already queued */
     }
-    /* keep the matcher guard: tab is accepted (tokenize splits on it),
-       DEL, the C1 range and surrogates smuggled in as 3-byte CESU-8
-       must not reach the matcher or the render loop; the surviving
-       insert rides the shared tf_insert (caret + select-all semantics
-       identical to every other field) */
     char clean[512];
-    size_t o = 0;
-    const char *q = text;
-    while (*q && o + 4 < sizeof clean) {
-        unsigned cp;
-        int n = font_utf8_next(q, &cp);
-        int keep = cp == 0x09 || (cp >= 0x20 && cp < 0x7F) ||
-                   (cp >= 0xA0 && !(cp >= 0xD800 && cp <= 0xDFFF));
-        if (keep) o += (size_t)utf8_enc(cp, clean + o);
-        q += n;
-    }
-    if (!o) return;
-    clean[o] = 0;
+    if (!search_filter_query(text, clean, sizeof clean)) return;
     tf_insert(&qtf, clean);
     if (query[0]) run_search();
     else { nres = 0; sel = scroll = 0; }
@@ -864,4 +881,25 @@ void search_focus_drag(void) {
         srx = wx; sry = wy;
         sxlo = sxhi = sylo = syhi = 0;
     }
+}
+
+/* ---- merged mini search: the playlist window (ui_pl.c) hosts the query
+   field and the result list; the matcher and the result set are shared
+   with the search window. Only one host is ever live: entering mini
+   closes the window, and the merged field exists only in mini. ---- */
+
+void search_engine_run(const char *q, int sc) { run_search_q(q, sc); }
+
+int search_engine_count(void) { return nres; }
+
+const char *search_engine_disp(int i) {
+    return i >= 0 && i < nres ? res[i].disp : "";
+}
+
+int search_engine_pl_idx(int i) {
+    return i >= 0 && i < nres ? res[i].pl_idx : -1;
+}
+
+void search_engine_jump(int i) {
+    if (i >= 0 && i < nres) do_jump(&res[i]);
 }

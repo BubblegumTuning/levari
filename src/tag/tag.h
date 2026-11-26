@@ -32,6 +32,12 @@ void tag_read_full(const char *path, TagFull *f);
 void tag_init(Tags *t);
 /* fills whatever it can find; never fails hard */
 void tag_read(const char *path, Tags *t);
+/* ---- ReplayGain extraction (playback-time, the index never carries it)
+   One open, one walk of the tag block only (ID3v2 TXXX/RVA2, Vorbis
+   comments via fLaC/OggS): fills centi-dB values, LV_RG_NONE = absent.
+   Never fails hard; absent on any unreadable/unknown file. */
+#define LV_RG_NONE (-32768)
+void tag_rg_read(const char *path, int *trk, int *alb);
 /* tags + duration estimate in one open and one head read: MP3 duration
    comes from XING/VBRI or a CBR size/bitrate estimate (size_hint from the
    caller's stat, 0 = stat internally); Ogg streams with no length in their
