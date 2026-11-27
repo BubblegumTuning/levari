@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(levari VERSION 0.4.0 LANGUAGES C)
+project(levari VERSION 0.4.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -98,6 +98,21 @@ set(VEND_WARN -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
     -Wno-unused-variable -Wno-unused-but-set-variable
     -Wno-implicit-fallthrough)
 set(VEND_HARD -fstack-protector-strong -D_FORTIFY_SOURCE=2)
+
+# Windows LTO (forwarded optimize-report item 12, adjudicated 2026-11-27):
+# the flagship win build links with LTO like every other platform. The
+# old MinGW link failure (LTO IR hides main() from the linker's
+# archive-member selection, so mingw's crtexewin.o wins) is fixed by
+# compiling src/main.c / src/mcp/mcp_main.c with -fno-lto (see the
+# set_source_files_properties sites). The era build (LV_WIN9X) stays
+# LTO-free: its interposition shims and import-table gate ride
+# archive-member selection and the artifact is hardware-settled — LTO
+# there means a re-verification battery on a real 98 box, not a flip.
+if(WIN32 AND NOT LV_WIN9X)
+    set(LV_WIN_LTO -flto)
+else()
+    set(LV_WIN_LTO "")
+endif()
 add_library(modplug STATIC
     third_party/libmodplug/fastmix.cpp
     third_party/libmodplug/load_it.cpp
@@ -117,9 +132,10 @@ target_include_directories(modplug PRIVATE
     third_party/libmodplug third_party/libmodplug/libmodplug)
 target_compile_definitions(modplug PRIVATE MODPLUG_BUILD HAVE_CONFIG_H MODPLUG_BASIC_SUPPORT)
 if(WIN32)
-    # no -flto on MinGW: LTO IR hides main() from archive member selection,
-    # so mingw's crtexewin.o (main -> WinMain shim) wins and the link fails
-    target_compile_options(modplug PRIVATE -Os ${VEND_HARD} ${VEND_WARN})
+    # LV_WIN_LTO: flagship win links with LTO (main.c keeps `main`
+    # visible via -fno-lto, see the LV_WIN_LTO block); era (LV_WIN9X)
+    # stays LTO-free — shim/import-table architecture, hardware-settled
+    target_compile_options(modplug PRIVATE -Os ${LV_WIN_LTO} ${VEND_HARD} ${VEND_WARN})
 elseif(APPLE)
     target_compile_options(modplug PRIVATE -Os -flto ${VEND_HARD} ${VEND_WARN})
 else()
@@ -154,7 +170,7 @@ if(LV_SANITIZE AND UNIX AND NOT APPLE)
     target_compile_options(lzma PRIVATE -fPIE)
 endif()
 if(WIN32)
-    target_compile_options(snes_spc PRIVATE -Os ${VEND_HARD} ${VEND_WARN})
+    target_compile_options(snes_spc PRIVATE -Os ${LV_WIN_LTO} ${VEND_HARD} ${VEND_WARN})
 elseif(APPLE)
     target_compile_options(snes_spc PRIVATE -Os -flto ${VEND_HARD} ${VEND_WARN})
 else()
@@ -237,7 +253,7 @@ endif()
 # executables carry the same link line they always did).
 function(lv_harden_compile tgt)
     if(WIN32)
-        target_compile_options(${tgt} PRIVATE -Os -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
+        target_compile_options(${tgt} PRIVATE -Os ${LV_WIN_LTO} -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
     elseif(APPLE)
         target_compile_options(${tgt} PRIVATE -Os -flto -ffunction-sections -fdata-sections -fstack-protector-strong -Wall -Wextra -Wno-unused-parameter)
     else()
@@ -261,7 +277,7 @@ endfunction()
 function(lv_harden tgt)
     lv_harden_compile(${tgt})
     if(WIN32)
-        target_link_options(${tgt} PRIVATE -Wl,--gc-sections)
+        target_link_options(${tgt} PRIVATE ${LV_WIN_LTO} -Wl,--gc-sections)
     elseif(APPLE)
         target_link_options(${tgt} PRIVATE -flto -Wl,-dead_strip)
     else()
@@ -386,6 +402,13 @@ endif()
 
 add_executable(levari src/main.c)
 target_link_libraries(levari levari_ui levari_engine levari_core)
+if(WIN32 AND NOT LV_WIN9X)
+    # Keep main.c out of LTO: an IR-only main.c.o hides `main` from the
+    # linker's archive-member selection, so mingw's crtexewin.o (the
+    # main->WinMain GUI shim) wins and the link dies. A non-IR object
+    # keeps the symbol visible; every other TU still LTOs.
+    set_source_files_properties(src/main.c PROPERTIES COMPILE_OPTIONS "-fno-lto")
+endif()
 
 # 8-bit PseudoColor/GrayScale presentation path (src/ui/x8bit.c): needs
 # X11 headers at COMPILE time only — Xlib is dlopen'd at runtime, so the
@@ -671,6 +694,10 @@ if(ENABLE_MCP)
         src/mcp/mcp_tools.c
         third_party/cJSON.c
     )
+    if(WIN32 AND NOT LV_WIN9X)
+        # same crtexewin archive-selection rule as src/main.c above
+        set_source_files_properties(src/mcp/mcp_main.c PROPERTIES COMPILE_OPTIONS "-fno-lto")
+    endif()
     # refactor item 3: the old copy-pasted source list (daemon_client,
     # library, library_cli, config, tag, decode, stb_vorbis) is just the
     # core archive now — one compile shared with levari.
@@ -908,6 +935,13 @@ if(LV_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_include_directories(testplaylistedit PRIVATE src src/tag ${SDL2_INCLUDE_DIRS})
     target_link_libraries(testplaylistedit m pthread)
     add_test(NAME testplaylistedit COMMAND sh ${LV_CTHOME} $<TARGET_FILE:testplaylistedit>)
+
+    # intern pool + 64 B row gate (playlist row width): same direct-compile shape
+    add_executable(testpoolmem test/poolmem/testpoolmem.c
+        src/playlist/playlist.c src/tag/tag.c)
+    target_include_directories(testpoolmem PRIVATE src src/tag ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(testpoolmem m pthread)
+    add_test(NAME testpoolmem COMMAND sh ${LV_CTHOME} $<TARGET_FILE:testpoolmem>)
 
     add_executable(testdsp test/dsp/testdsp.c src/dsp/dsp.c)
     target_include_directories(testdsp PRIVATE src/dsp)

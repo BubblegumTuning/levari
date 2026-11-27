@@ -92,6 +92,7 @@ static void load_track_locked(Player *p, int idx, int report) {
        change takes effect at the next track, exactly like the old
        decode-side cfg read */
     DecOpts dopts = { .allow_large = cfg.allow_large,
+                      .mod_resample = cfg.mod_resample,
                       .seek_abort = seek_cmd_pending,
                       .seek_abort_ctx = p };
     Decoder *d = dec_open(pl->items[idx].path, &dopts);
@@ -180,8 +181,16 @@ static void load_track(Player *p, int idx, int report) {
     if (need_tags && idx >= 0 && idx < p->pl->count &&
         !strcmp(p->pl->items[idx].path, path) &&
         !p->pl->items[idx].tags.title[0]) {
-        p->pl->items[idx].tags = tags;
-        pl_touch(p->pl);   /* the search cache must see tags that arrive this late */
+        const char *ti = pl_intern(&p->pl->pool, tags.title);
+        const char *ar = pl_intern(&p->pl->pool, tags.artist);
+        const char *al = pl_intern(&p->pl->pool, tags.album);
+        if (ti && ar && al) {
+            p->pl->items[idx].tags.title = ti;
+            p->pl->items[idx].tags.artist = ar;
+            p->pl->items[idx].tags.album = al;
+            p->pl->items[idx].tags.track = tags.track;
+            pl_touch(p->pl);   /* the search cache must see tags that arrive this late */
+        }
     }
     if (idx >= 0 && idx < p->pl->count && !strcmp(p->pl->items[idx].path, path)) {
         p->rg_trk = rg_trk;
@@ -378,9 +387,14 @@ static void *player_thread(void *arg) {
                    needed */
                 pthread_mutex_lock(&p->mtx);
                 if (p->cur >= 0 && p->cur < p->pl->count) {
-                    lv_strlcpy(p->pl->items[p->cur].tags.title, icy,
-                               sizeof p->pl->items[p->cur].tags.title);
-                    pl_touch(p->pl);   /* live title change: re-normalizes that row */
+                    const char *it = pl_intern(&p->pl->pool, icy);
+                    if (it) {
+                        p->pl->items[p->cur].tags.title = it;
+                        pl_touch(p->pl);   /* live title change: re-normalizes that row */
+                    }
+                    /* the ONLY unbounded interner (every StreamTitle is a
+                       fresh string): the pool GC rides this write */
+                    pl_pool_maybe_gc(p->pl);
                 }
                 pthread_mutex_unlock(&p->mtx);
             }

@@ -273,8 +273,8 @@ int main(void) {
 
     /* ---- virtual CUE row: stored sheet tags, no disk read (file absent) ---- */
     pl_add_file(&pl, "ghost.cue");
-    lv_strlcpy(pl.items[1].tags.title, "Stored Track", sizeof pl.items[1].tags.title);
-    lv_strlcpy(pl.items[1].tags.artist, "Stored Artist", sizeof pl.items[1].tags.artist);
+    pl.items[1].tags.title = pl_intern(&pl.pool, "Stored Track");
+    pl.items[1].tags.artist = pl_intern(&pl.pool, "Stored Artist");
     pl.items[1].tags.track = 3;
     pl.items[1].start_sec = 0; pl.items[1].end_sec = 120;
     ui.pl_multi_n = 0; ui.pl_sel = 1;

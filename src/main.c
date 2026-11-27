@@ -39,7 +39,8 @@ static void print_usage(void) {
 }
 
 static int probe(const char *path) {
-    DecOpts dopts = { .allow_large = cfg.allow_large };
+    DecOpts dopts = { .allow_large = cfg.allow_large,
+                      .mod_resample = cfg.mod_resample };
     Decoder *d = dec_open(path, &dopts);
     if (!d) { printf("%-24s FAIL open\n", path); return 1; }
     Tags t; tag_init(&t); tag_read(path, &t);

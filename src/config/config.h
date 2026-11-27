@@ -37,6 +37,10 @@ typedef struct {
                               2 album — playback gain from RG tags, read by
                               the player at each track load and stored live
                               by the options RG cycle button */
+    int  mod_resample;     /* audio.mod_resample: module resampler cost
+                              ladder — 1 linear, 2 spline (default), 3 fir;
+                              anything else in the config file falls back
+                              to spline. Lower = cheaper CPU on slow boards */
     int  tag_legacy_enc;   /* tag.legacy_encoding: LV_ENC_* from tag.h —
                               -1 auto (default, per-block evidence),
                               0 latin-1, 1 cp1251, 2 utf-8 */

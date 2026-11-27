@@ -62,6 +62,30 @@ static void cfg_with_rg(const char *val) {
     cfg_load();
 }
 
+/* rewrite the user config with one audio.mod_resample line and re-read it */
+static void cfg_with_resample(const char *val) {
+    const char *home = getenv("XDG_CONFIG_HOME");
+    char path[LV_MAX_PATH];
+    snprintf(path, sizeof path, "%s/levari/config", home);
+    FILE *f = fopen(path, "w");
+    if (!f) { printf("FAIL cfg_with_resample: cannot write %s\n", path); fails++; return; }
+    fprintf(f, "audio.mod_resample = %s\n", val);
+    fclose(f);
+    cfg_load();
+}
+
+/* rewrite the user config with one ui.mini line and re-read it */
+static void cfg_with_mini(const char *val) {
+    const char *home = getenv("XDG_CONFIG_HOME");
+    char path[LV_MAX_PATH];
+    snprintf(path, sizeof path, "%s/levari/config", home);
+    FILE *f = fopen(path, "w");
+    if (!f) { printf("FAIL cfg_with_mini: cannot write %s\n", path); fails++; return; }
+    fprintf(f, "ui.mini = %s\n", val);
+    fclose(f);
+    cfg_load();
+}
+
 int main(void) {
     const char *home = getenv("HOME");
     if (!home) { printf("caller must set scratch HOME/XDG_CONFIG_HOME\n"); return 1; }
@@ -156,6 +180,49 @@ int main(void) {
     chk("opt_save persisted track", cfg.replaygain, 1);
     chk("opt_save stored rg_mode live on the player",
         atomic_load_explicit(&fake_pl.rg_mode, memory_order_relaxed), 1);
+
+    /* audio.mod_resample: the module resampler cost ladder (decode-side
+       consumption is the mod open path; here we pin the reader, the
+       explicit spline default, and save persistence) */
+    {   /* the no-key default needs the config file absent (cfg_load reads
+           whatever sits there; the RG block above left one behind) */
+        char p[LV_MAX_PATH];
+        snprintf(p, sizeof p, "%s/levari/config", getenv("XDG_CONFIG_HOME"));
+        unlink(p);
+    }
+    cfg_load();
+    chk("default mod_resample is spline", cfg.mod_resample, 2);
+    cfg_with_resample("linear");
+    chk("config linear accepted", cfg.mod_resample, 1);
+    cfg_with_resample("FIR");
+    chk("config FIR accepted (case-insensitive)", cfg.mod_resample, 3);
+    cfg_with_resample("spline");
+    chk("config spline accepted", cfg.mod_resample, 2);
+    cfg_with_resample("nearest");
+    chk("config garbage stays spline", cfg.mod_resample, 2);
+    cfg_with_resample("fir");
+    opt_save();
+    cfg_load();
+    chk("opt_save persisted fir", cfg.mod_resample, 3);
+
+    /* ui.mini: the mini-layout startup default. The live checkbox toggle
+       and its opt_save persistence are pinned in testoptenc; this block
+       locks the reader: nothing pinned (no config file) starts the
+       full-size player, and only an explicit on-value selects mini. */
+    {   /* the no-key default needs the config file absent (the block
+           above left one behind) */
+        char p[LV_MAX_PATH];
+        snprintf(p, sizeof p, "%s/levari/config", getenv("XDG_CONFIG_HOME"));
+        unlink(p);
+    }
+    cfg_load();
+    chk("default ui.mini is off (full player)", cfg.ui_mini, 0);
+    cfg_with_mini("on");
+    chk("config on accepted", cfg.ui_mini, 1);
+    cfg_with_mini("OFF");
+    chk("config OFF accepted (case-insensitive)", cfg.ui_mini, 0);
+    cfg_with_mini("maybe");
+    chk("config garbage stays off", cfg.ui_mini, 0);
 
     printf(fails ? "FAILED (%d)\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;

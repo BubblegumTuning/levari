@@ -178,10 +178,11 @@ static void handle_cmd(Player *p, char *line, char *resp, size_t rn) {
                index already holds tags + duration for scanned files */
             lib_fill_playlist(&np);
             pthread_mutex_lock(&p->mtx);
-            pl_clear(p->pl);
+            pl_clear(p->pl);              /* frees the old rows AND their pool */
             p->pl->items = np.items;
             p->pl->count = np.count;
             p->pl->cap = np.cap;
+            p->pl->pool = np.pool;        /* adopt: every row string rides it */
             pl_touch(p->pl);   /* the swap rewrites every row: any cache on the old gen dies */
             pthread_mutex_unlock(&p->mtx);
             pl_post(p, CMD_PLAY, 0);

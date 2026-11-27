@@ -6,9 +6,10 @@ static const Btn PL_BTNS[] = {
     {PB_SHUF, &P_SHUF}, {PB_REPEAT, &P_REPEAT}, {PB_ADD, &P_ADD},
     {PB_REM, &P_REM}, {PB_CLOSE, &P_CLOSE}, {PB_LIB, &P_LIB}, {PB_SCAN, &P_SCAN},
 };
-/* row line pitch: full rides the 16px font (16+1 leading), mini the
-   small 5x7 font like the main window (7+2) */
-static int pl_lh(void) { return ui.mini ? 9 : 17; }
+/* row line pitch: both modes ride the 16px font (the mini small font
+   cannot host 16px CJK cells — they overflowed the 9px pitch); mini
+   packs 16px pitch, full keeps 16+1 leading */
+static int pl_lh(void) { return ui.mini ? 16 : 17; }
 /* ---- playlist right-click edit menu (D1: menu, not new PL_BTNS — chrome
    space is precious and Winamp-authentic playlists edit through the list
    menu). Two columns of flat items fit the default 116px window; 5x7
@@ -301,13 +302,13 @@ void ui_draw_pl(void) {
             if (idx >= n) break;
             char line[512];
             lv_strlcpy(line, search_engine_disp(idx), sizeof line);
-            int fit = font_fit_small(line, ptext.w - 4);
+            int fit = font_fit(line, ptext.w - 4);
             if ((int)strlen(line) > fit) line[fit] = 0;
             Uint32 c = search_engine_pl_idx(idx) >= 0
                            ? ui_col(s, 170, 170, 170)
                            : ui_col(s, 130, 130, 170);
             if (idx == pl_ssel) c = ui_col(s, 0, 255, 0);
-            font_puts(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
+            font_puts16(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
         }
         if (n > lines) {
             int th = pscroll.h * lines / n;
@@ -317,11 +318,12 @@ void ui_draw_pl(void) {
             SDL_FillRect(s, &r, ui_col(s, 110, 110, 110));
         }
         if (!n)
-            font_puts(s, ptext.x + 2, ptext.y + 1, "(no matches)",
-                      ui_col(s, 150, 150, 150));
+            font_puts16(s, ptext.x + 2, ptext.y + 1, "(no matches)",
+                        ui_col(s, 150, 150, 150));
     } else {
-    /* track list: as many lines as the window height allows (full: 17px
-       lines of the 16px font; mini: 9px lines of the small font) */
+    /* track list: as many lines as the window height allows (both modes
+       ride the 16px font — the small font cannot host 16px CJK cells;
+       mini packs them tighter: 16px pitch vs 17) */
     int lh = pl_lh();
     int lines = ptext.h / lh;
     /* keep the playing track in view: when cur moves (next/prev, shuffle,
@@ -348,14 +350,12 @@ void ui_draw_pl(void) {
         if (t->duration) snprintf(line, sizeof line, "%02d. %s [%d:%02d]", idx + 1, name, t->duration / 60, t->duration % 60);
         else snprintf(line, sizeof line, "%02d. %s", idx + 1, name);
         /* truncate to fit, without splitting UTF-8 sequences */
-        int fit = ui.mini ? font_fit_small(line, ptext.w - 4)
-                          : font_fit(line, ptext.w - 4);
+        int fit = font_fit(line, ptext.w - 4);
         if ((int)strlen(line) > fit) line[fit] = 0;
         Uint32 c = ui_col(s, 170, 170, 170);
         if (idx == p->cur) c = ui_col(s, 0, 255, 0);
         else if (ui.pl_selall || ui_pl_sel_has(idx)) c = ui_col(s, 255, 255, 255);
-        if (ui.mini) font_puts(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
-        else font_puts16(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
+        font_puts16(s, ptext.x + 2, ptext.y + 1 + i * lh, line, c);
     }
 
     /* scrollbar thumb */

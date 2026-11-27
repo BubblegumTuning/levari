@@ -91,6 +91,13 @@ static void set_key(const char *k, char *v) {
         /* memset default 0 = RG_OFF; garbage stays off */
         if      (!lv_strcasecmp(v, "track")) cfg.replaygain = 1;
         else if (!lv_strcasecmp(v, "album")) cfg.replaygain = 2;
+    } else if (!strcmp(k, "audio.mod_resample")) {
+        /* memset default 0 = unset... which is NOT the shipped default:
+           spline (2) is set explicitly in cfg_load below; garbage stays
+           spline. Values carry the MODPLUG_RESAMPLE_* numbering. */
+        if      (!lv_strcasecmp(v, "linear")) cfg.mod_resample = 1;
+        else if (!lv_strcasecmp(v, "spline"))  cfg.mod_resample = 2;
+        else if (!lv_strcasecmp(v, "fir"))     cfg.mod_resample = 3;
     } else if (!strcmp(k, "tag.legacy_encoding")) {
         if      (!lv_strcasecmp(v, "auto"))   cfg.tag_legacy_enc = LV_ENC_AUTO;
         else if (!lv_strcasecmp(v, "latin1")) cfg.tag_legacy_enc = LV_ENC_LATIN1;
@@ -106,6 +113,7 @@ void cfg_load(void) {
     cfg.shuffle_remember = cfg.shuffle = -1;
     cfg.fade_stop = 1; /* fade-out on stop is on unless configured off */
     cfg.vis_hz = 10;   /* ui.vis_hz: default 10; only 24/30/60 override */
+    cfg.mod_resample = 2; /* audio.mod_resample: default spline */
     cfg.tag_legacy_enc = LV_ENC_AUTO;
     char path[LV_MAX_PATH];
     cfg_path(path, sizeof path);
@@ -132,6 +140,9 @@ static const char *legacy_enc_s(int e) {
     return e == LV_ENC_LATIN1 ? "latin1" : e == LV_ENC_CP1251 ? "cp1251"
          : e == LV_ENC_UTF8   ? "utf8"   : e == LV_ENC_SJIS ? "shiftjis"
          : "auto";
+}
+static const char *mod_resample_s(int m) {
+    return m == 1 ? "linear" : m == 3 ? "fir" : "spline";
 }
 
 /* cfg_save runs on the UI thread (options save, scan) AND the daemon
@@ -174,6 +185,7 @@ static int cfg_save_locked(void) {
     fprintf(f, "ui.vis_hz = %d\n", cfg.vis_hz);
     fprintf(f, "audio.replaygain = %s\n",
             cfg.replaygain == 1 ? "track" : cfg.replaygain == 2 ? "album" : "off");
+    fprintf(f, "audio.mod_resample = %s\n", mod_resample_s(cfg.mod_resample));
     fprintf(f, "tag.legacy_encoding = %s\n", legacy_enc_s(cfg.tag_legacy_enc));
     fclose(f);
     /* mingw's rename refuses to replace an existing file: retry once

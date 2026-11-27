@@ -12,6 +12,10 @@ typedef struct Decoder Decoder;
    = defaults (cap enforced). */
 typedef struct {
     int allow_large;
+    /* module resampler cost ladder, MODPLUG_RESAMPLE_* values: 1 linear,
+       2 spline, 3 fir (0 = default spline). Call sites read
+       audio.mod_resample from cfg — the decode tree owns no cfg. */
+    int mod_resample;
     /* optional abort poll for seeks that emulate a fast-forward (SPC):
        called between skip chunks; a non-zero return abandons the seek,
        which returns -1 with the decoder still valid at however far the

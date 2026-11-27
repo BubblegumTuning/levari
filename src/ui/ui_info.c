@@ -82,7 +82,12 @@ void ui_info_open(void) {
         if (row >= 0 && row < p->pl->count) {
             Track *t = &p->pl->items[row];
             lv_strlcpy(path, t->path, sizeof path);
-            stored = t->tags;
+            /* snapshot into owned buffers: pool strings never escape
+               the lock (stored is read after the unlock below) */
+            lv_strlcpy(stored.title, t->tags.title, sizeof stored.title);
+            lv_strlcpy(stored.artist, t->tags.artist, sizeof stored.artist);
+            lv_strlcpy(stored.album, t->tags.album, sizeof stored.album);
+            stored.track = t->tags.track;
             cue = pl_ext_kind(path) == PL_CUE;
             have = 1;
         }

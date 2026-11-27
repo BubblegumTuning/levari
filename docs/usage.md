@@ -134,6 +134,12 @@ plain `key = value` lines, `#` comments. Edit by hand or through the UI
                                   to [-20, +12] dB (options window ADV
                                   page, `RG` cycle button, cyan label when
                                   non-default)
+    audio.mod_resample = spline   module (MOD/S3M/XM/IT) resampler cost
+                                  ladder: linear | spline | fir. Lower is
+                                  cheaper CPU — `linear` suits Pi Zero-class
+                                  boards; `fir` is the highest quality.
+                                  Anything else falls back to spline.
+                                  Takes effect from the next module start
     tag.legacy_encoding = auto    codepage for tag fields with no declared
                                   encoding: auto | latin1 | cp1251 | utf8 |
                                   shiftjis.

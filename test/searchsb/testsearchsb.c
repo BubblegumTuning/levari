@@ -196,11 +196,11 @@ int main(void) {
         sp = &cp; cp.pl = &cpl; pl_init(&cpl);
         scope = 0;
         pl_add_file(&cpl, "/x/alpha.mp3");
-        lv_strlcpy(cpl.items[0].tags.title, "Alpha Zeta", sizeof cpl.items[0].tags.title);
-        lv_strlcpy(cpl.items[0].tags.artist, "One", sizeof cpl.items[0].tags.artist);
+        cpl.items[0].tags.title = pl_intern(&cpl.pool, "Alpha Zeta");
+        cpl.items[0].tags.artist = pl_intern(&cpl.pool, "One");
         pl_touch(&cpl);   /* exactly the lib_fill_playlist_ix contract */
         pl_add_file(&cpl, "/x/beta.mp3");
-        lv_strlcpy(cpl.items[1].tags.title, "Beta", sizeof cpl.items[1].tags.title);
+        cpl.items[1].tags.title = pl_intern(&cpl.pool, "Beta");
         pl_touch(&cpl);
         strcpy(query, "zeta");
         run_search();
@@ -213,7 +213,7 @@ int main(void) {
 
         /* add: the new row joins on the next pass (append bump re-validates) */
         pl_add_file(&cpl, "/x/zeta.mp3");
-        lv_strlcpy(cpl.items[2].tags.title, "Zeta Reticula", sizeof cpl.items[2].tags.title);
+        cpl.items[2].tags.title = pl_intern(&cpl.pool, "Zeta Reticula");
         pl_touch(&cpl);
         run_search();
         chk("PL cache: add re-validates", nres, 2);

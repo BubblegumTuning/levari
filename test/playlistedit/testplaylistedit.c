@@ -40,9 +40,9 @@ static void addrow(const char *path, const char *artist, const char *title,
                    const char *album, int track, double ss, double es, int dur) {
     pl_add_file(&pl, path);
     Track *t = &pl.items[pl.count - 1];
-    lv_strlcpy(t->tags.artist, artist, sizeof t->tags.artist);
-    lv_strlcpy(t->tags.title, title, sizeof t->tags.title);
-    lv_strlcpy(t->tags.album, album, sizeof t->tags.album);
+    t->tags.artist = pl_intern(&pl.pool, artist);
+    t->tags.title = pl_intern(&pl.pool, title);
+    t->tags.album = pl_intern(&pl.pool, album);
     t->tags.track = track;
     t->start_sec = ss; t->end_sec = es;
     t->duration = dur;

@@ -120,11 +120,25 @@ void ui_set_mini(int on) {
         int wx = 0, wy = 0;
         if (ui.wmain) SDL_GetWindowPosition(ui.wmain, &wx, &wy);
         ui.pl_visible = 1;
+        /* On a display exactly the bar's width (PiTFT-class 320x240) mini
+           takes the whole panel: bar pinned to the origin, playlist fills
+           the rest. Larger displays keep the floating mini as before. */
+        SDL_Rect d;
+        int fill = 0;
+        if (SDL_GetDisplayBounds(0, &d) == 0 && d.w == MINI_W &&
+            d.h > MINI_H) {
+            fill = d.h - MINI_H;
+            if (wx != d.x || wy != d.y) {
+                SDL_SetWindowPosition(ui.wmain, d.x, d.y);
+                wx = d.x; wy = d.y;
+            }
+        }
         if (ui.wpl) {
-            if (ui.pl_w != MINI_W) {
-                SDL_SetWindowSize(ui.wpl, MINI_W, ui.pl_h);
+            int ph = fill > 0 ? fill : ui.pl_h;
+            if (ui.pl_w != MINI_W || ui.pl_h != ph) {
+                SDL_SetWindowSize(ui.wpl, MINI_W, ph);
                 ui.spl = lv_win_surface(ui.wpl);
-                ui.pl_w = MINI_W;
+                ui.pl_w = MINI_W; ui.pl_h = ph;
             }
             SDL_SetWindowPosition(ui.wpl, wx, wy + MINI_H);
             SDL_ShowWindow(ui.wpl);
@@ -670,7 +684,7 @@ static void refresh_title(void) {
     int cur = p->cur;
     if (cur >= 0 && cur < p->pl->count) {
         const Track *t = &p->pl->items[cur];
-        const Tags *g = &t->tags;
+        const RowTags *g = &t->tags;
         if (g->title[0] || g->artist[0]) {
             /* leading spaces so the first glyph isn't clipped the instant
                the marquee starts scrolling */
@@ -711,6 +725,18 @@ void ui_msg(const char *text) {
     ui.msg_at = SDL_GetTicks();
 }
 
+/* SDL_SetWindowAlwaysOnTop arrived in SDL 2.0.9 (measured: absent from
+   the era-pinned 2.0.8 header, though the creation flag exists there).
+   On era SDL the AoT state is kept and the button stays, the effect is
+   a no-op — the honest degradation until an era shim lands. Shared by
+   the main-window button and the options checkbox (ui_opt.c). */
+void ui_set_aot(int on) {
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    SDL_SetWindowAlwaysOnTop(ui.wmain, on ? SDL_TRUE : SDL_FALSE);
+#else
+    (void)on;
+#endif
+}
 
 void ui_action(int id) {
     Player *p = ui.pl;
@@ -750,7 +776,7 @@ void ui_action(int id) {
         /* live override only: config keeps the saved default until SAVE
            in options writes the current state */
         ui.aot = !ui.aot;
-        SDL_SetWindowAlwaysOnTop(ui.wmain, ui.aot ? SDL_TRUE : SDL_FALSE);
+        ui_set_aot(ui.aot);
         break;
     case B_MSTOP: pl_post(p, CMD_STOP, 0); break;
     case B_MPREV: pl_post(p, CMD_PREV, 0); break;
@@ -816,9 +842,16 @@ void ui_action(int id) {
                track and the row's tags would overwrite its fields */
             if (pl_add_file(p->pl, r->path) != 0) continue;
             Track *t = &p->pl->items[p->pl->count - 1];
-            lv_strlcpy(t->tags.artist, r->artist, sizeof t->tags.artist);
-            lv_strlcpy(t->tags.title, r->title, sizeof t->tags.title);
-            lv_strlcpy(t->tags.album, r->album, sizeof t->tags.album);
+            char tmp[256];
+            lv_strlcpy(tmp, r->artist, sizeof tmp);
+            const char *sa = pl_intern(&p->pl->pool, tmp);
+            if (sa) t->tags.artist = sa;
+            lv_strlcpy(tmp, r->title, sizeof tmp);
+            const char *st = pl_intern(&p->pl->pool, tmp);
+            if (st) t->tags.title = st;
+            lv_strlcpy(tmp, r->album, sizeof tmp);
+            const char *sb = pl_intern(&p->pl->pool, tmp);
+            if (sb) t->tags.album = sb;
             t->duration = r->dur;
             t->tags.track = r->track;
             t->notag = r->notag;
@@ -879,7 +912,16 @@ void ui_action(int id) {
                write-back exactly like pl_scan_tags (the row may have moved) */
             pthread_mutex_lock(&p->mtx);
             if (sel < p->pl->count && !strcmp(p->pl->items[sel].path, path)) {
-                p->pl->items[sel].tags = nt;
+                const char *ti = pl_intern(&p->pl->pool, nt.title);
+                const char *ar = pl_intern(&p->pl->pool, nt.artist);
+                const char *al = pl_intern(&p->pl->pool, nt.album);
+                if (ti && ar && al) {
+                    p->pl->items[sel].tags.title = ti;
+                    p->pl->items[sel].tags.artist = ar;
+                    p->pl->items[sel].tags.album = al;
+                    p->pl->items[sel].tags.track = nt.track;
+                    pl_touch(p->pl);   /* tags rewritten: stale search cache dies */
+                }
                 if (ndur) p->pl->items[sel].duration = ndur;
                 p->pl->items[sel].notag = nnotag;
             }
@@ -1286,7 +1328,7 @@ int ui_run(Player *p, int show_pl) {
     }
     if (!show_pl) SDL_HideWindow(ui.wpl);
     ui.aot = cfg.ui_aot > 0;
-    if (ui.aot) SDL_SetWindowAlwaysOnTop(ui.wmain, SDL_TRUE);
+    if (ui.aot) ui_set_aot(1);
     if (cfg.ui_mini > 0) ui_set_mini(1);  /* seeds the mini layout + opens all three */
     ui.weq = SDL_CreateWindow("levari - equalizer", ex, ey,
                               EQ_W, EQ_H, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);

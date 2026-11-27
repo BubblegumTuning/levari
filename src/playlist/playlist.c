@@ -9,10 +9,168 @@
 #include <stdlib.h>
 #include <string.h>
 
-void pl_init(Playlist *p) { p->items = NULL; p->count = p->cap = 0; p->gen++; }
+/* ================= intern pool =================
+   The GC high-water: a pool only grows past this through the Icy
+   live-title write (paths and scan tags are bounded by the library),
+   so the check is a size compare and the rebuild is rare. The
+   anti-thrash factor means a legitimately large pool (30k rows) is
+   never rebuilt twice for the same garbage budget. */
+#define POOL_HIGH_WATER (16u << 20)
+#define POOL_BLOCK (64u << 10)
+
+void pl_pool_free(PlPool *pool) {
+    for (int i = 0; i < pool->nblocks; i++) free(pool->blocks[i]);
+    free(pool->blocks);
+    free(pool->tab);
+    memset(pool, 0, sizeof *pool);
+}
+
+static unsigned pool_hash(const char *s) {
+    unsigned h = 2166136261u;
+    while (*s) h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h;
+}
+
+/* bump-allocate n bytes: fresh block when the cursor cannot host it
+   (a string larger than POOL_BLOCK gets its own block) */
+static char *pool_alloc(PlPool *pool, size_t n) {
+    if (pool->cur && pool->cur_used + n <= pool->cur_cap) {
+        char *r = pool->cur + pool->cur_used;
+        pool->cur_used += n;
+        return r;
+    }
+    size_t bs = n > POOL_BLOCK ? n : POOL_BLOCK;
+    if (bs > SIZE_MAX - pool->bytes) return NULL;
+    char *blk = malloc(bs);
+    if (!blk) return NULL;
+    if (pool->nblocks == pool->blockcap) {
+        int nc = pool->blockcap ? pool->blockcap * 2 : 8;
+        char **nb = realloc(pool->blocks, (size_t)nc * sizeof *nb);
+        if (!nb) { free(blk); return NULL; }
+        pool->blocks = nb;
+        pool->blockcap = nc;
+    }
+    pool->blocks[pool->nblocks++] = blk;
+    pool->cur = blk;
+    pool->cur_cap = bs;
+    pool->bytes += bs;
+    pool->cur_used = n;
+    return blk;
+}
+
+/* double the hash and re-insert every interned string (walk the old
+   table; the strings themselves never move) */
+static int pool_grow(PlPool *pool) {
+    int on = pool->tab ? pool->tab_mask + 1 : 0;
+    int nn = on ? on * 2 : 256;
+    char **nt = calloc((size_t)nn, sizeof *nt);
+    if (!nt) return -1;
+    int nm = nn - 1;
+    for (int i = 0; i < on; i++) {
+        char *s = pool->tab[i];
+        if (!s) continue;
+        int j = (int)(pool_hash(s) & (unsigned)nm);
+        while (nt[j]) j = (j + 1) & nm;
+        nt[j] = s;
+    }
+    free(pool->tab);
+    pool->tab = nt;
+    pool->tab_mask = nm;
+    return 0;
+}
+
+const char *pl_intern(PlPool *pool, const char *s) {
+    if (!s || !*s) return "";   /* one shared static slot, never in a block */
+    if (pool->tab_count + 1 > (pool->tab_mask + 1) / 2)
+        if (pool_grow(pool) != 0) return NULL;
+    int mask = pool->tab_mask, i = (int)(pool_hash(s) & (unsigned)mask);
+    while (pool->tab[i]) {
+        if (!strcmp(pool->tab[i], s)) return pool->tab[i];
+        i = (i + 1) & mask;
+    }
+    size_t n = strlen(s) + 1;
+    char *d = pool_alloc(pool, n);
+    if (!d) return NULL;
+    memcpy(d, s, n);
+    pool->tab[i] = d;
+    pool->tab_count++;
+    return d;
+}
+
+const char *pl_intern_cap(PlPool *pool, const char *s, size_t cap) {
+    size_t n = strlen(s);
+    if (n <= cap) return pl_intern(pool, s);
+    char *d = pool_alloc(pool, cap + 1);
+    if (!d) return NULL;
+    memcpy(d, s, cap);
+    d[cap] = 0;
+    /* the truncated copy may itself already be interned: look it up
+       before inserting. If the grow fails, d is returned unindexed —
+       valid memory (it lives in a block, reclaimed by GC), just not
+       shared this once. A dedup hit orphans d in the arena: bounded
+       waste, reclaimed by GC. */
+    if (pool->tab_count + 1 > (pool->tab_mask + 1) / 2) {
+        if (pool_grow(pool) != 0) return d;
+    }
+    int mask = pool->tab_mask, i = (int)(pool_hash(d) & (unsigned)mask);
+    while (pool->tab[i]) {
+        if (!strcmp(pool->tab[i], d)) return pool->tab[i];
+        i = (i + 1) & mask;
+    }
+    pool->tab[i] = d;
+    pool->tab_count++;
+    return d;
+}
+
+void pl_pool_maybe_gc(Playlist *p) {
+    if (p->pool.bytes < POOL_HIGH_WATER) return;
+    if (p->pool.bytes < 2 * p->pool.last_live) return;
+    /* two passes: re-intern every row's strings into the fresh pool via
+       a temp array, commit only when ALL succeeded — a mid-way OOM must
+       leave every row pointing at the intact old pool */
+    int n = p->count;
+    const char **tmp = n > 0 ? malloc((size_t)n * 4 * sizeof *tmp) : NULL;
+    if (n > 0 && !tmp) return;
+    PlPool np;
+    memset(&np, 0, sizeof np);
+    for (int i = 0; i < n; i++) {
+        const Track *t = &p->items[i];
+        const char **q = tmp + (size_t)i * 4;
+        q[0] = pl_intern(&np, t->path);
+        q[1] = pl_intern(&np, t->tags.title);
+        q[2] = pl_intern(&np, t->tags.artist);
+        q[3] = pl_intern(&np, t->tags.album);
+        if (!q[0] || !q[1] || !q[2] || !q[3]) {
+            pl_pool_free(&np);
+            free(tmp);
+            p->pool.last_live = p->pool.bytes;  /* anti-thrash on OOM too */
+            return;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        const char **q = tmp + (size_t)i * 4;
+        p->items[i].path = q[0];
+        p->items[i].tags.title = q[1];
+        p->items[i].tags.artist = q[2];
+        p->items[i].tags.album = q[3];
+    }
+    free(tmp);
+    pl_pool_free(&p->pool);
+    p->pool = np;
+    p->pool.last_live = p->pool.bytes;
+}
+
+size_t pl_pool_bytes(const Playlist *p) { return p->pool.bytes; }
+
+void pl_init(Playlist *p) {
+    p->items = NULL; p->count = p->cap = 0;
+    memset(&p->pool, 0, sizeof p->pool);
+    p->gen++;
+}
 
 void pl_clear(Playlist *p) {
     free(p->items);
+    pl_pool_free(&p->pool);   /* every row string rode the pool */
     p->items = NULL; p->count = p->cap = 0;
     pl_touch(p);
 }
@@ -21,8 +179,8 @@ static int ensure(Playlist *p, int need) {
     if (need <= p->cap) return 0;
     int cap = p->cap ? p->cap + p->cap / 2 + 1 : 64;
     while (cap < need) {
-        /* clamp before doubling can wrap the int counter; a Track is ~6 KB
-           so the realloc below fails long before — this just documents it */
+        /* clamp before doubling can wrap the int counter; the cap*
+           sizeof(Track) overflow gate below catches the rest */
         if (cap > INT_MAX / 2) { cap = INT_MAX; break; }
         cap += cap / 2 + 1;
     }
@@ -93,13 +251,12 @@ int pl_add(Playlist *p, const char *path) {
    returns 0 when the entry was appended, -1 when the grow failed:
    callers that touch items[count-1] afterwards must check it */
 int pl_add_file(Playlist *p, const char *path) {
-    if (ensure(p, p->count + 1) != 0) return -1;
-    Track *t = &p->items[p->count++];
+    char full[LV_MAX_PATH];
     if (lv_is_abs(path) || lv_is_url(path)) {
         /* URLs are already fully qualified — cwd-absolutizing them would
            mangle the scheme into a bogus relative path (P0 gate caught
            exactly this: dec_open would never see the URL) */
-        lv_strlcpy(t->path, path, sizeof t->path);
+        lv_strlcpy(full, path, sizeof full);
     } else {
         char cwd[PATH_MAX];
         if (getcwd(cwd, sizeof cwd))
@@ -108,11 +265,18 @@ int pl_add_file(Playlist *p, const char *path) {
                "C:\/test.mp3" (hardware: plyr:dead on argv files while the
                browser's native-joined rows played). lv_path_join trims the
                trailing separator and emits native slashes. */
-            lv_path_join(t->path, sizeof t->path, cwd, path);
+            lv_path_join(full, sizeof full, cwd, path);
         else
-            lv_strlcpy(t->path, path, sizeof t->path);
+            lv_strlcpy(full, path, sizeof full);
     }
-    tag_init(&t->tags);
+    /* intern BEFORE the grow: a failed intern leaves the list untouched,
+       matching pl_add's -1 contract */
+    const char *ip = pl_intern(&p->pool, full);
+    if (!ip) return -1;
+    if (ensure(p, p->count + 1) != 0) return -1;
+    Track *t = &p->items[p->count++];
+    t->path = ip;
+    t->tags.title = t->tags.artist = t->tags.album = "";
     t->duration = 0;
     t->notag = 0;
     t->start_sec = t->end_sec = 0;
@@ -123,12 +287,14 @@ int pl_add_file(Playlist *p, const char *path) {
 void pl_insert(Playlist *p, int idx, const char *path) {
     if (idx < 0) idx = 0;
     if (idx > p->count) idx = p->count;
+    const char *ip = pl_intern(&p->pool, path);
+    if (!ip) return;
     if (ensure(p, p->count + 1) != 0) return;
     memmove(&p->items[idx + 1], &p->items[idx], (size_t)(p->count - idx) * sizeof(Track));
     p->count++;
     Track *t = &p->items[idx];
-    lv_strlcpy(t->path, path, sizeof t->path);
-    tag_init(&t->tags);
+    t->path = ip;
+    t->tags.title = t->tags.artist = t->tags.album = "";
     t->duration = 0;
     t->notag = 0;
     t->start_sec = t->end_sec = 0;
@@ -150,9 +316,10 @@ int pl_load_m3u(Playlist *p, const char *m3u) {
     if (!lv_dirname(dir)) lv_strlcpy(dir, ".", sizeof dir);
 
     /* pre-size from the file size (~96 bytes per entry): multi-KB
-       playlists otherwise churn realloc through every doubling. cap it:
-       Track is ~6 KB, so a multi-MB m3u (or a junk huge file sniffed as
-       one) would pre-allocate gigabytes */
+       playlists otherwise churn realloc through every doubling. cap it
+       for sanity (a junk huge file sniffed as .m3u must not pre-allocate
+       on its size); with 64 B rows the old gigabyte hazard is gone, the
+       cap stays as cheap conservatism */
     if (fseek(f, 0, SEEK_END) == 0) {
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
@@ -309,8 +476,10 @@ int pl_load_pls(Playlist *p, const char *pls) {
         if (pl_add_file(p, ent[i].path) == 0) {
             Track *t = &p->items[p->count - 1];
             t->duration = ent[i].dur;
-            if (ent[i].title[0])
-                lv_strlcpy(t->tags.title, ent[i].title, sizeof t->tags.title);
+            if (ent[i].title[0]) {
+                const char *it = pl_intern(&p->pool, ent[i].title);
+                if (it) t->tags.title = it;
+            }
         }
     }
     free(ent);
@@ -382,14 +551,16 @@ int pl_load_cue(Playlist *p, const char *cue) {
             if (q1) {
                 char *q2 = strchr(q1 + 1, '"');
                 if (q2) *q2 = 0;
-                lv_strlcpy(p->items[idx].tags.title, q1 + 1, sizeof p->items[idx].tags.title);
+                const char *it = pl_intern_cap(&p->pool, q1 + 1, 255);
+                if (it) p->items[idx].tags.title = it;
             }
         } else if (!strncmp(s, "PERFORMER ", 10) && idx >= 0 && idx < p->count) {
             char *q1 = strchr(s, '"');
             if (q1) {
                 char *q2 = strchr(q1 + 1, '"');
                 if (q2) *q2 = 0;
-                lv_strlcpy(p->items[idx].tags.artist, q1 + 1, sizeof p->items[idx].tags.artist);
+                const char *ia = pl_intern_cap(&p->pool, q1 + 1, 255);
+                if (ia) p->items[idx].tags.artist = ia;
             }
         } else if (!strncmp(s, "INDEX 01 ", 9)) {
             long mm, ss, ff;
@@ -462,8 +633,16 @@ void pl_scan_tags(Playlist *p, pthread_mutex_t *mtx) {
         /* the row may have moved or changed while we were reading: only
            write back if item i is still the file we probed */
         if (i < p->count && !strcmp(p->items[i].path, path)) {
-            p->items[i].tags = tags;
-            pl_touch(p);   /* a row whose tags arrived late must not keep a stale cache */
+            const char *ti = pl_intern(&p->pool, tags.title);
+            const char *ar = pl_intern(&p->pool, tags.artist);
+            const char *al = pl_intern(&p->pool, tags.album);
+            if (ti && ar && al) {
+                p->items[i].tags.title = ti;
+                p->items[i].tags.artist = ar;
+                p->items[i].tags.album = al;
+                p->items[i].tags.track = tags.track;
+                pl_touch(p);   /* a row whose tags arrived late must not keep a stale cache */
+            }
         }
         if (mtx) pthread_mutex_unlock(mtx);
     }
@@ -836,9 +1015,12 @@ void pl_drop(Playlist *p, int *sel, int n, int at, int *cur) {
 }
 
 /* internal row clipboard (decision D3): a static Track array grown to the
-   selection size; OOM refuses the copy whole and keeps the old clipboard */
+   selection size, with its OWN intern pool — clipboard rows never point
+   into a playlist's pool, so a playlist clear/GC can never dangle them.
+   OOM refuses the copy whole and keeps the old clipboard */
 static Track *clip;
 static int clip_n;
+static PlPool clip_pool;
 
 int pl_clip_copy(Playlist *p, const int *sel, int n) {
     if (n <= 0) return 0;              /* empty selection: clipboard intact */
@@ -846,9 +1028,28 @@ int pl_clip_copy(Playlist *p, const int *sel, int n) {
         if (sel[i] < 0 || sel[i] >= p->count) return -1;  /* stale set: refuse */
     Track *nc = malloc((size_t)n * sizeof *nc);
     if (!nc) return -1;
-    for (int i = 0; i < n; i++) nc[i] = p->items[sel[i]];
+    PlPool np;
+    memset(&np, 0, sizeof np);
+    for (int i = 0; i < n; i++) {
+        const Track *src = &p->items[sel[i]];
+        const char *a = pl_intern(&np, src->path);
+        const char *b = pl_intern(&np, src->tags.title);
+        const char *c = pl_intern(&np, src->tags.artist);
+        const char *d = pl_intern(&np, src->tags.album);
+        if (!a || !b || !c || !d) {
+            pl_pool_free(&np);
+            free(nc);
+            return -1;                 /* refused: old clipboard intact */
+        }
+        nc[i] = *src;                  /* value copy: only the pointers are replaced */
+        nc[i].path = a;
+        nc[i].tags.title = b;
+        nc[i].tags.artist = c;
+        nc[i].tags.album = d;
+    }
+    pl_pool_free(&clip_pool);
     free(clip);
-    clip = nc; clip_n = n;
+    clip = nc; clip_n = n; clip_pool = np;
     return 0;
 }
 
@@ -870,9 +1071,33 @@ int pl_clip_paste(Playlist *p, int at, int *cur) {
         else break;
     }
     if (ensure(p, p->count + clip_n) != 0) return -1;
+    /* re-intern every clipboard string into the target pool BEFORE the
+       memmove: an OOM mid-way leaves the list untouched (the temp array
+       holds the new pointers, no row has been written yet) */
+    const char **tmp = malloc((size_t)clip_n * 4 * sizeof *tmp);
+    if (!tmp) return -1;
+    for (int i = 0; i < clip_n; i++) {
+        const Track *src = &clip[i];
+        tmp[(size_t)i * 4 + 0] = pl_intern(&p->pool, src->path);
+        tmp[(size_t)i * 4 + 1] = pl_intern(&p->pool, src->tags.title);
+        tmp[(size_t)i * 4 + 2] = pl_intern(&p->pool, src->tags.artist);
+        tmp[(size_t)i * 4 + 3] = pl_intern(&p->pool, src->tags.album);
+        if (!tmp[(size_t)i * 4] || !tmp[(size_t)i * 4 + 1] ||
+            !tmp[(size_t)i * 4 + 2] || !tmp[(size_t)i * 4 + 3]) {
+            free(tmp);
+            return -1;
+        }
+    }
     memmove(&p->items[at + clip_n], &p->items[at],
             (size_t)(p->count - at) * sizeof(Track));
-    for (int i = 0; i < clip_n; i++) p->items[at + i] = clip[i];
+    for (int i = 0; i < clip_n; i++) {
+        p->items[at + i] = clip[i];
+        p->items[at + i].path = tmp[(size_t)i * 4];
+        p->items[at + i].tags.title = tmp[(size_t)i * 4 + 1];
+        p->items[at + i].tags.artist = tmp[(size_t)i * 4 + 2];
+        p->items[at + i].tags.album = tmp[(size_t)i * 4 + 3];
+    }
+    free(tmp);
     p->count += clip_n;
     pl_touch(p);
     /* paste BELOW cur leaves cur alone; paste at/above it shifts it */

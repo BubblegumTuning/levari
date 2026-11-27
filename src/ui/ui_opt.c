@@ -765,7 +765,7 @@ void ui_handle_opt_mouse(SDL_Event *e) {
                 Rect ra = opt_aot_rect();
                 if (ui_in_rect(&ra, x, y)) {
                     ui.aot = !ui.aot;
-                    SDL_SetWindowAlwaysOnTop(ui.wmain, ui.aot ? SDL_TRUE : SDL_FALSE);
+                    ui_set_aot(ui.aot);
                 }
             }
             else if (ui.pressed >= OPTB_TPL && ui.pressed <= OPTB_TFADE) {

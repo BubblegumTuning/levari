@@ -235,6 +235,16 @@ static FFContext *abi_open(const char *path, int url,
         a->ic->interrupt_callback.opaque = a;
         ff_arm(a);
         p_av_dict_set(&opts, "protocol_whitelist", FF_PROTOCOLS, 0);
+        /* bounded probe budget: the libav defaults (5 MB probesize /
+           5 s analyzeduration) let find_stream_info buffer up to 5 MB
+           of probe data on a high-bitrate network stream before it
+           gives up. 1 MB is ~25 s of 320 kbit/s audio — far more than
+           any whitelisted stream needs to declare its streams — and
+           3 s of analysis finds an audio stream instantly. Local
+           files keep the defaults: their probe is disk I/O, not RAM
+           off a socket. */
+        p_av_dict_set(&opts, "probesize", "1048576", 0);
+        p_av_dict_set(&opts, "analyzeduration", "3000000", 0);
     }
     int r = p_avformat_open_input(&a->ic, path, NULL, url ? &opts : NULL);
     if (url) p_av_dict_free(&opts); /* consumes any leftovers (or the

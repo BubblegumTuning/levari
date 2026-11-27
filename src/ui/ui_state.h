@@ -218,6 +218,8 @@ Uint32 ui_col(SDL_Surface *s, int r, int g, int b);
 void ui_action(int id);
 void ui_set_mini(int on);  /* live mini-mode switch (menu item + options
                               checkbox; only opt_save persists cfg.ui_mini) */
+void ui_set_aot(int on);   /* live always-on-top apply (main button +
+                              options checkbox; version-guarded, see ui.c) */
 void ui_msg(const char *text);
 int ui_ffprobe_info(char *ver, size_t vn, char *dir, size_t dn);
 void ui_pl_dock_pos(int *x, int *y);

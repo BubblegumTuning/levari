@@ -309,9 +309,9 @@ int main(void) {
     /* ---- multi SCAN ---------------------------------------------------- */
     /* background-scan refusal (index must not appear) */
     pl_reset(3);
-    snprintf(pl.items[0].path, sizeof pl.items[0].path, "%s", pa);
-    snprintf(pl.items[1].path, sizeof pl.items[1].path, "%s", pb);
-    snprintf(pl.items[2].path, sizeof pl.items[2].path, "%s", pmiss);
+    pl.items[0].path = pl_intern(&pl.pool, pa);
+    pl.items[1].path = pl_intern(&pl.pool, pb);
+    pl.items[2].path = pl_intern(&pl.pool, pmiss);
     ui.pl_multi[0] = 0; ui.pl_multi[1] = 1; ui.pl_multi[2] = 2; ui.pl_multi_n = 3;
     ui.opt_scanning = 1;
     ui_action(PB_SCAN);
@@ -412,9 +412,10 @@ int main(void) {
     {
         /* click ON an item fires its action and closes: titles E D C B A,
            SORT TITLE (item 0, center 47/8) must reorder rows */
-        for (int i = 0; i < pl.count; i++)
-            snprintf(pl.items[i].tags.title, sizeof pl.items[i].tags.title,
-                     "%c", 'E' - i);
+        for (int i = 0; i < pl.count; i++) {
+            char b[2] = { (char)('E' - i), 0 };
+            pl.items[i].tags.title = pl_intern(&pl.pool, b);
+        }
         SDL_Event e;
         memset(&e, 0, sizeof e);
         e.type = SDL_MOUSEBUTTONDOWN;
@@ -434,8 +435,10 @@ int main(void) {
     /* ---- menu-action dispatch ----------------------------------------- */
     pl_reset(5);
     p.cur = 0;
-    for (int i = 0; i < pl.count; i++)
-        snprintf(pl.items[i].tags.title, sizeof pl.items[i].tags.title, "%c", 'E' - i);
+    for (int i = 0; i < pl.count; i++) {
+        char b[2] = { (char)('E' - i), 0 };
+        pl.items[i].tags.title = pl_intern(&pl.pool, b);
+    }
     pl_menu_action(PM_STITLE);
     chk("sort permuted rows", strcmp(pl.items[4].tags.title, "E") == 0, 1);
     char r0s[LV_MAX_PATH];

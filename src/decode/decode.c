@@ -455,6 +455,8 @@ struct Decoder {
     int (*seek_abort)(void *ctx);  /* DecOpts poll banked at open; consulted
                                       by lv_fmt_spc_seek between skip chunks */
     void *seek_abort_ctx;
+    int mod_resample;              /* DecOpts ladder banked at open; consumed
+                                      by lv_fmt_mod_open (0 = spline) */
 };
 
 /* validate an mpeg audio frame header as a layer-iii frame and return its
@@ -963,18 +965,22 @@ static int lv_fmt_wav_open(Decoder *d, const char *path, int url) {
 /* fmt mod open */
 static int lv_fmt_mod_open(Decoder *d, const char *path, int url) {
     (void)url;
-        static int mp_settings_done;
-    if (!mp_settings_done) {
+    /* applied at EVERY open: ModPlug_Load re-applies the global settings
+       (UpdateSettings) per load, so the cost ladder follows the config
+       from the next track on, exactly like LARGE. The ladder carries the
+       MODPLUG_RESAMPLE_* numbering (1 linear / 2 spline / 3 fir); 0 or
+       garbage stays spline, the historical default. Every call site
+       passes the same cfg value, so nothing flip-flops mid-song. */
     ModPlug_Settings st;
-        ModPlug_GetSettings(&st);
-        st.mChannels = 2;
-        st.mBits = 16;
-        st.mFrequency = 44100;
-        st.mResamplingMode = MODPLUG_RESAMPLE_SPLINE;
-        st.mFlags = MODPLUG_ENABLE_OVERSAMPLING;
-        ModPlug_SetSettings(&st);
-        mp_settings_done = 1;
-    }
+    ModPlug_GetSettings(&st);
+    st.mChannels = 2;
+    st.mBits = 16;
+    st.mFrequency = 44100;
+    st.mResamplingMode = (d->mod_resample >= MODPLUG_RESAMPLE_LINEAR
+                          && d->mod_resample <= MODPLUG_RESAMPLE_FIR)
+                             ? d->mod_resample : MODPLUG_RESAMPLE_SPLINE;
+    st.mFlags = MODPLUG_ENABLE_OVERSAMPLING;
+    ModPlug_SetSettings(&st);
     long long fs = 0;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -1136,6 +1142,7 @@ Decoder *dec_open(const char *path, const DecOpts *opts) {
     d->fmt = fmt;
     d->seek_abort = opts ? opts->seek_abort : NULL;
     d->seek_abort_ctx = opts ? opts->seek_abort_ctx : NULL;
+    d->mod_resample = opts ? opts->mod_resample : 0;
     if (DEC_FMT[fmt].open(d, path, url) != 0) { free(d); return NULL; }
     /* the whole pipeline (player buffers, pan, viz, WSOLA, ALSA) assumes
        at most stereo; vorbis allows 255 channels, flac 32, wav 65535, so

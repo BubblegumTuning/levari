@@ -86,7 +86,7 @@ int main(void) {
     /* CUE virtual row: end_sec set -> deliberate no-op: silent AND the
        row's tags AND the index both verifiably untouched */
     ui.msg[0] = 0;
-    lv_strlcpy(pl.items[0].tags.title, "SENTINEL", sizeof pl.items[0].tags.title);
+    pl.items[0].tags.title = pl_intern(&pl.pool, "SENTINEL");
     LibIndex i0 = lib_index_load();
     long n0 = i0.n;
     lib_index_free(&i0);
@@ -105,7 +105,7 @@ int main(void) {
     chk("select-all: row tags untouched", strcmp(pl.items[0].tags.title, "SENTINEL") == 0, 1);
     { LibIndex i0 = lib_index_load(); chk("select-all: index untouched", i0.n == n0, 1); lib_index_free(&i0); }
     ui.pl_selall = 0;
-    lv_strlcpy(pl.items[0].tags.title, "ScanMe", sizeof pl.items[0].tags.title);
+    pl.items[0].tags.title = pl_intern(&pl.pool, "ScanMe");
 
     /* background scan running: refusal message, index not touched again */
     ui.opt_scanning = 1;

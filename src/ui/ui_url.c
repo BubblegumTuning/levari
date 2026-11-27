@@ -20,10 +20,11 @@ void ui_url_play_transient(Player *p, const char *url) {
     pl_add_file(&np, url);
     if (np.count == 0) { pl_clear(&np); return; } /* OOM: play nothing */
     pthread_mutex_lock(&p->mtx);
-    pl_clear(p->pl);
+    pl_clear(p->pl);              /* frees the old rows AND their pool */
     p->pl->items = np.items;
     p->pl->count = np.count;
     p->pl->cap = np.cap;
+    p->pl->pool = np.pool;        /* adopt: the row's interned string rides it */
     pthread_mutex_unlock(&p->mtx);
     pl_post(p, CMD_PLAY, 0);
 }

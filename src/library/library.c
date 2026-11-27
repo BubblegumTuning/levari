@@ -276,7 +276,8 @@ static void scan_dir(const char *dir, ScanCtx *c) {
                    only opened for formats that need it for length */
                 dur = tag_probe(full, st.st_size, &t);
                 if (!dur) {
-                    DecOpts dopts = { .allow_large = cfg.allow_large };
+                    DecOpts dopts = { .allow_large = cfg.allow_large,
+                                      .mod_resample = cfg.mod_resample };
                     Decoder *dec = dec_open(full, &dopts);
                     if (dec) {
                         long long tot = dec_total_frames(dec);
@@ -460,15 +461,28 @@ static void idx_copy(char *dst, size_t dn, const char *src) {
 }
 
 void lib_fill_playlist_ix(Playlist *p, const LibIndex *ix) {
+    char tmp[256];   /* idx_copy staging: sanitize + 255-cap, then intern */
     for (int i = 0; i < p->count; i++) {
         Track *t = &p->items[i];
         if (t->tags.title[0]) continue;
-        LibRow key = { t->path, NULL, NULL, NULL, 0, 0, 0 };
+        LibRow key = { (char *)t->path, NULL, NULL, NULL, 0, 0, 0 };  /* read-only bsearch key */
         LibRow *hit = bsearch(&key, ix->rows, (size_t)ix->n, sizeof *ix->rows, cmprow);
         if (!hit) continue;
-        if (hit->artist[0]) idx_copy(t->tags.artist, sizeof t->tags.artist, hit->artist);
-        if (hit->title[0]) idx_copy(t->tags.title, sizeof t->tags.title, hit->title);
-        if (hit->album[0]) idx_copy(t->tags.album, sizeof t->tags.album, hit->album);
+        if (hit->artist[0]) {
+            idx_copy(tmp, sizeof tmp, hit->artist);
+            const char *s = pl_intern(&p->pool, tmp);
+            if (s) t->tags.artist = s;
+        }
+        if (hit->title[0]) {
+            idx_copy(tmp, sizeof tmp, hit->title);
+            const char *s = pl_intern(&p->pool, tmp);
+            if (s) t->tags.title = s;
+        }
+        if (hit->album[0]) {
+            idx_copy(tmp, sizeof tmp, hit->album);
+            const char *s = pl_intern(&p->pool, tmp);
+            if (s) t->tags.album = s;
+        }
         if (hit->track) t->tags.track = hit->track;
         if (hit->dur) t->duration = hit->dur;
         t->notag = hit->notag;
@@ -523,7 +537,8 @@ int lib_index_rescan(const char *path, Tags *out_tags, int *out_dur,
            backfills a stored ZERO. Modules cannot widen the documented UI-
            thread concern: modplug reads its whole (64 MB-capped) image but
            a module is megabytes, not the mp3 minimp3 would walk. */
-        DecOpts dopts = { .allow_large = cfg.allow_large };
+        DecOpts dopts = { .allow_large = cfg.allow_large,
+                          .mod_resample = cfg.mod_resample };
         Decoder *dec = dec_open(rp, &dopts);
         if (dec) {
             long long tot = dec_total_frames(dec);

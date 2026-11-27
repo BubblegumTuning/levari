@@ -5,9 +5,40 @@
 #include "../tag/tag.h"
 #include "../common.h"
 
+/* Intern pool: bump arena + open-addressing hash. Every string
+   returned is immutable and shared: equal content => equal pointer
+   (the empty string is one static slot, never in the pool). A pool is
+   OWNED by its Playlist: only code holding that playlist's lock (or
+   owning the playlist outright, like the daemon's off-lock np) ever
+   touches it — that ownership discipline is the locking; there is no
+   pool mutex. Rows hold const char*: in-place mutation of a pool
+   string is a compile error, so a struct copy of a Track (the edit
+   engine memmoves whole rows) is correct by construction.
+   Lifetime invariant: pool strings NEVER escape the lock — anything
+   that must survive an unlock copies into its own buffer first (the
+   established capture pattern: pl_scan_tags, load_track, PB_SCAN). */
 typedef struct {
-    char path[LV_MAX_PATH];
-    Tags tags;
+    char **blocks;                  /* arena blocks, each freed whole */
+    int nblocks, blockcap;
+    char *cur; size_t cur_used, cur_cap; /* bump cursor in the last block */
+    char **tab; int tab_mask, tab_count; /* hash: interned ptrs, NULL=free */
+    size_t bytes;                   /* arena bytes allocated */
+    size_t last_live;               /* live bytes at last GC (anti-thrash) */
+} PlPool;
+
+void pl_pool_free(PlPool *pool);
+const char *pl_intern(PlPool *pool, const char *s);          /* NULL on OOM */
+/* intern a copy of s truncated to cap BYTES (same byte-level semantics
+   as the lv_strlcpy sites this replaces) */
+const char *pl_intern_cap(PlPool *pool, const char *s, size_t cap);
+
+/* Row tags ride interned pointers; the member keeps the .tags name so
+   every read site (strcmp/snprintf/[0] tests) is unchanged. */
+typedef struct { const char *title, *artist, *album; int track; } RowTags;
+
+typedef struct {
+    const char *path;   /* interned, never NULL ("" allowed) */
+    RowTags tags;       /* interned; "" = absent (the shared slot) */
     int duration; /* seconds, 0 unknown */
     int notag;    /* index says this file carries no tags: skip re-reads */
     double start_sec, end_sec; /* CUE virtual track bounds, 0 = whole file */
@@ -16,6 +47,7 @@ typedef struct {
 typedef struct {
     Track *items;
     int count, cap;
+    PlPool pool;        /* owns every string any row points at */
     /* bumped by EVERY mutation of the rows or their searchable tags
        (pl_touch): consumers that cache per-row derived data (the search
        window's normalized-field cache) key their cache on it. Read/write
@@ -26,6 +58,13 @@ typedef struct {
 } Playlist;
 
 static inline void pl_touch(Playlist *p) { p->gen++; }
+
+/* Reclaim the pool when it grew past the high-water with garbage:
+   rebuild keeping only strings reachable from p->items. Call under the
+   owner lock, after any unbounded interner ran (the Icy title write is
+   the only one). OOM keeps the old pool and every row intact. */
+void pl_pool_maybe_gc(Playlist *p);
+size_t pl_pool_bytes(const Playlist *p);   /* introspection (test gate) */
 
 void pl_init(Playlist *p);
 void pl_clear(Playlist *p);
